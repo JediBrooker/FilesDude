@@ -52,7 +52,7 @@ import {
 } from "lucide-react";
 import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import type { BulkRenameRule, DiskInfo, FileEntry, IdentityOption, OwnershipPair, RenamePreview, UploadOwnershipOptions, UploadOwnershipPreference } from "@/lib/types";
+import type { BulkRenameRule, DiskInfo, FileEntry, IdentityOption, LargestFilesResult, OwnershipPair, RenamePreview, UploadOwnershipOptions, UploadOwnershipPreference } from "@/lib/types";
 
 type AuthState = {
   loading: boolean;
@@ -64,6 +64,7 @@ type AuthState = {
 
 type DialogState =
   | { kind: "upload"; files: File[] }
+  | { kind: "storage" }
   | { kind: "new" }
   | { kind: "rename"; entry: FileEntry }
   | { kind: "delete" }
@@ -94,6 +95,11 @@ function formatBytes(value: number) {
   const units = ["B", "KB", "MB", "GB", "TB", "PB"];
   const index = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1);
   return `${(value / 1024 ** index).toFixed(index === 0 ? 0 : value / 1024 ** index >= 10 ? 1 : 2)} ${units[index]}`;
+}
+
+function formatGigabytes(value: number) {
+  if (value > 0 && value < 0.01 * 1024 ** 3) return "<0.01 GB";
+  return `${(value / 1024 ** 3).toFixed(value >= 10 * 1024 ** 3 ? 1 : 2)} GB`;
 }
 
 function formatDate(value: string) {
@@ -435,12 +441,12 @@ export function FileManager() {
           </div>
         </div>
 
-        <div className="storage-card">
+        <button type="button" className="storage-card" title="Find the largest files" onClick={() => setDialog({ kind: "storage" })}>
           <div className="storage-heading"><span><HardDrive size={16} /> Storage</span><strong>{diskPercent}%</strong></div>
           <div className="storage-track"><span style={{ width: `${diskPercent}%` }} /></div>
           <p>{disk ? `${formatBytes(disk.used)} of ${formatBytes(disk.total)} used` : "Calculating…"}</p>
           <small>{disk ? `${formatBytes(disk.available)} available` : ""}</small>
-        </div>
+        </button>
 
         <div className="sidebar-footer">
           <button className="user-chip" title="Open preferences" onClick={() => setDialog({ kind: "preferences" })}><span className="avatar">{auth.username?.slice(0, 1).toUpperCase()}</span><span><strong>{auth.username}</strong><small>Administrator</small></span></button>
@@ -555,6 +561,8 @@ export function FileManager() {
           onRefresh={() => loadDirectory()}
           username={auth.username || ""}
           onCredentialsUpdated={async () => { setDialog(null); await refreshAuth(); notify("Account preferences updated"); }}
+          onReveal={(entry) => { setDialog(null); navigate(entry.path.split("/").slice(0, -1).join("/")); }}
+          onPreview={(entry) => setDialog({ kind: "preview", entry })}
         />
       )}
       {toast && <div className={`toast ${toast.tone === "error" ? "toast-error" : ""}`}>{toast.tone === "error" ? <CircleAlert size={18} /> : <Check size={18} />}{toast.message}</div>}
@@ -740,7 +748,7 @@ function FileSkeleton() {
   return <div className="file-skeleton">{Array.from({ length: 6 }).map((_, index) => <div key={index}><span /><span /><span /><span /></div>)}</div>;
 }
 
-function DialogHost({ dialog, selected, currentPath, username, onClose, onRun, notify, onRefresh, onCredentialsUpdated }: {
+function DialogHost({ dialog, selected, currentPath, username, onClose, onRun, notify, onRefresh, onCredentialsUpdated, onReveal, onPreview }: {
   dialog: NonNullable<DialogState>;
   selected: FileEntry[];
   currentPath: string;
@@ -750,8 +758,11 @@ function DialogHost({ dialog, selected, currentPath, username, onClose, onRun, n
   notify: (message: string, tone?: "error") => void;
   onRefresh: () => Promise<void>;
   onCredentialsUpdated: () => Promise<void>;
+  onReveal: (entry: FileEntry) => void;
+  onPreview: (entry: FileEntry) => void;
 }) {
   if (dialog.kind === "upload") return <UploadDialog files={dialog.files} currentPath={currentPath} onClose={onClose} notify={notify} onComplete={onRefresh} />;
+  if (dialog.kind === "storage") return <StorageDialog onClose={onClose} onReveal={onReveal} onPreview={onPreview} />;
   if (dialog.kind === "new") return <NewDialog path={currentPath} onClose={onClose} onRun={onRun} />;
   if (dialog.kind === "rename") return <RenameDialog entry={dialog.entry} onClose={onClose} onRun={onRun} />;
   if (dialog.kind === "delete") return <DeleteDialog entries={selected} onClose={onClose} onRun={onRun} />;
@@ -771,6 +782,39 @@ function Modal({ title, subtitle, icon, onClose, children, wide = false }: { tit
 
 function ModalActions({ onClose, submitLabel, danger = false, busy = false }: { onClose: () => void; submitLabel: string; danger?: boolean; busy?: boolean }) {
   return <div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className={`button ${danger ? "danger" : "primary"}`} disabled={busy}>{busy && <LoaderCircle className="spin" size={16} />}{submitLabel}</button></div>;
+}
+
+function StorageDialog({ onClose, onReveal, onPreview }: { onClose: () => void; onReveal: (entry: FileEntry) => void; onPreview: (entry: FileEntry) => void }) {
+  const [result, setResult] = useState<LargestFilesResult | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const requestRef = useRef<AbortController | null>(null);
+
+  const load = useCallback(async (refresh = false) => {
+    requestRef.current?.abort();
+    const controller = new AbortController();
+    requestRef.current = controller;
+    setLoading(true);
+    setError("");
+    try {
+      const value = await requestJson<LargestFilesResult>(`/api/fs/largest?limit=100${refresh ? "&refresh=true" : ""}`, { signal: controller.signal });
+      setResult(value);
+    } catch (caught) {
+      if ((caught as Error).name !== "AbortError") setError((caught as Error).message);
+    } finally {
+      if (requestRef.current === controller) setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => void load(), 0);
+    return () => {
+      window.clearTimeout(timer);
+      requestRef.current?.abort();
+    };
+  }, [load]);
+
+  return <Modal title="Largest files" subtitle="Files using the most space across the entire directory tree" icon={<HardDrive size={19} />} onClose={onClose} wide><div className="storage-browser"><div className="storage-scan-bar"><div>{result ? <><strong>{result.entries.length} largest files</strong><span>Scanned {result.scannedFiles.toLocaleString()} files in {result.scannedDirectories.toLocaleString()} folders · {(result.durationMs / 1000).toFixed(1)}s{result.cached ? " · cached" : ""}</span></> : <><strong>Whole-tree storage scan</strong><span>Every accessible folder under the configured root</span></>}</div><button className="button secondary" disabled={loading} onClick={() => void load(true)}><RefreshCw size={15} className={loading ? "spin" : ""} /> Refresh</button></div>{loading && !result ? <div className="storage-scan-state"><LoaderCircle className="spin" size={25} /><strong>Finding the largest files…</strong><span>Large directory trees can take a little while on the first scan.</span></div> : error && !result ? <div className="storage-scan-state error"><CircleAlert size={25} /><strong>Unable to scan storage</strong><span>{error}</span><button className="button secondary" onClick={() => void load(true)}>Try again</button></div> : result && <><div className="largest-file-table" role="table" aria-label="Largest files"><div className="largest-file-row largest-file-header" role="row"><div role="columnheader">#</div><div role="columnheader">Name</div><div role="columnheader">Location</div><div role="columnheader">Size (GB)</div><div role="columnheader">Modified</div><div role="columnheader" /></div>{result.entries.map((entry, index) => <div className="largest-file-row" role="row" key={entry.path}><div className="largest-rank" role="cell">{index + 1}</div><div className="largest-name" role="cell"><span className={`file-icon ${entry.type}`}>{fileIcon(entry, 17)}</span><button title={entry.name} onClick={() => onPreview(entry)}>{entry.name}</button></div><div className="largest-location" role="cell" title={`/${entry.path}`}><span>/</span>{entry.path.split("/").slice(0, -1).join("/") || "Root"}</div><div className="largest-size" role="cell" title={formatBytes(entry.size)}>{formatGigabytes(entry.size)}</div><div className="muted" role="cell">{formatDate(entry.modified)}</div><div className="largest-actions" role="cell"><button className="icon-button" title="Open containing folder" aria-label={`Open folder containing ${entry.name}`} onClick={() => onReveal(entry)}><FolderOpen size={16} /></button><a className="icon-button" title="Download" aria-label={`Download ${entry.name}`} href={`/api/fs/download?path=${encodePath(entry.path)}`}><Download size={16} /></a></div></div>)}</div>{error && <div className="storage-scan-note error"><CircleAlert size={15} /> Refresh failed: {error}</div>}{result.skippedEntries > 0 && <div className="storage-scan-note"><Info size={15} /> {result.skippedEntries.toLocaleString()} inaccessible or changed {result.skippedEntries === 1 ? "entry was" : "entries were"} skipped.</div>}<div className="storage-scan-foot"><span>Scanned {new Date(result.generatedAt).toLocaleString()}</span><button className="button primary" onClick={onClose}>Done</button></div></>}</div></Modal>;
 }
 
 function UploadDialog({ files, currentPath, onClose, notify, onComplete }: { files: File[]; currentPath: string; onClose: () => void; notify: (message: string, tone?: "error") => void; onComplete: () => Promise<void> }) {

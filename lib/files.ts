@@ -1,9 +1,10 @@
 import fs from "node:fs/promises";
+import type { Dirent } from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { config } from "./config";
 import { AppError } from "./http";
-import type { BulkRenameRule, DiskInfo, FileEntry, IdentityOption, OwnershipPair, RenamePreview } from "./types";
+import type { BulkRenameRule, DiskInfo, FileEntry, IdentityOption, LargestFilesResult, OwnershipPair, RenamePreview } from "./types";
 
 const INTERNAL_NAMES = new Set([".filedude"]);
 const mimeTypes: Record<string, string> = {
@@ -20,6 +21,8 @@ const mimeTypes: Record<string, string> = {
 
 let identitiesCache: { users: Map<number, string>; groups: Map<number, string>; at: number } | null = null;
 let canonicalRoot: string | null = null;
+let largestFilesCache: { at: number; result: LargestFilesResult } | null = null;
+let largestFilesScan: Promise<LargestFilesResult> | null = null;
 
 export function getMime(filePath: string) {
   return mimeTypes[path.extname(filePath).toLowerCase()] || "application/octet-stream";
@@ -461,4 +464,119 @@ export async function applyBulkRename(paths: string[], rule: BulkRenameRule) {
 
 export async function details(relativePath: string) {
   return toEntry(await safeResolve(relativePath));
+}
+
+type LargestCandidate = { absolute: string; size: number };
+
+function addLargestCandidate(heap: LargestCandidate[], candidate: LargestCandidate, limit: number) {
+  const smaller = (left: LargestCandidate, right: LargestCandidate) => left.size < right.size
+    || left.size === right.size && left.absolute.localeCompare(right.absolute) > 0;
+  const rise = (index: number) => {
+    while (index > 0) {
+      const parent = Math.floor((index - 1) / 2);
+      if (!smaller(heap[index], heap[parent])) break;
+      [heap[index], heap[parent]] = [heap[parent], heap[index]];
+      index = parent;
+    }
+  };
+  const sink = (index: number) => {
+    while (true) {
+      const left = index * 2 + 1;
+      const right = left + 1;
+      let smallest = index;
+      if (left < heap.length && smaller(heap[left], heap[smallest])) smallest = left;
+      if (right < heap.length && smaller(heap[right], heap[smallest])) smallest = right;
+      if (smallest === index) break;
+      [heap[index], heap[smallest]] = [heap[smallest], heap[index]];
+      index = smallest;
+    }
+  };
+
+  if (heap.length < limit) {
+    heap.push(candidate);
+    rise(heap.length - 1);
+  } else if (smaller(heap[0], candidate)) {
+    heap[0] = candidate;
+    sink(0);
+  }
+}
+
+async function scanLargestFiles(): Promise<LargestFilesResult> {
+  const startedAt = Date.now();
+  const root = await ensureRoot();
+  const directoryQueue = [root];
+  const largest: LargestCandidate[] = [];
+  const resultLimit = 200;
+  let scannedFiles = 0;
+  let scannedDirectories = 0;
+  let skippedEntries = 0;
+
+  while (directoryQueue.length) {
+    const batch = directoryQueue.splice(0, 4);
+    const discovered = await Promise.all(batch.map(async (directory) => {
+      scannedDirectories += 1;
+      let entries: Dirent[];
+      try {
+        const directoryStat = await fs.lstat(directory);
+        const realDirectory = await fs.realpath(directory);
+        if (!directoryStat.isDirectory() || !insideRoot(realDirectory)) throw new Error("Directory is no longer safe to scan");
+        entries = await fs.readdir(directory, { withFileTypes: true });
+      } catch {
+        skippedEntries += 1;
+        return [] as string[];
+      }
+
+      const directories: string[] = [];
+      for (let offset = 0; offset < entries.length; offset += 64) {
+        const chunk = entries.slice(offset, offset + 64).filter((entry) => !INTERNAL_NAMES.has(entry.name) && !entry.isSymbolicLink());
+        const stats = await Promise.allSettled(chunk.map(async (entry) => ({
+          entry,
+          absolute: path.join(directory, entry.name),
+          stat: await fs.lstat(path.join(directory, entry.name)),
+        })));
+        for (const item of stats) {
+          if (item.status !== "fulfilled") {
+            skippedEntries += 1;
+            continue;
+          }
+          if (item.value.stat.isDirectory()) directories.push(item.value.absolute);
+          else if (item.value.stat.isFile()) {
+            scannedFiles += 1;
+            addLargestCandidate(largest, { absolute: item.value.absolute, size: item.value.stat.size }, resultLimit);
+          }
+        }
+      }
+      return directories;
+    }));
+    directoryQueue.push(...discovered.flat());
+  }
+
+  const ranked = largest.sort((a, b) => b.size - a.size || a.absolute.localeCompare(b.absolute));
+  const converted = await Promise.allSettled(ranked.map((candidate) => toEntry(candidate.absolute)));
+  const entries = converted.flatMap((item) => item.status === "fulfilled" ? [item.value] : []);
+  skippedEntries += converted.length - entries.length;
+  return {
+    entries,
+    scannedFiles,
+    scannedDirectories,
+    skippedEntries,
+    durationMs: Date.now() - startedAt,
+    generatedAt: new Date().toISOString(),
+    cached: false,
+  };
+}
+
+export async function largestFiles(refresh = false): Promise<LargestFilesResult> {
+  if (!refresh && largestFilesCache && Date.now() - largestFilesCache.at < 60_000) {
+    return { ...largestFilesCache.result, cached: true };
+  }
+  if (!largestFilesScan) {
+    largestFilesScan = scanLargestFiles()
+      .then((result) => {
+        largestFilesCache = { at: Date.now(), result };
+        return result;
+      })
+      .finally(() => { largestFilesScan = null; });
+  }
+  return largestFilesScan;
 }

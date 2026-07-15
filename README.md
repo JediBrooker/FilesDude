@@ -13,7 +13,7 @@ FilesDude is a secure, self-hosted web file manager designed for a Proxmox host,
 - Inline previews for text, code, JSON, images, PDF, audio, and video; media uses byte-range streaming
 - POSIX `chmod` and numeric `chown` for one or many items
 - Bulk rename with find/replace, regular expressions, prefix, suffix, sequential numbering, live conflict detection, and two-phase application
-- Recursive filename search, disk usage, owner/group display, and symlink escape warnings
+- Recursive filename search, disk usage, owner/group display, symlink escape warnings, and a cached whole-tree view of the 100 largest files from the clickable Storage card
 - Protected trash by default, persistent favourites, and a JSON Lines audit log inside the protected state directory
 - Signed, expiring, HTTP-only, SameSite login sessions; scrypt password hashes; login throttling; same-origin mutation checks; and hardened response headers
 - Account preferences for changing the username and password; credential changes invalidate other sessions

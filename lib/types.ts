@@ -53,6 +53,16 @@ export interface IdentityOption {
   name: string;
 }
 
+export interface LargestFilesResult {
+  entries: FileEntry[];
+  scannedFiles: number;
+  scannedDirectories: number;
+  skippedEntries: number;
+  durationMs: number;
+  generatedAt: string;
+  cached: boolean;
+}
+
 export interface BulkRenameRule {
   find?: string;
   replace?: string;
