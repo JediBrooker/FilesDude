@@ -52,7 +52,7 @@ body {
   font-size: 14px;
   -webkit-font-smoothing: antialiased;
 }
-button, input { font: inherit; }
+button, input, select { font: inherit; }
 button, a { -webkit-tap-highlight-color: transparent; }
 button { color: inherit; }
 a { color: inherit; text-decoration: none; }
@@ -280,9 +280,10 @@ kbd { padding: 3px 5px; border: 1px solid var(--line); border-bottom-width: 2px;
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 22px; padding: 15px 0 19px; border-top: 1px solid var(--line); }
 .modal > .modal-actions { margin: 20px 22px 0; }
 .form-field { position: relative; display: grid; gap: 7px; color: var(--ink-soft); font-size: 10px; font-weight: 700; }
-.form-field input, .path-input { width: 100%; height: 42px; border: 1px solid var(--line-strong); border-radius: 9px; outline: 0; background: var(--panel-soft); color: var(--ink); }
+.form-field input, .form-field select, .path-input { width: 100%; height: 42px; border: 1px solid var(--line-strong); border-radius: 9px; outline: 0; background: var(--panel-soft); color: var(--ink); }
 .form-field input { padding: 0 11px; }
-.form-field input:focus, .path-input:focus-within { border-color: var(--brand); box-shadow: 0 0 0 3px color-mix(in srgb, var(--brand) 11%, transparent); }
+.form-field select { padding: 0 34px 0 11px; cursor: pointer; }
+.form-field input:focus, .form-field select:focus, .path-input:focus-within { border-color: var(--brand); box-shadow: 0 0 0 3px color-mix(in srgb, var(--brand) 11%, transparent); }
 .form-field small { color: var(--ink-faint); font-size: 8px; font-weight: 500; }
 .field-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 11px; }
 .field-pair + .field-pair { margin-top: 14px; }
@@ -318,6 +319,35 @@ kbd { padding: 3px 5px; border: 1px solid var(--line); border-bottom-width: 2px;
 .path-input span { padding-left: 11px; color: var(--ink-faint); }
 .path-input input { height: 40px; border: 0; background: transparent; box-shadow: none !important; }
 
+.upload-form { padding-top: 16px !important; }
+.upload-file-summary { padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel-soft); }
+.upload-file-summary > div:first-child { display: flex; align-items: center; gap: 10px; }
+.upload-file-summary > div:first-child > svg { color: var(--brand); }
+.upload-file-summary > div:first-child > span { display: flex; flex-direction: column; }
+.upload-file-summary strong { font-size: 10px; }
+.upload-file-summary small { color: var(--ink-faint); font-size: 8px; }
+.upload-file-list { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 9px; }
+.upload-file-list span { max-width: 100%; overflow: hidden; padding: 4px 7px; border-radius: 5px; background: var(--panel); color: var(--ink-soft); font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+.ownership-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 10px; margin: 18px 0 9px; }
+.ownership-heading > div { display: flex; align-items: center; gap: 8px; }
+.ownership-heading > div > svg { color: var(--brand); }
+.ownership-heading span { display: flex; flex-direction: column; }
+.ownership-heading strong { font-size: 10px; }
+.ownership-heading small { color: var(--ink-faint); font-size: 8px; }
+.ownership-loading { display: flex; min-height: 80px; align-items: center; justify-content: center; gap: 8px; border: 1px dashed var(--line-strong); border-radius: 10px; color: var(--ink-soft); font-size: 9px; }
+.ownership-options { display: grid; max-height: 245px; gap: 6px; overflow-y: auto; }
+.ownership-option { display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; align-items: center; gap: 9px; min-height: 54px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel-soft); cursor: pointer; }
+.ownership-option:hover { border-color: var(--line-strong); }
+.ownership-option.active { border-color: var(--brand); background: var(--brand-soft); box-shadow: inset 0 0 0 1px var(--brand); }
+.ownership-option.disabled { cursor: not-allowed; opacity: .45; }
+.ownership-option input { position: absolute; opacity: 0; }
+.ownership-radio { display: grid; width: 16px; height: 16px; place-items: center; border: 1px solid var(--line-strong); border-radius: 50%; background: var(--panel); }
+.ownership-option.active .ownership-radio { border: 5px solid var(--brand); }
+.ownership-option > span:nth-of-type(2) { display: flex; min-width: 0; flex-direction: column; }
+.ownership-option strong { overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.ownership-option small { color: var(--ink-faint); font-size: 8px; }
+.ownership-option em { padding: 3px 6px; border-radius: 5px; background: var(--panel); color: var(--brand); font-size: 7px; font-style: normal; font-weight: 800; letter-spacing: .04em; text-transform: uppercase; }
+
 .bulk-layout { display: grid; grid-template-columns: minmax(240px, .8fr) minmax(330px, 1.2fr); gap: 20px; }
 .bulk-rules { padding-right: 20px; border-right: 1px solid var(--line); }
 .bulk-rules .switch-row:first-of-type { margin-top: 13px; }
@@ -347,6 +377,7 @@ kbd { padding: 3px 5px; border: 1px solid var(--line); border-bottom-width: 2px;
 .settings-section-title strong { font-size: 10px; }
 .settings-section-title small { color: var(--ink-faint); font-size: 8px; }
 .preferences-passwords { margin-top: 12px; }
+.preference-identity-pair { margin-top: 12px; }
 .password-field { position: relative; }
 .password-field input { padding-right: 36px; }
 .password-field svg { position: absolute; top: 13px; right: 12px; color: var(--ink-faint); }

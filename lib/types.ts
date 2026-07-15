@@ -24,6 +24,35 @@ export interface DiskInfo {
   used: number;
 }
 
+export interface OwnershipPair {
+  uid: number;
+  gid: number;
+  owner: string;
+  group: string;
+  count?: number;
+  source?: "destination" | "contents" | "service" | "default";
+}
+
+export type UploadOwnershipPreference =
+  | { mode: "destination" }
+  | { mode: "service" }
+  | { mode: "fixed"; uid: number; gid: number };
+
+export interface UploadOwnershipOptions {
+  destination: OwnershipPair;
+  detected: OwnershipPair[];
+  service: OwnershipPair;
+  preference: UploadOwnershipPreference;
+  defaultPair?: OwnershipPair;
+  canChangeOwnership: boolean;
+  truncated: boolean;
+}
+
+export interface IdentityOption {
+  id: number;
+  name: string;
+}
+
 export interface BulkRenameRule {
   find?: string;
   replace?: string;

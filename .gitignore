@@ -42,3 +42,7 @@ next-env.d.ts
 /outputs/
 /work/
 /demo-root/.filedude/
+
+# macOS/iCloud conflict copies
+* 2
+* 2.*

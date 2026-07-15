@@ -52,7 +52,7 @@ import {
 } from "lucide-react";
 import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import type { BulkRenameRule, DiskInfo, FileEntry, RenamePreview } from "@/lib/types";
+import type { BulkRenameRule, DiskInfo, FileEntry, IdentityOption, OwnershipPair, RenamePreview, UploadOwnershipOptions, UploadOwnershipPreference } from "@/lib/types";
 
 type AuthState = {
   loading: boolean;
@@ -63,6 +63,7 @@ type AuthState = {
 };
 
 type DialogState =
+  | { kind: "upload"; files: File[] }
   | { kind: "new" }
   | { kind: "rename"; entry: FileEntry }
   | { kind: "delete" }
@@ -107,6 +108,10 @@ function formatDate(value: string) {
 
 function encodePath(value: string) {
   return encodeURIComponent(value);
+}
+
+function ownershipKey(pair: Pick<OwnershipPair, "uid" | "gid">) {
+  return `${pair.uid}:${pair.gid}`;
 }
 
 function extension(name: string) {
@@ -311,21 +316,11 @@ export function FileManager() {
     }
   };
 
-  const uploadFiles = async (files: FileList | File[]) => {
-    if (!files.length) return;
-    const form = new FormData();
-    Array.from(files).forEach((file) => form.append("files", file));
-    setLoading(true);
-    try {
-      const result = await requestJson<{ uploaded: string[] }>(`/api/fs/upload?path=${encodePath(currentPath)}`, { method: "POST", body: form });
-      notify(`${result.uploaded.length} ${result.uploaded.length === 1 ? "file" : "files"} uploaded`);
-      await loadDirectory();
-    } catch (error) {
-      notify((error as Error).message, "error");
-    } finally {
-      setLoading(false);
-      if (uploadRef.current) uploadRef.current.value = "";
-    }
+  const queueUpload = (files: FileList | File[]) => {
+    const queued = Array.from(files);
+    if (!queued.length) return;
+    setDialog({ kind: "upload", files: queued });
+    if (uploadRef.current) uploadRef.current.value = "";
   };
 
   const downloadSelected = () => {
@@ -413,7 +408,7 @@ export function FileManager() {
   if (!auth.authenticated) return <LoginScreen auth={auth} onSuccess={refreshAuth} theme={theme} onToggleTheme={toggleTheme} />;
 
   return (
-    <div className="app-shell" onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); void uploadFiles(event.dataTransfer.files); }}>
+    <div className="app-shell" onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); queueUpload(event.dataTransfer.files); }}>
       <aside className={`sidebar ${sidebarOpen ? "sidebar-open" : ""}`}>
         <div className="brand-row">
           <div className="brand-mark"><FolderOpen size={21} /></div>
@@ -483,7 +478,7 @@ export function FileManager() {
               <p>{activeSearch ? `${entries.length} search results` : `${entries.length} ${entries.length === 1 ? "item" : "items"}`}{showHidden ? " · hidden files shown" : ""}</p>
             </div>
             <div className="primary-actions">
-              <input ref={uploadRef} className="visually-hidden" type="file" multiple onChange={(event) => event.target.files && void uploadFiles(event.target.files)} />
+              <input ref={uploadRef} className="visually-hidden" type="file" multiple onChange={(event) => event.target.files && queueUpload(event.target.files)} />
               {currentPath && <button className={`button secondary favorite-location ${favoritePaths.has(currentPath) ? "active" : ""}`} title={favoritePaths.has(currentPath) ? "Remove this folder from favourites" : "Add this folder to favourites"} onClick={() => void toggleFavorite(currentPath)}><Star size={16} fill={favoritePaths.has(currentPath) ? "currentColor" : "none"} /> <span>{favoritePaths.has(currentPath) ? "Favourited" : "Favourite"}</span></button>}
               <button className="button secondary" onClick={() => uploadRef.current?.click()}><Upload size={17} /> Upload</button>
               <button className="button primary" onClick={() => setDialog({ kind: "new" })}><Plus size={17} /> New <ChevronDown size={14} /></button>
@@ -756,6 +751,7 @@ function DialogHost({ dialog, selected, currentPath, username, onClose, onRun, n
   onRefresh: () => Promise<void>;
   onCredentialsUpdated: () => Promise<void>;
 }) {
+  if (dialog.kind === "upload") return <UploadDialog files={dialog.files} currentPath={currentPath} onClose={onClose} notify={notify} onComplete={onRefresh} />;
   if (dialog.kind === "new") return <NewDialog path={currentPath} onClose={onClose} onRun={onRun} />;
   if (dialog.kind === "rename") return <RenameDialog entry={dialog.entry} onClose={onClose} onRun={onRun} />;
   if (dialog.kind === "delete") return <DeleteDialog entries={selected} onClose={onClose} onRun={onRun} />;
@@ -775,6 +771,68 @@ function Modal({ title, subtitle, icon, onClose, children, wide = false }: { tit
 
 function ModalActions({ onClose, submitLabel, danger = false, busy = false }: { onClose: () => void; submitLabel: string; danger?: boolean; busy?: boolean }) {
   return <div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className={`button ${danger ? "danger" : "primary"}`} disabled={busy}>{busy && <LoaderCircle className="spin" size={16} />}{submitLabel}</button></div>;
+}
+
+function UploadDialog({ files, currentPath, onClose, notify, onComplete }: { files: File[]; currentPath: string; onClose: () => void; notify: (message: string, tone?: "error") => void; onComplete: () => Promise<void> }) {
+  const [options, setOptions] = useState<UploadOwnershipOptions | null>(null);
+  const [selectedOwnership, setSelectedOwnership] = useState("service");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    requestJson<UploadOwnershipOptions>(`/api/fs/upload?path=${encodePath(currentPath)}`, { signal: controller.signal })
+      .then((result) => {
+        setOptions(result);
+        if (!result.canChangeOwnership || result.preference.mode === "service") setSelectedOwnership("service");
+        else if (result.preference.mode === "fixed") setSelectedOwnership(`${result.preference.uid}:${result.preference.gid}`);
+        else setSelectedOwnership(ownershipKey(result.destination));
+      })
+      .catch((caught) => { if ((caught as Error).name !== "AbortError") setError((caught as Error).message); });
+    return () => controller.abort();
+  }, [currentPath]);
+
+  const ownershipPairs = useMemo(() => {
+    if (!options) return [];
+    const pairs = [...options.detected];
+    if (options.defaultPair && !pairs.some((pair) => ownershipKey(pair) === ownershipKey(options.defaultPair!))) pairs.push(options.defaultPair);
+    return pairs;
+  }, [options]);
+
+  const preferredKey = options
+    ? options.preference.mode === "service"
+      ? "service"
+      : options.preference.mode === "fixed"
+        ? `${options.preference.uid}:${options.preference.gid}`
+        : ownershipKey(options.destination)
+    : "service";
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!options) return;
+    setBusy(true);
+    setError("");
+    const form = new FormData();
+    files.forEach((file) => form.append("files", file));
+    const params = new URLSearchParams({ path: currentPath });
+    if (selectedOwnership !== "service") {
+      const [uid, gid] = selectedOwnership.split(":");
+      params.set("uid", uid);
+      params.set("gid", gid);
+    }
+    try {
+      const result = await requestJson<{ uploaded: string[] }>(`/api/fs/upload?${params}`, { method: "POST", body: form });
+      notify(`${result.uploaded.length} ${result.uploaded.length === 1 ? "file" : "files"} uploaded`);
+      onClose();
+      await onComplete();
+    } catch (caught) {
+      setError((caught as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return <Modal title={`Upload ${files.length} ${files.length === 1 ? "file" : "files"}`} subtitle={`Choose ownership before uploading to /${currentPath}`} icon={<Upload size={19} />} onClose={onClose}><form className="upload-form" onSubmit={submit}><div className="upload-file-summary"><div><Upload size={18} /><span><strong>{files.length} {files.length === 1 ? "file" : "files"}</strong><small>{formatBytes(files.reduce((total, file) => total + file.size, 0))} total</small></span></div><div className="upload-file-list">{files.slice(0, 4).map((file) => <span key={`${file.name}-${file.size}`}>{file.name}</span>)}{files.length > 4 && <span>and {files.length - 4} more…</span>}</div></div><div className="ownership-heading"><div><UserRoundCog size={17} /><span><strong>Owner and group</strong><small>Detected from this folder and its contents</small></span></div>{options?.truncated && <small>Based on the first 2,000 items</small>}</div>{!options && !error ? <div className="ownership-loading"><LoaderCircle className="spin" size={18} /> Detecting ownership…</div> : options && <div className="ownership-options"><label className={`ownership-option ${selectedOwnership === "service" ? "active" : ""}`}><input type="radio" name="upload-ownership" value="service" checked={selectedOwnership === "service"} onChange={(event) => setSelectedOwnership(event.target.value)} /><span className="ownership-radio" /><span><strong>Keep FilesDude service ownership</strong><small>{options.service.owner}:{options.service.group} · {options.service.uid}:{options.service.gid}</small></span>{preferredKey === "service" && <em>Default</em>}</label>{ownershipPairs.map((pair) => { const key = ownershipKey(pair); const destination = key === ownershipKey(options.destination); return <label key={key} className={`ownership-option ${selectedOwnership === key ? "active" : ""} ${!options.canChangeOwnership ? "disabled" : ""}`}><input type="radio" name="upload-ownership" value={key} checked={selectedOwnership === key} disabled={!options.canChangeOwnership} onChange={(event) => setSelectedOwnership(event.target.value)} /><span className="ownership-radio" /><span><strong>{pair.owner}:{pair.group}</strong><small>{pair.uid}:{pair.gid}{destination ? " · destination folder" : pair.source === "default" ? " · saved default" : ` · ${pair.count || 0} existing ${pair.count === 1 ? "item" : "items"}`}</small></span>{preferredKey === key && <em>Default</em>}</label>; })}</div>}{options && !options.canChangeOwnership && <div className="warning-box"><CircleAlert size={17} /> Ownership changes require FilesDude&apos;s systemd service to run as root. This upload will keep <code>{options.service.uid}:{options.service.gid}</code>.</div>}<div className="info-box"><Info size={17} /> Uploaded files use mode <code>640</code>. Owner/group selection does not change those read and write permissions.</div>{error && <div className="form-error"><CircleAlert size={16} />{error}</div>}<ModalActions onClose={onClose} submitLabel={`Upload ${files.length === 1 ? "file" : "files"}`} busy={busy || !options} /></form></Modal>;
 }
 
 function NewDialog({ path, onClose, onRun }: { path: string; onClose: () => void; onRun: (body: Record<string, unknown>, success: string) => Promise<boolean> }) {
@@ -880,8 +938,40 @@ function PreferencesDialog({ username: initialUsername, onClose, onUpdated }: { 
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [showPasswords, setShowPasswords] = useState(false);
+  const [uploadMode, setUploadMode] = useState<UploadOwnershipPreference["mode"]>("destination");
+  const [fixedUid, setFixedUid] = useState("0");
+  const [fixedGid, setFixedGid] = useState("0");
+  const [users, setUsers] = useState<IdentityOption[]>([]);
+  const [groups, setGroups] = useState<IdentityOption[]>([]);
+  const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    requestJson<{ username: string; uploadOwnership: UploadOwnershipPreference; identities: { users: IdentityOption[]; groups: IdentityOption[] } }>("/api/auth/preferences", { signal: controller.signal })
+      .then((result) => {
+        setUsername(result.username);
+        setUploadMode(result.uploadOwnership.mode);
+        setUsers(result.identities.users);
+        setGroups(result.identities.groups);
+        if (result.uploadOwnership.mode === "fixed") {
+          setFixedUid(String(result.uploadOwnership.uid));
+          setFixedGid(String(result.uploadOwnership.gid));
+        } else {
+          setFixedUid(String(result.identities.users.find((item) => item.id === 0)?.id ?? result.identities.users[0]?.id ?? 0));
+          setFixedGid(String(result.identities.groups.find((item) => item.id === 0)?.id ?? result.identities.groups[0]?.id ?? 0));
+        }
+        setLoaded(true);
+      })
+      .catch((caught) => { if ((caught as Error).name !== "AbortError") setError((caught as Error).message); });
+    return () => controller.abort();
+  }, []);
+
+  const credentialsChanged = username !== initialUsername || Boolean(newPassword);
+  const uploadOwnership: UploadOwnershipPreference = uploadMode === "fixed"
+    ? { mode: "fixed", uid: Number(fixedUid), gid: Number(fixedGid) }
+    : { mode: uploadMode };
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -890,11 +980,15 @@ function PreferencesDialog({ username: initialUsername, onClose, onUpdated }: { 
       setError("New passwords do not match");
       return;
     }
+    if (uploadMode === "fixed" && (!fixedUid || !fixedGid)) {
+      setError("Choose both a default owner and group");
+      return;
+    }
     setBusy(true);
     try {
       await requestJson("/api/auth/preferences", {
         method: "POST",
-        body: JSON.stringify({ currentPassword, username, newPassword: newPassword || undefined }),
+        body: JSON.stringify({ currentPassword: currentPassword || undefined, username, newPassword: newPassword || undefined, uploadOwnership }),
       });
       await onUpdated();
     } catch (caught) {
@@ -904,7 +998,7 @@ function PreferencesDialog({ username: initialUsername, onClose, onUpdated }: { 
     }
   };
 
-  return <Modal title="Preferences" subtitle="Account and sign-in security" icon={<Settings2 size={19} />} onClose={onClose}><form className="preferences-form" onSubmit={submit}><div className="preferences-intro"><div className="avatar large-avatar">{initialUsername.slice(0, 1).toUpperCase()}</div><div><strong>Administrator account</strong><span>Changing these details invalidates other signed-in sessions.</span></div></div><div className="settings-section"><div className="settings-section-title"><span><UserRoundCog size={16} /></span><div><strong>Username</strong><small>Used on the FilesDude sign-in screen</small></div></div><FormField label="Username"><input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" minLength={3} maxLength={64} pattern="[A-Za-z0-9._-]+" required /></FormField></div><div className="settings-section"><div className="settings-section-title"><span><LockKeyhole size={16} /></span><div><strong>Password</strong><small>Leave the new password blank to keep the existing one</small></div></div><FormField label="Current password"><div className="password-field"><input type={showPasswords ? "text" : "password"} value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} autoComplete="current-password" required /><LockKeyhole size={15} /></div></FormField><div className="field-pair preferences-passwords"><FormField label="New password"><input type={showPasswords ? "text" : "password"} value={newPassword} onChange={(event) => setNewPassword(event.target.value)} autoComplete="new-password" minLength={newPassword ? 12 : undefined} placeholder="At least 12 characters" /></FormField><FormField label="Confirm new password"><input type={showPasswords ? "text" : "password"} value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} autoComplete="new-password" placeholder="Repeat new password" /></FormField></div><label className="show-passwords"><input type="checkbox" checked={showPasswords} onChange={(event) => setShowPasswords(event.target.checked)} />{showPasswords ? <EyeOff size={15} /> : <Eye size={15} />} Show passwords</label></div>{error && <div className="form-error"><CircleAlert size={16} />{error}</div>}<div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy}>{busy ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}Save preferences</button></div></form></Modal>;
+  return <Modal title="Preferences" subtitle="Account, sign-in security, and upload defaults" icon={<Settings2 size={19} />} onClose={onClose}><form className="preferences-form" onSubmit={submit}><div className="preferences-intro"><div className="avatar large-avatar">{initialUsername.slice(0, 1).toUpperCase()}</div><div><strong>Administrator account</strong><span>Account changes invalidate other signed-in sessions.</span></div></div><div className="settings-section"><div className="settings-section-title"><span><Upload size={16} /></span><div><strong>Default upload ownership</strong><small>This choice is preselected for confirmation before every upload</small></div></div><FormField label="Default owner and group"><select value={uploadMode} onChange={(event) => setUploadMode(event.target.value as UploadOwnershipPreference["mode"])} disabled={!loaded}><option value="destination">Match the destination folder</option><option value="service">Keep FilesDude service ownership</option><option value="fixed">Use a fixed owner and group</option></select></FormField>{uploadMode === "fixed" && <div className="field-pair preference-identity-pair"><FormField label="Owner"><select value={fixedUid} onChange={(event) => setFixedUid(event.target.value)} required>{!users.some((user) => String(user.id) === fixedUid) && <option value={fixedUid}>UID {fixedUid}</option>}{users.map((user) => <option key={user.id} value={user.id}>{user.name} ({user.id})</option>)}</select></FormField><FormField label="Group"><select value={fixedGid} onChange={(event) => setFixedGid(event.target.value)} required>{!groups.some((group) => String(group.id) === fixedGid) && <option value={fixedGid}>GID {fixedGid}</option>}{groups.map((group) => <option key={group.id} value={group.id}>{group.name} ({group.id})</option>)}</select></FormField></div>}<div className="info-box"><Info size={17} /> FilesDude still shows the detected owner/group choices each time, so unusual folders can be handled safely.</div></div><div className="settings-section"><div className="settings-section-title"><span><UserRoundCog size={16} /></span><div><strong>Username</strong><small>Used on the FilesDude sign-in screen</small></div></div><FormField label="Username"><input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" minLength={3} maxLength={64} pattern="[A-Za-z0-9._-]+" required /></FormField></div><div className="settings-section"><div className="settings-section-title"><span><LockKeyhole size={16} /></span><div><strong>Password</strong><small>Only required when changing the username or password</small></div></div><FormField label="Current password" hint={credentialsChanged ? "Required to save account changes" : "Not needed for upload preferences"}><div className="password-field"><input type={showPasswords ? "text" : "password"} value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} autoComplete="current-password" required={credentialsChanged} /><LockKeyhole size={15} /></div></FormField><div className="field-pair preferences-passwords"><FormField label="New password"><input type={showPasswords ? "text" : "password"} value={newPassword} onChange={(event) => setNewPassword(event.target.value)} autoComplete="new-password" minLength={newPassword ? 12 : undefined} placeholder="At least 12 characters" /></FormField><FormField label="Confirm new password"><input type={showPasswords ? "text" : "password"} value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} autoComplete="new-password" placeholder="Repeat new password" /></FormField></div><label className="show-passwords"><input type="checkbox" checked={showPasswords} onChange={(event) => setShowPasswords(event.target.checked)} />{showPasswords ? <EyeOff size={15} /> : <Eye size={15} />} Show passwords</label></div>{error && <div className="form-error"><CircleAlert size={16} />{error}</div>}<div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy || !loaded}>{busy ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}Save preferences</button></div></form></Modal>;
 }
 
 function PreviewDialog({ entry, onClose }: { entry: FileEntry; onClose: () => void }) {

@@ -8,7 +8,7 @@ FilesDude is a secure, self-hosted web file manager designed for a Proxmox host,
 - Use a SharePoint-style row menu for preview, text editing, downloads, organization, administration, properties, and deletion
 - Pin durable favourite folder locations to the sidebar from a folder menu, selection toolbar, or the current-location button
 - Create files and folders; edit text/code files up to 2 MB; rename, copy, move, soft-delete, and permanently delete
-- Multi-file drag-and-drop upload with collision-safe names and a configurable size limit
+- Multi-file drag-and-drop upload with collision-safe names, a configurable size limit, and owner/group confirmation based on the destination folder and its existing contents
 - Direct file downloads and ZIP downloads for folders
 - Inline previews for text, code, JSON, images, PDF, audio, and video; media uses byte-range streaming
 - POSIX `chmod` and numeric `chown` for one or many items
@@ -79,9 +79,18 @@ audit log, and other state in `/var/lib/filesdude`.
 ## Change the username or password
 
 Open the account area at the bottom-left of FilesDude and choose **Preferences**.
-Enter the current password, then change the username, password, or both. The new
-credentials are stored in the protected state directory and all other sessions
-are invalidated. The current browser receives a fresh session automatically.
+From there you can:
+
+- Change the username, password, or both. The current password is only required
+  for account changes; other sessions are invalidated when credentials change.
+- Select the default upload ownership: match the destination folder, keep the
+  FilesDude service account, or use a fixed system owner and group.
+
+Before every upload, FilesDude shows the saved default alongside owner/group
+pairs detected from the destination folder and its existing contents. Applying
+ownership other than the service identity requires the systemd service to run
+as root; the installer offers this mode when full ownership administration is
+needed.
 
 ## Manual development setup
 

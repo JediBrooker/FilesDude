@@ -3,7 +3,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { config } from "./config";
 import { AppError } from "./http";
-import type { BulkRenameRule, DiskInfo, FileEntry, RenamePreview } from "./types";
+import type { BulkRenameRule, DiskInfo, FileEntry, IdentityOption, OwnershipPair, RenamePreview } from "./types";
 
 const INTERNAL_NAMES = new Set([".filedude"]);
 const mimeTypes: Record<string, string> = {
@@ -103,6 +103,86 @@ async function identities() {
   }
   identitiesCache = { users, groups, at: Date.now() };
   return identitiesCache;
+}
+
+async function namedOwnership(uid: number, gid: number): Promise<OwnershipPair> {
+  const ids = await identities();
+  return {
+    uid,
+    gid,
+    owner: ids.users.get(uid) || String(uid),
+    group: ids.groups.get(gid) || String(gid),
+  };
+}
+
+export async function identityCatalog(): Promise<{ users: IdentityOption[]; groups: IdentityOption[] }> {
+  const ids = await identities();
+  const sort = (a: IdentityOption, b: IdentityOption) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" });
+  return {
+    users: [...ids.users].map(([id, name]) => ({ id, name })).sort(sort),
+    groups: [...ids.groups].map(([id, name]) => ({ id, name })).sort(sort),
+  };
+}
+
+export async function isKnownIdentityPair(uid: number, gid: number) {
+  if (!Number.isInteger(uid) || uid < 0 || !Number.isInteger(gid) || gid < 0) return false;
+  const ids = await identities();
+  return ids.users.has(uid) && ids.groups.has(gid);
+}
+
+export async function resolveOwnershipPair(uid: number, gid: number, source?: OwnershipPair["source"]) {
+  return { ...(await namedOwnership(uid, gid)), source };
+}
+
+export async function uploadOwnershipOptions(relativePath = "") {
+  const absolute = await safeResolve(relativePath);
+  const directoryStat = await fs.stat(absolute);
+  if (!directoryStat.isDirectory()) throw new AppError("Upload destination is not a folder", 400, "NOT_A_DIRECTORY");
+
+  const names = await fs.readdir(absolute);
+  const limit = 2_000;
+  const samples = await Promise.allSettled(names.slice(0, limit).map((name) => fs.lstat(path.join(absolute, name))));
+  const counts = new Map<string, { uid: number; gid: number; count: number }>();
+  for (const sample of samples) {
+    if (sample.status !== "fulfilled") continue;
+    const key = `${sample.value.uid}:${sample.value.gid}`;
+    const current = counts.get(key);
+    if (current) current.count += 1;
+    else counts.set(key, { uid: sample.value.uid, gid: sample.value.gid, count: 1 });
+  }
+
+  const destination = { ...(await namedOwnership(directoryStat.uid, directoryStat.gid)), source: "destination" as const };
+  const detected = await Promise.all([...counts.values()].map(async (pair) => ({
+    ...(await namedOwnership(pair.uid, pair.gid)),
+    count: pair.count,
+    source: pair.uid === destination.uid && pair.gid === destination.gid ? "destination" as const : "contents" as const,
+  })));
+  if (!detected.some((pair) => pair.uid === destination.uid && pair.gid === destination.gid)) {
+    detected.unshift({ ...destination, count: 0 });
+  }
+  detected.sort((a, b) => {
+    if (a.source === "destination" && b.source !== "destination") return -1;
+    if (a.source !== "destination" && b.source === "destination") return 1;
+    return (b.count || 0) - (a.count || 0) || a.owner.localeCompare(b.owner);
+  });
+
+  const serviceUid = typeof process.getuid === "function" ? process.getuid() : directoryStat.uid;
+  const serviceGid = typeof process.getgid === "function" ? process.getgid() : directoryStat.gid;
+  return {
+    destination,
+    detected,
+    service: { ...(await namedOwnership(serviceUid, serviceGid)), source: "service" as const },
+    canChangeOwnership: typeof process.getuid === "function" && process.getuid() === 0,
+    truncated: names.length > limit,
+  };
+}
+
+export async function isAvailableUploadOwnership(relativePath: string, uid: number, gid: number, savedDefault?: { uid: number; gid: number }) {
+  if (!Number.isInteger(uid) || uid < 0 || !Number.isInteger(gid) || gid < 0) return false;
+  if (savedDefault?.uid === uid && savedDefault.gid === gid) return true;
+  if (await isKnownIdentityPair(uid, gid)) return true;
+  const options = await uploadOwnershipOptions(relativePath);
+  return options.detected.some((pair) => pair.uid === uid && pair.gid === gid);
 }
 
 async function toEntry(absolute: string, name = path.basename(absolute)): Promise<FileEntry> {
