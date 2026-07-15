@@ -1,0 +1,10 @@
+# Replace files.example.com with the hostname you control.
+files.example.com {
+  encode zstd gzip
+  reverse_proxy 127.0.0.1:3000
+
+  header {
+    -Server
+    Strict-Transport-Security "max-age=31536000; includeSubDomains"
+  }
+}

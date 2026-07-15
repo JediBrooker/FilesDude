@@ -1,0 +1,7 @@
+Welcome to FilesDude.
+
+This is the safe demonstration root. Set FILEDUDE_ROOT (or FILEDUDE_HOST_ROOT
+when using Docker Compose) to the folder you want to manage on your Proxmox
+server.
+
+FilesDude will not allow browser operations to leave that configured root.

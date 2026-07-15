@@ -1,0 +1,23 @@
+services:
+  filesdude:
+    build: .
+    container_name: filesdude
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      FILEDUDE_ROOT: /data
+      FILEDUDE_STATE_DIR: /state
+    volumes:
+      - ${FILEDUDE_HOST_ROOT:-./demo-root}:/data:rw
+      - filesdude-state:/state
+    ports:
+      - "127.0.0.1:3000:3000"
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  filesdude-state:
