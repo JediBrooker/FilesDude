@@ -55,6 +55,7 @@ done
 [[ ${PORT} =~ ^[0-9]+$ ]] && ((PORT >= 1 && PORT <= 65535)) || fail "Port must be between 1 and 65535."
 
 export DEBIAN_FRONTEND=noninteractive
+export npm_config_update_notifier=false
 say "Installing operating-system prerequisites"
 apt-get update -qq
 apt-get install -y -qq ca-certificates curl openssl tar xz-utils >/dev/null

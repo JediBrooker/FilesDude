@@ -1,7 +1,7 @@
 FROM node:22-bookworm-slim AS dependencies
 WORKDIR /app
-COPY package.json package-lock.json ./
-RUN npm ci
+COPY package.json package-lock.json .npmrc ./
+RUN npm ci --no-audit --no-fund
 
 FROM node:22-bookworm-slim AS builder
 WORKDIR /app

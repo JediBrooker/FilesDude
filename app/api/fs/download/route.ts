@@ -2,7 +2,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { PassThrough, Readable } from "node:stream";
-import archiver from "archiver";
+import { ZipArchive } from "archiver";
 import { requireSession } from "@/lib/auth";
 import { audit } from "@/lib/audit";
 import { getMime, safeResolve } from "@/lib/files";
@@ -27,7 +27,7 @@ export async function GET(request: Request) {
 
     if (stat.isDirectory()) {
       const output = new PassThrough();
-      const archive = archiver("zip", { zlib: { level: 6 } });
+      const archive = new ZipArchive({ zlib: { level: 6 } });
       archive.on("error", (error) => output.destroy(error));
       archive.pipe(output);
       archive.directory(absolute, name);
