@@ -21,7 +21,21 @@ FilesDude is a secure, self-hosted web file manager designed for a Proxmox host,
 
 ## Install on Proxmox with systemd
 
-SSH into the Proxmox server, download the installer, and run it:
+This GitHub repository is currently private. SSH into the Proxmox server,
+authenticate GitHub CLI once, and run the installer without exposing the token
+in the downloaded file or Git remote:
+
+```bash
+sudo apt update && sudo apt install -y gh
+gh auth login
+gh api -H "Accept: application/vnd.github.raw+json" \
+  "/repos/JediBrooker/FilesDude/contents/install.sh?ref=main" \
+  | sudo GITHUB_TOKEN="$(gh auth token)" bash
+```
+
+The token only needs read access to this repository. It is used for that run and
+is not stored by FilesDude. If you later make the repository public, the shorter
+installer works without GitHub authentication:
 
 ```bash
 curl -fsSLo /tmp/filesdude-install.sh \
@@ -43,6 +57,13 @@ Useful service commands:
 systemctl status filesdude
 journalctl -u filesdude -f
 sudo filesdude-update
+```
+
+For updates while the repository remains private, pass a fresh token from your
+GitHub CLI login:
+
+```bash
+sudo GITHUB_TOKEN="$(gh auth token)" filesdude-update
 ```
 
 To recover a forgotten login, generate a new bootstrap login and invalidate all

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-REPOSITORY="https://github.com/JediBrooker/FilesDude.git"
+GITHUB_REPOSITORY="${FILEDUDE_GITHUB_REPOSITORY:-JediBrooker/FilesDude}"
+GITHUB_REF="${FILEDUDE_GITHUB_REF:-main}"
 APP_HOME="/opt/filesdude"
 CONFIG_DIR="/etc/filesdude"
 ENV_FILE="${CONFIG_DIR}/filesdude.env"
@@ -32,6 +33,7 @@ Options:
   --help                  Show this help
 
 For unattended first installs, set FILEDUDE_INSTALL_PASSWORD in the environment.
+For a private GitHub repository, also pass a read-only GITHUB_TOKEN.
 EOF
 }
 
@@ -55,7 +57,7 @@ done
 export DEBIAN_FRONTEND=noninteractive
 say "Installing operating-system prerequisites"
 apt-get update -qq
-apt-get install -y -qq ca-certificates curl git openssl xz-utils >/dev/null
+apt-get install -y -qq ca-certificates curl openssl tar xz-utils >/dev/null
 
 ensure_node() {
   local current_major="0"
@@ -99,7 +101,21 @@ export PATH="${APP_HOME}/node/bin:${PATH}"
 say "Downloading and building FilesDude"
 BUILD_ROOT="$(mktemp -d)"
 trap 'rm -rf "${BUILD_ROOT}"' EXIT
-git clone --depth 1 --branch main "${REPOSITORY}" "${BUILD_ROOT}/source" >/dev/null 2>&1
+ARCHIVE="${BUILD_ROOT}/source.tar.gz"
+SOURCE_URL="https://api.github.com/repos/${GITHUB_REPOSITORY}/tarball/${GITHUB_REF}"
+CURL_AUTH=()
+if [[ -n ${GITHUB_TOKEN:-} ]]; then
+  TOKEN_CONFIG="${BUILD_ROOT}/github-curl.conf"
+  umask 077
+  printf 'header = "Authorization: Bearer %s"\n' "${GITHUB_TOKEN}" >"${TOKEN_CONFIG}"
+  CURL_AUTH=(--config "${TOKEN_CONFIG}")
+fi
+if ! curl -fsSL --retry 3 --header 'Accept: application/vnd.github+json' \
+  "${CURL_AUTH[@]}" "${SOURCE_URL}" -o "${ARCHIVE}"; then
+  fail "Could not download ${GITHUB_REPOSITORY}. If it is private, pass a read-only GITHUB_TOKEN."
+fi
+mkdir -p "${BUILD_ROOT}/source"
+tar -xzf "${ARCHIVE}" --strip-components=1 -C "${BUILD_ROOT}/source"
 cd "${BUILD_ROOT}/source"
 npm ci --no-audit --no-fund >/dev/null
 NEXT_TELEMETRY_DISABLED=1 npm run build >/dev/null
@@ -109,6 +125,7 @@ mkdir -p "${RELEASE}/.next"
 cp -a .next/standalone/. "${RELEASE}/"
 cp -a .next/static "${RELEASE}/.next/static"
 cp -a public "${RELEASE}/public"
+install -m 0755 install.sh "${RELEASE}/install.sh"
 ln -sfn "${RELEASE}" "${APP_HOME}/current.new"
 mv -Tf "${APP_HOME}/current.new" "${APP_HOME}/current"
 
@@ -262,10 +279,7 @@ EOF
 cat >/usr/local/sbin/filesdude-update <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
-tmp="$(mktemp)"
-trap 'rm -f "${tmp}"' EXIT
-curl -fsSL https://raw.githubusercontent.com/JediBrooker/FilesDude/main/install.sh -o "${tmp}"
-bash "${tmp}" --update "$@"
+exec /opt/filesdude/current/install.sh --update "$@"
 EOF
 chmod 755 /usr/local/sbin/filesdude-update
 
@@ -282,4 +296,7 @@ printf 'Open: http://<proxmox-ip>:%s\n' "${PORT}"
 printf 'Status: systemctl status filesdude\n'
 printf 'Logs: journalctl -u filesdude -f\n'
 printf 'Update later: sudo filesdude-update\n'
+if [[ -n ${GITHUB_TOKEN:-} ]]; then
+  printf 'Private-repo update: sudo GITHUB_TOKEN="$(gh auth token)" filesdude-update\n'
+fi
 printf '\nFor remote access, place an HTTPS reverse proxy or VPN in front of FilesDude.\n'
