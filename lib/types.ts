@@ -55,6 +55,12 @@ export interface IdentityOption {
 
 export interface LargestFilesResult {
   entries: FileEntry[];
+  totalMatching: number;
+  matchingBytes: number;
+  offset: number;
+  limit: number;
+  nextOffset: number;
+  hasMore: boolean;
   scannedFiles: number;
   scannedDirectories: number;
   skippedEntries: number;

@@ -13,7 +13,8 @@ FilesDude is a secure, self-hosted web file manager designed for a Proxmox host,
 - Inline previews for text, code, JSON, images, PDF, audio, and video; media uses byte-range streaming
 - POSIX `chmod` and numeric `chown` for one or many items
 - Bulk rename with find/replace, regular expressions, prefix, suffix, sequential numbering, live conflict detection, and two-phase application
-- Recursive filename search, disk usage, owner/group display, symlink escape warnings, and a cached whole-tree view of the 100 largest files from the clickable Storage card
+- Recursive filename search, disk usage, owner/group display, symlink escape warnings, and a cached whole-tree largest-files view from the clickable Storage card
+- Filter largest files by a minimum size, load 100, 250, or 500 more at a time, export the currently loaded results to CSV, and move one or many selected files to protected trash (or permanently delete them after confirmation)
 - Protected trash by default, persistent favourites, and a JSON Lines audit log inside the protected state directory
 - Signed, expiring, HTTP-only, SameSite login sessions; scrypt password hashes; login throttling; same-origin mutation checks; and hardened response headers
 - Account preferences for changing the username and password; credential changes invalidate other sessions
@@ -91,6 +92,18 @@ pairs detected from the destination folder and its existing contents. Applying
 ownership other than the service identity requires the systemd service to run
 as root; the installer offers this mode when full ownership administration is
 needed.
+
+## Find and cull large files
+
+Click the **Storage** card in the sidebar to scan the entire configured root.
+Set a minimum size in GB, choose whether each page loads 100, 250, or 500 files,
+and use **Show more** until the required results are visible. **Export CSV**
+exports every currently loaded row, including its path, exact byte count,
+owner, group, and modified time.
+
+Use the row checkboxes (or the header checkbox for all loaded rows) to select
+files for bulk deletion. Deletion uses FilesDude's protected trash unless you
+explicitly enable permanent deletion in the confirmation panel.
 
 ## Manual development setup
 

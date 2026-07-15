@@ -11,9 +11,13 @@ export async function GET(request: Request) {
     await requireSession(request);
     const url = new URL(request.url);
     const requestedLimit = Number(url.searchParams.get("limit") || 100);
-    const limit = Number.isFinite(requestedLimit) ? Math.min(200, Math.max(10, Math.floor(requestedLimit))) : 100;
-    const result = await largestFiles(url.searchParams.get("refresh") === "true");
-    return NextResponse.json({ ...result, entries: result.entries.slice(0, limit) }, { headers: { "Cache-Control": "no-store" } });
+    const requestedOffset = Number(url.searchParams.get("offset") || 0);
+    const requestedMinBytes = Number(url.searchParams.get("minBytes") || 0);
+    const limit = Number.isFinite(requestedLimit) ? Math.min(500, Math.max(10, Math.floor(requestedLimit))) : 100;
+    const offset = Number.isFinite(requestedOffset) ? Math.max(0, Math.floor(requestedOffset)) : 0;
+    const minBytes = Number.isFinite(requestedMinBytes) ? Math.max(0, Math.floor(requestedMinBytes)) : 0;
+    const result = await largestFiles({ refresh: url.searchParams.get("refresh") === "true", minBytes, offset, limit });
+    return NextResponse.json(result, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {
     return jsonError(error);
   }

@@ -21,8 +21,8 @@ const mimeTypes: Record<string, string> = {
 
 let identitiesCache: { users: Map<number, string>; groups: Map<number, string>; at: number } | null = null;
 let canonicalRoot: string | null = null;
-let largestFilesCache: { at: number; result: LargestFilesResult } | null = null;
-let largestFilesScan: Promise<LargestFilesResult> | null = null;
+let largestFilesCache: { at: number; index: LargestFilesIndex } | null = null;
+let largestFilesScan: Promise<LargestFilesIndex> | null = null;
 
 export function getMime(filePath: string) {
   return mimeTypes[path.extname(filePath).toLowerCase()] || "application/octet-stream";
@@ -467,46 +467,20 @@ export async function details(relativePath: string) {
 }
 
 type LargestCandidate = { absolute: string; size: number };
+type LargestFilesIndex = {
+  candidates: LargestCandidate[];
+  scannedFiles: number;
+  scannedDirectories: number;
+  skippedEntries: number;
+  durationMs: number;
+  generatedAt: string;
+};
 
-function addLargestCandidate(heap: LargestCandidate[], candidate: LargestCandidate, limit: number) {
-  const smaller = (left: LargestCandidate, right: LargestCandidate) => left.size < right.size
-    || left.size === right.size && left.absolute.localeCompare(right.absolute) > 0;
-  const rise = (index: number) => {
-    while (index > 0) {
-      const parent = Math.floor((index - 1) / 2);
-      if (!smaller(heap[index], heap[parent])) break;
-      [heap[index], heap[parent]] = [heap[parent], heap[index]];
-      index = parent;
-    }
-  };
-  const sink = (index: number) => {
-    while (true) {
-      const left = index * 2 + 1;
-      const right = left + 1;
-      let smallest = index;
-      if (left < heap.length && smaller(heap[left], heap[smallest])) smallest = left;
-      if (right < heap.length && smaller(heap[right], heap[smallest])) smallest = right;
-      if (smallest === index) break;
-      [heap[index], heap[smallest]] = [heap[smallest], heap[index]];
-      index = smallest;
-    }
-  };
-
-  if (heap.length < limit) {
-    heap.push(candidate);
-    rise(heap.length - 1);
-  } else if (smaller(heap[0], candidate)) {
-    heap[0] = candidate;
-    sink(0);
-  }
-}
-
-async function scanLargestFiles(): Promise<LargestFilesResult> {
+async function scanLargestFiles(): Promise<LargestFilesIndex> {
   const startedAt = Date.now();
   const root = await ensureRoot();
   const directoryQueue = [root];
-  const largest: LargestCandidate[] = [];
-  const resultLimit = 200;
+  const candidates: LargestCandidate[] = [];
   let scannedFiles = 0;
   let scannedDirectories = 0;
   let skippedEntries = 0;
@@ -542,7 +516,7 @@ async function scanLargestFiles(): Promise<LargestFilesResult> {
           if (item.value.stat.isDirectory()) directories.push(item.value.absolute);
           else if (item.value.stat.isFile()) {
             scannedFiles += 1;
-            addLargestCandidate(largest, { absolute: item.value.absolute, size: item.value.stat.size }, resultLimit);
+            candidates.push({ absolute: item.value.absolute, size: item.value.stat.size });
           }
         }
       }
@@ -551,32 +525,58 @@ async function scanLargestFiles(): Promise<LargestFilesResult> {
     directoryQueue.push(...discovered.flat());
   }
 
-  const ranked = largest.sort((a, b) => b.size - a.size || a.absolute.localeCompare(b.absolute));
-  const converted = await Promise.allSettled(ranked.map((candidate) => toEntry(candidate.absolute)));
-  const entries = converted.flatMap((item) => item.status === "fulfilled" ? [item.value] : []);
-  skippedEntries += converted.length - entries.length;
+  candidates.sort((a, b) => b.size - a.size || a.absolute.localeCompare(b.absolute));
   return {
-    entries,
+    candidates,
     scannedFiles,
     scannedDirectories,
     skippedEntries,
     durationMs: Date.now() - startedAt,
     generatedAt: new Date().toISOString(),
-    cached: false,
   };
 }
 
-export async function largestFiles(refresh = false): Promise<LargestFilesResult> {
-  if (!refresh && largestFilesCache && Date.now() - largestFilesCache.at < 60_000) {
-    return { ...largestFilesCache.result, cached: true };
+export async function largestFiles({ refresh = false, minBytes = 0, offset = 0, limit = 100 }: { refresh?: boolean; minBytes?: number; offset?: number; limit?: number } = {}): Promise<LargestFilesResult> {
+  let index: LargestFilesIndex;
+  let cached = false;
+  if (!refresh && largestFilesCache && Date.now() - largestFilesCache.at < 5 * 60_000) {
+    index = largestFilesCache.index;
+    cached = true;
+  } else {
+    if (!largestFilesScan) {
+      largestFilesScan = scanLargestFiles()
+        .then((value) => {
+          largestFilesCache = { at: Date.now(), index: value };
+          return value;
+        })
+        .finally(() => { largestFilesScan = null; });
+    }
+    index = await largestFilesScan;
   }
-  if (!largestFilesScan) {
-    largestFilesScan = scanLargestFiles()
-      .then((result) => {
-        largestFilesCache = { at: Date.now(), result };
-        return result;
-      })
-      .finally(() => { largestFilesScan = null; });
+
+  const matching = minBytes > 0 ? index.candidates.filter((candidate) => candidate.size >= minBytes) : index.candidates;
+  const page = matching.slice(offset, offset + limit);
+  const entries: FileEntry[] = [];
+  let pageSkipped = 0;
+  for (let start = 0; start < page.length; start += 64) {
+    const converted = await Promise.allSettled(page.slice(start, start + 64).map((candidate) => toEntry(candidate.absolute)));
+    entries.push(...converted.flatMap((item) => item.status === "fulfilled" ? [item.value] : []));
+    pageSkipped += converted.filter((item) => item.status === "rejected").length;
   }
-  return largestFilesScan;
+  const nextOffset = Math.min(matching.length, offset + page.length);
+  return {
+    entries,
+    totalMatching: matching.length,
+    matchingBytes: matching.reduce((total, candidate) => total + candidate.size, 0),
+    offset,
+    limit,
+    nextOffset,
+    hasMore: nextOffset < matching.length,
+    scannedFiles: index.scannedFiles,
+    scannedDirectories: index.scannedDirectories,
+    skippedEntries: index.skippedEntries + pageSkipped,
+    durationMs: index.durationMs,
+    generatedAt: index.generatedAt,
+    cached,
+  };
 }

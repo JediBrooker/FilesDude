@@ -102,6 +102,10 @@ function formatGigabytes(value: number) {
   return `${(value / 1024 ** 3).toFixed(value >= 10 * 1024 ** 3 ? 1 : 2)} GB`;
 }
 
+function csvCell(value: string | number) {
+  return `"${String(value).replaceAll('"', '""')}"`;
+}
+
 function formatDate(value: string) {
   const date = new Date(value);
   const today = new Date();
@@ -762,7 +766,7 @@ function DialogHost({ dialog, selected, currentPath, username, onClose, onRun, n
   onPreview: (entry: FileEntry) => void;
 }) {
   if (dialog.kind === "upload") return <UploadDialog files={dialog.files} currentPath={currentPath} onClose={onClose} notify={notify} onComplete={onRefresh} />;
-  if (dialog.kind === "storage") return <StorageDialog onClose={onClose} onReveal={onReveal} onPreview={onPreview} />;
+  if (dialog.kind === "storage") return <StorageDialog onClose={onClose} onReveal={onReveal} onPreview={onPreview} notify={notify} />;
   if (dialog.kind === "new") return <NewDialog path={currentPath} onClose={onClose} onRun={onRun} />;
   if (dialog.kind === "rename") return <RenameDialog entry={dialog.entry} onClose={onClose} onRun={onRun} />;
   if (dialog.kind === "delete") return <DeleteDialog entries={selected} onClose={onClose} onRun={onRun} />;
@@ -784,21 +788,40 @@ function ModalActions({ onClose, submitLabel, danger = false, busy = false }: { 
   return <div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className={`button ${danger ? "danger" : "primary"}`} disabled={busy}>{busy && <LoaderCircle className="spin" size={16} />}{submitLabel}</button></div>;
 }
 
-function StorageDialog({ onClose, onReveal, onPreview }: { onClose: () => void; onReveal: (entry: FileEntry) => void; onPreview: (entry: FileEntry) => void }) {
+function StorageDialog({ onClose, onReveal, onPreview, notify }: { onClose: () => void; onReveal: (entry: FileEntry) => void; onPreview: (entry: FileEntry) => void; notify: (message: string, tone?: "error") => void }) {
   const [result, setResult] = useState<LargestFilesResult | null>(null);
   const [loading, setLoading] = useState(true);
+  const [pageSize, setPageSize] = useState(100);
+  const [minimumGb, setMinimumGb] = useState("0");
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [deleteTargets, setDeleteTargets] = useState<FileEntry[] | null>(null);
+  const [permanent, setPermanent] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState("");
   const requestRef = useRef<AbortController | null>(null);
+  const nextOffsetRef = useRef(0);
+  const minBytesRef = useRef(0);
+  const pageSizeRef = useRef(100);
 
-  const load = useCallback(async (refresh = false) => {
+  const load = useCallback(async ({ refresh = false, append = false, minBytes = minBytesRef.current, limit = pageSizeRef.current }: { refresh?: boolean; append?: boolean; minBytes?: number; limit?: number } = {}) => {
     requestRef.current?.abort();
     const controller = new AbortController();
     requestRef.current = controller;
+    const offset = append ? nextOffsetRef.current : 0;
     setLoading(true);
     setError("");
     try {
-      const value = await requestJson<LargestFilesResult>(`/api/fs/largest?limit=100${refresh ? "&refresh=true" : ""}`, { signal: controller.signal });
-      setResult(value);
+      const params = new URLSearchParams({ limit: String(limit), offset: String(offset), minBytes: String(minBytes) });
+      if (refresh) params.set("refresh", "true");
+      const value = await requestJson<LargestFilesResult>(`/api/fs/largest?${params}`, { signal: controller.signal });
+      nextOffsetRef.current = value.nextOffset;
+      minBytesRef.current = minBytes;
+      setResult((previous) => {
+        if (!append || !previous) return value;
+        const paths = new Set(previous.entries.map((entry) => entry.path));
+        return { ...value, entries: [...previous.entries, ...value.entries.filter((entry) => !paths.has(entry.path))] };
+      });
+      if (!append) setSelected(new Set());
     } catch (caught) {
       if ((caught as Error).name !== "AbortError") setError((caught as Error).message);
     } finally {
@@ -814,7 +837,111 @@ function StorageDialog({ onClose, onReveal, onPreview }: { onClose: () => void; 
     };
   }, [load]);
 
-  return <Modal title="Largest files" subtitle="Files using the most space across the entire directory tree" icon={<HardDrive size={19} />} onClose={onClose} wide><div className="storage-browser"><div className="storage-scan-bar"><div>{result ? <><strong>{result.entries.length} largest files</strong><span>Scanned {result.scannedFiles.toLocaleString()} files in {result.scannedDirectories.toLocaleString()} folders · {(result.durationMs / 1000).toFixed(1)}s{result.cached ? " · cached" : ""}</span></> : <><strong>Whole-tree storage scan</strong><span>Every accessible folder under the configured root</span></>}</div><button className="button secondary" disabled={loading} onClick={() => void load(true)}><RefreshCw size={15} className={loading ? "spin" : ""} /> Refresh</button></div>{loading && !result ? <div className="storage-scan-state"><LoaderCircle className="spin" size={25} /><strong>Finding the largest files…</strong><span>Large directory trees can take a little while on the first scan.</span></div> : error && !result ? <div className="storage-scan-state error"><CircleAlert size={25} /><strong>Unable to scan storage</strong><span>{error}</span><button className="button secondary" onClick={() => void load(true)}>Try again</button></div> : result && <><div className="largest-file-table" role="table" aria-label="Largest files"><div className="largest-file-row largest-file-header" role="row"><div role="columnheader">#</div><div role="columnheader">Name</div><div role="columnheader">Location</div><div role="columnheader">Size (GB)</div><div role="columnheader">Modified</div><div role="columnheader" /></div>{result.entries.map((entry, index) => <div className="largest-file-row" role="row" key={entry.path}><div className="largest-rank" role="cell">{index + 1}</div><div className="largest-name" role="cell"><span className={`file-icon ${entry.type}`}>{fileIcon(entry, 17)}</span><button title={entry.name} onClick={() => onPreview(entry)}>{entry.name}</button></div><div className="largest-location" role="cell" title={`/${entry.path}`}><span>/</span>{entry.path.split("/").slice(0, -1).join("/") || "Root"}</div><div className="largest-size" role="cell" title={formatBytes(entry.size)}>{formatGigabytes(entry.size)}</div><div className="muted" role="cell">{formatDate(entry.modified)}</div><div className="largest-actions" role="cell"><button className="icon-button" title="Open containing folder" aria-label={`Open folder containing ${entry.name}`} onClick={() => onReveal(entry)}><FolderOpen size={16} /></button><a className="icon-button" title="Download" aria-label={`Download ${entry.name}`} href={`/api/fs/download?path=${encodePath(entry.path)}`}><Download size={16} /></a></div></div>)}</div>{error && <div className="storage-scan-note error"><CircleAlert size={15} /> Refresh failed: {error}</div>}{result.skippedEntries > 0 && <div className="storage-scan-note"><Info size={15} /> {result.skippedEntries.toLocaleString()} inaccessible or changed {result.skippedEntries === 1 ? "entry was" : "entries were"} skipped.</div>}<div className="storage-scan-foot"><span>Scanned {new Date(result.generatedAt).toLocaleString()}</span><button className="button primary" onClick={onClose}>Done</button></div></>}</div></Modal>;
+  const applyMinimum = (event: FormEvent) => {
+    event.preventDefault();
+    const value = Math.max(0, Number(minimumGb) || 0);
+    const minBytes = Math.floor(value * 1024 ** 3);
+    minBytesRef.current = minBytes;
+    nextOffsetRef.current = 0;
+    void load({ minBytes, limit: pageSize });
+  };
+
+  const toggleSelected = (path: string) => {
+    setSelected((current) => {
+      const next = new Set(current);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+  };
+
+  const allLoadedSelected = Boolean(result?.entries.length) && result!.entries.every((entry) => selected.has(entry.path));
+  const selectedEntries = result?.entries.filter((entry) => selected.has(entry.path)) || [];
+
+  const exportCurrentList = () => {
+    if (!result?.entries.length) return;
+    const header = ["Rank", "Name", "Path", "Size (GB)", "Size (bytes)", "Owner", "Group", "Modified"];
+    const rows = result.entries.map((entry, index) => [
+      index + 1,
+      entry.name,
+      `/${entry.path}`,
+      (entry.size / 1024 ** 3).toFixed(4),
+      entry.size,
+      entry.owner,
+      entry.group,
+      entry.modified,
+    ]);
+    const csv = `\uFEFF${[header, ...rows].map((row) => row.map((value) => csvCell(value)).join(",")).join("\r\n")}`;
+    const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `filesdude-largest-files-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+  };
+
+  const deleteFiles = async () => {
+    if (!deleteTargets?.length) return;
+    setDeleting(true);
+    setError("");
+    try {
+      for (let start = 0; start < deleteTargets.length; start += 100) {
+        await requestJson("/api/fs", {
+          method: "POST",
+          body: JSON.stringify({ action: "delete", paths: deleteTargets.slice(start, start + 100).map((entry) => entry.path), permanent }),
+        });
+      }
+      notify(permanent ? `${deleteTargets.length} files permanently deleted` : `${deleteTargets.length} files moved to protected trash`);
+      setDeleteTargets(null);
+      setPermanent(false);
+      setSelected(new Set());
+      nextOffsetRef.current = 0;
+      await load({ refresh: true, minBytes: minBytesRef.current, limit: pageSizeRef.current });
+    } catch (caught) {
+      const message = (caught as Error).message;
+      notify(message, "error");
+      nextOffsetRef.current = 0;
+      await load({ refresh: true, minBytes: minBytesRef.current, limit: pageSizeRef.current });
+    } finally {
+      setDeleteTargets(null);
+      setPermanent(false);
+      setDeleting(false);
+    }
+  };
+
+  const remaining = result ? Math.max(0, result.totalMatching - result.entries.length) : 0;
+  const nextCount = Math.min(pageSize, remaining);
+
+  return (
+    <Modal title="Largest files" subtitle="Find, export, and remove files across the entire directory tree" icon={<HardDrive size={19} />} onClose={onClose} wide>
+      <div className="storage-browser">
+        <div className="storage-scan-bar">
+          <div>{result ? <><strong>{result.totalMatching.toLocaleString()} matching files · {formatBytes(result.matchingBytes)}</strong><span>Showing {result.entries.length.toLocaleString()} · scanned {result.scannedFiles.toLocaleString()} files in {result.scannedDirectories.toLocaleString()} folders · {(result.durationMs / 1000).toFixed(1)}s{result.cached ? " · cached" : ""}</span></> : <><strong>Whole-tree storage scan</strong><span>Every accessible folder under the configured root</span></>}</div>
+          <div className="storage-scan-actions"><button className="button secondary" disabled={!result?.entries.length} onClick={exportCurrentList}><ArrowDownToLine size={15} /> Export CSV</button><button className="button secondary" disabled={loading} onClick={() => void load({ refresh: true, minBytes: minBytesRef.current, limit: pageSizeRef.current })}><RefreshCw size={15} className={loading ? "spin" : ""} /> Refresh</button></div>
+        </div>
+        <form className="storage-filter" onSubmit={applyMinimum}>
+          <label><span>Minimum file size</span><div><input type="number" min="0" step="0.1" value={minimumGb} onChange={(event) => setMinimumGb(event.target.value)} /><strong>GB</strong></div></label>
+          <label><span>Load at a time</span><select value={pageSize} onChange={(event) => { const value = Number(event.target.value); setPageSize(value); pageSizeRef.current = value; }}><option value="100">100 files</option><option value="250">250 files</option><option value="500">500 files</option></select></label>
+          <button className="button primary" disabled={loading}>Apply filter</button>
+        </form>
+        {selected.size > 0 && <div className="storage-selection-bar"><div><span>{selected.size}</span><strong>{selected.size === 1 ? "file" : "files"} selected</strong></div><div><button className="button danger" onClick={() => setDeleteTargets(selectedEntries)}><Trash2 size={15} /> Delete selected</button><button className="button secondary" onClick={() => setSelected(new Set())}>Clear</button></div></div>}
+        {loading && !result ? <div className="storage-scan-state"><LoaderCircle className="spin" size={25} /><strong>Finding the largest files…</strong><span>Large directory trees can take a little while on the first scan.</span></div> : error && !result ? <div className="storage-scan-state error"><CircleAlert size={25} /><strong>Unable to scan storage</strong><span>{error}</span><button className="button secondary" onClick={() => void load({ refresh: true })}>Try again</button></div> : result && <>
+          <div className="largest-file-table" role="table" aria-label="Largest files">
+            <div className="largest-file-row largest-file-header" role="row"><div role="columnheader"><CheckBox checked={allLoadedSelected} onChange={() => setSelected(allLoadedSelected ? new Set() : new Set(result.entries.map((entry) => entry.path)))} label="Select all loaded files" /></div><div role="columnheader">#</div><div role="columnheader">Name</div><div role="columnheader">Location</div><div role="columnheader">Size (GB)</div><div role="columnheader">Modified</div><div role="columnheader" /></div>
+            {result.entries.map((entry, index) => <div className={`largest-file-row ${selected.has(entry.path) ? "selected" : ""}`} role="row" key={entry.path}><div role="cell"><CheckBox checked={selected.has(entry.path)} onChange={() => toggleSelected(entry.path)} label={`Select ${entry.name}`} /></div><div className="largest-rank" role="cell">{index + 1}</div><div className="largest-name" role="cell"><span className={`file-icon ${entry.type}`}>{fileIcon(entry, 17)}</span><button title={entry.name} onClick={() => onPreview(entry)}>{entry.name}</button></div><div className="largest-location" role="cell" title={`/${entry.path}`}><span>/</span>{entry.path.split("/").slice(0, -1).join("/") || "Root"}</div><div className="largest-size" role="cell" title={formatBytes(entry.size)}>{formatGigabytes(entry.size)}</div><div className="muted" role="cell">{formatDate(entry.modified)}</div><div className="largest-actions" role="cell"><button className="icon-button" title="Open containing folder" aria-label={`Open folder containing ${entry.name}`} onClick={() => onReveal(entry)}><FolderOpen size={16} /></button><a className="icon-button" title="Download" aria-label={`Download ${entry.name}`} href={`/api/fs/download?path=${encodePath(entry.path)}`}><Download size={16} /></a><button className="icon-button delete" title="Delete" aria-label={`Delete ${entry.name}`} onClick={() => setDeleteTargets([entry])}><Trash2 size={16} /></button></div></div>)}
+            {!result.entries.length && <div className="storage-no-results"><Search size={23} /><strong>No files match this size</strong><span>Lower the minimum size and apply the filter again.</span></div>}
+          </div>
+          {result.hasMore && <div className="storage-show-more"><span>Showing {result.entries.length.toLocaleString()} of {result.totalMatching.toLocaleString()}</span><button className="button secondary" disabled={loading} onClick={() => void load({ append: true, minBytes: minBytesRef.current, limit: pageSizeRef.current })}>{loading ? <LoaderCircle className="spin" size={15} /> : <Plus size={15} />} Show {nextCount.toLocaleString()} more</button></div>}
+          {error && <div className="storage-scan-note error"><CircleAlert size={15} /> Request failed: {error}</div>}
+          {result.skippedEntries > 0 && <div className="storage-scan-note"><Info size={15} /> {result.skippedEntries.toLocaleString()} inaccessible or changed {result.skippedEntries === 1 ? "entry was" : "entries were"} skipped.</div>}
+          {deleteTargets && <div className="storage-delete-confirm" role="alert"><div><Trash2 size={19} /><span><strong>Delete {deleteTargets.length} {deleteTargets.length === 1 ? "file" : "files"}?</strong><small>{permanent ? "This cannot be undone." : "Files will be moved to FilesDude’s protected trash."}</small></span></div><label className="switch-row compact"><input type="checkbox" checked={permanent} disabled={deleting} onChange={(event) => setPermanent(event.target.checked)} /><span className="switch" /><div><strong>Delete permanently</strong><small>Bypass protected trash</small></div></label><div><button className="button secondary" disabled={deleting} onClick={() => { setDeleteTargets(null); setPermanent(false); }}>Cancel</button><button className="button danger" disabled={deleting} onClick={() => void deleteFiles()}>{deleting && <LoaderCircle className="spin" size={15} />}{permanent ? "Delete permanently" : "Move to trash"}</button></div></div>}
+          <div className="storage-scan-foot"><span>Scanned {new Date(result.generatedAt).toLocaleString()} · results cached for five minutes</span><button className="button primary" onClick={onClose}>Done</button></div>
+        </>}
+      </div>
+    </Modal>
+  );
 }
 
 function UploadDialog({ files, currentPath, onClose, notify, onComplete }: { files: File[]; currentPath: string; onClose: () => void; notify: (message: string, tone?: "error") => void; onComplete: () => Promise<void> }) {
