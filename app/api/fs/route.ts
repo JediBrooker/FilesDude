@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { requireSession } from "@/lib/auth";
 import { audit } from "@/lib/audit";
-import { assertMutationRequest, AppError, jsonError } from "@/lib/http";
+import { assertMutationRequest, AppError, jsonError, readJsonBody } from "@/lib/http";
 import {
   applyBulkRename,
   changeMode,
@@ -14,6 +14,7 @@ import {
   previewBulkRename,
   renameEntry,
   searchFiles,
+  withFilesystemLock,
   writeTextFile,
 } from "@/lib/files";
 import type { BulkRenameRule } from "@/lib/types";
@@ -29,9 +30,9 @@ export async function GET(request: Request) {
     const relativePath = url.searchParams.get("path") || "";
     const search = url.searchParams.get("search")?.trim();
     const showHidden = url.searchParams.get("hidden") === "true";
-    const result = search
-      ? await searchFiles(relativePath, search, showHidden)
-      : await listDirectory(relativePath, showHidden);
+    const result = await withFilesystemLock(() => search
+      ? searchFiles(relativePath, search, showHidden)
+      : listDirectory(relativePath, showHidden));
     return NextResponse.json(result, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {
     return jsonError(error);
@@ -58,19 +59,27 @@ export async function POST(request: Request) {
   try {
     assertMutationRequest(request);
     const session = await requireSession(request);
-    const body = (await request.json()) as ActionBody;
+    const parsed = await readJsonBody<unknown>(request, 16 * 1024 * 1024);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new AppError("Request body is invalid", 400, "INVALID_REQUEST");
+    const body = parsed as ActionBody;
+    if (body.path !== undefined && (typeof body.path !== "string" || body.path.length > 4096)) throw new AppError("Path is invalid", 400, "INVALID_PATH");
+    if (body.destination !== undefined && (typeof body.destination !== "string" || body.destination.length > 4096)) throw new AppError("Destination is invalid", 400, "INVALID_PATH");
+    if (body.name !== undefined && (typeof body.name !== "string" || Buffer.byteLength(body.name, "utf8") > 255)) throw new AppError("Name is invalid", 400, "INVALID_NAME");
     const paths = Array.isArray(body.paths) ? body.paths : [];
-    let result: unknown = { ok: true };
-
-    switch (body.action) {
+    if (paths.length > 1_000 || paths.some((item) => typeof item !== "string" || item.length > 4096)) {
+      throw new AppError("Too many or invalid paths", 400, "INVALID_PATHS");
+    }
+    const result = await withFilesystemLock(async () => {
+      let operationResult: unknown = { ok: true };
+      switch (body.action) {
       case "create":
         if (!body.name || !body.type) throw new AppError("Name and item type are required");
-        result = await createEntry(body.path || "", body.name, body.type);
+        operationResult = await createEntry(body.path || "", body.name, body.type);
         break;
       case "rename":
         if (!body.path || !body.name) throw new AppError("Path and new name are required");
-        result = await renameEntry(body.path, body.name);
-        await rewriteFavoritePaths([{ from: body.path, to: (result as { path: string }).path }]);
+        operationResult = await renameEntry(body.path, body.name);
+        await rewriteFavoritePaths([{ from: body.path, to: (operationResult as { path: string }).path }]);
         break;
       case "delete":
         await deleteEntries(paths, Boolean(body.permanent));
@@ -95,24 +104,26 @@ export async function POST(request: Request) {
         break;
       case "bulkRename":
         if (!body.rule) throw new AppError("Bulk rename rules are required");
-        result = body.apply
+        operationResult = body.apply
           ? await applyBulkRename(paths, body.rule)
           : await previewBulkRename(paths, body.rule);
         if (body.apply) {
-          await rewriteFavoritePaths((result as Array<{ source: string; to: string; changed: boolean }>).filter((item) => item.changed).map((item) => ({ from: item.source, to: [item.source.split("/").slice(0, -1).join("/"), item.to].filter(Boolean).join("/") })));
+          await rewriteFavoritePaths((operationResult as Array<{ source: string; to: string; changed: boolean }>).filter((item) => item.changed).map((item) => ({ from: item.source, to: [item.source.split("/").slice(0, -1).join("/"), item.to].filter(Boolean).join("/") })));
         }
         break;
       case "details":
         if (!body.path) throw new AppError("Path is required");
-        result = await details(body.path);
+        operationResult = await details(body.path);
         break;
       case "write":
         if (!body.path || typeof body.content !== "string") throw new AppError("Path and text content are required");
-        result = await writeTextFile(body.path, body.content);
+        operationResult = await writeTextFile(body.path, body.content);
         break;
       default:
         throw new AppError("Unknown file operation", 400, "UNKNOWN_ACTION");
-    }
+      }
+      return operationResult;
+    });
 
     await audit(`fs.${body.action}`, {
       username: session.username,

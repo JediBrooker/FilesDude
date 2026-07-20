@@ -1,10 +1,13 @@
 import crypto from "node:crypto";
-import { config, configurationIssues } from "./config";
+import net from "node:net";
+import { config, configurationIssues, isValidPasswordHash } from "./config";
 import { getCredentials } from "./credentials";
 import { AppError } from "./http";
 
 const COOKIE = "fd_session";
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
+const MAX_LOGIN_RATE_LIMIT_KEYS = 10_000;
+let lastLoginAttemptSweep = 0;
 
 function scryptPassword(password: string, salt: Buffer, length: number, options: crypto.ScryptOptions) {
   return new Promise<Buffer>((resolve, reject) => {
@@ -31,6 +34,7 @@ export function assertConfigured() {
 }
 
 export async function verifyPassword(password: string, encoded = config.passwordHash) {
+  if (!isValidPasswordHash(encoded)) return false;
   const [algorithm, nRaw, rRaw, pRaw, salt, expectedRaw] = encoded.split("$");
   if (algorithm !== "scrypt" || !salt || !expectedRaw) return false;
 
@@ -109,15 +113,28 @@ export async function requireSession(request: Request) {
 
 export function clientAddress(request: Request) {
   if (config.trustProxy) {
-    return request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "proxy-unknown";
+    const forwarded = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "";
+    return net.isIP(forwarded) ? forwarded : "proxy-unknown";
   }
   return "direct-client";
 }
 
+function sweepLoginAttempts(now: number) {
+  if (now - lastLoginAttemptSweep < 60_000 && loginAttempts.size < MAX_LOGIN_RATE_LIMIT_KEYS) return;
+  for (const [key, attempt] of loginAttempts) {
+    if (attempt.resetAt <= now) loginAttempts.delete(key);
+  }
+  lastLoginAttemptSweep = now;
+}
+
 export function checkLoginRateLimit(key: string) {
   const now = Date.now();
+  sweepLoginAttempts(now);
   const attempt = loginAttempts.get(key);
   if (!attempt || attempt.resetAt <= now) {
+    if (loginAttempts.size >= MAX_LOGIN_RATE_LIMIT_KEYS) {
+      throw new AppError("Too many login attempts. Try again later.", 429, "RATE_LIMITED");
+    }
     loginAttempts.set(key, { count: 0, resetAt: now + 15 * 60 * 1000 });
     return;
   }

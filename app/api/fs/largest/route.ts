@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { requireSession } from "@/lib/auth";
-import { largestFiles } from "@/lib/files";
+import { largestFiles, withFilesystemLock } from "@/lib/files";
 import { jsonError } from "@/lib/http";
 
 export const runtime = "nodejs";
@@ -16,7 +16,7 @@ export async function GET(request: Request) {
     const limit = Number.isFinite(requestedLimit) ? Math.min(500, Math.max(10, Math.floor(requestedLimit))) : 100;
     const offset = Number.isFinite(requestedOffset) ? Math.max(0, Math.floor(requestedOffset)) : 0;
     const minBytes = Number.isFinite(requestedMinBytes) ? Math.max(0, Math.floor(requestedMinBytes)) : 0;
-    const result = await largestFiles({ refresh: url.searchParams.get("refresh") === "true", minBytes, offset, limit });
+    const result = await withFilesystemLock(() => largestFiles({ refresh: url.searchParams.get("refresh") === "true", minBytes, offset, limit }));
     return NextResponse.json(result, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {
     return jsonError(error);

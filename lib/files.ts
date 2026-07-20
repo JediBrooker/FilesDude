@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import type { Dirent } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
 import { config } from "./config";
@@ -23,6 +24,30 @@ let identitiesCache: { users: Map<number, string>; groups: Map<number, string>; 
 let canonicalRoot: string | null = null;
 let largestFilesCache: { at: number; index: LargestFilesIndex } | null = null;
 let largestFilesScan: Promise<LargestFilesIndex> | null = null;
+let filesystemQueue: Promise<void> = Promise.resolve();
+
+export async function acquireFilesystemLock() {
+  let release!: () => void;
+  const previous = filesystemQueue;
+  filesystemQueue = new Promise<void>((resolve) => { release = resolve; });
+  await previous;
+  let released = false;
+  return () => {
+    if (!released) {
+      released = true;
+      release();
+    }
+  };
+}
+
+export async function withFilesystemLock<T>(operation: () => Promise<T>) {
+  const release = await acquireFilesystemLock();
+  try {
+    return await operation();
+  } finally {
+    release();
+  }
+}
 
 export function getMime(filePath: string) {
   return mimeTypes[path.extname(filePath).toLowerCase()] || "application/octet-stream";
@@ -59,6 +84,13 @@ export async function safeResolve(input = "", options: { mustExist?: boolean; al
   const root = await ensureRoot();
   const candidate = path.resolve(root, relative);
   if (!insideRoot(candidate)) throw new AppError("Path leaves the configured root", 403, "PATH_OUTSIDE_ROOT");
+  const stateRelative = path.relative(config.root, config.stateDir);
+  if (!options.allowInternal && stateRelative !== "" && stateRelative !== ".." && !stateRelative.startsWith(`..${path.sep}`) && !path.isAbsolute(stateRelative)) {
+    const stateDirectory = path.resolve(root, stateRelative);
+    if (candidate === stateDirectory || candidate.startsWith(`${stateDirectory}${path.sep}`)) {
+      throw new AppError("That path is reserved by FilesDude", 403, "RESERVED_PATH");
+    }
+  }
 
   try {
     if (options.followSymlink === false) {
@@ -79,6 +111,35 @@ export async function safeResolve(input = "", options: { mustExist?: boolean; al
     const parent = await fs.realpath(path.dirname(candidate));
     if (!insideRoot(parent)) throw new AppError("Parent folder leaves the configured root", 403, "PATH_OUTSIDE_ROOT");
     return candidate;
+  }
+}
+
+async function openedHandlePath(handle: FileHandle, absolute: string) {
+  if (process.platform === "linux") {
+    try {
+      return await fs.realpath(`/proc/self/fd/${handle.fd}`);
+    } catch {
+      throw new AppError("FilesDude could not verify the opened file", 503, "FILE_VERIFICATION_FAILED");
+    }
+  }
+  return fs.realpath(absolute);
+}
+
+export async function verifyFileHandleWithinRoot(handle: FileHandle, absolute: string) {
+  const openedPath = await openedHandlePath(handle, absolute);
+  if (!insideRoot(openedPath)) throw new AppError("Opened file leaves the configured root", 403, "PATH_OUTSIDE_ROOT");
+  return { openedPath, stat: await handle.stat() };
+}
+
+export async function openVerifiedFile(relativePath: string, flags: string | number = "r") {
+  const absolute = await safeResolve(relativePath);
+  const handle = await fs.open(absolute, flags);
+  try {
+    const { openedPath, stat } = await verifyFileHandleWithinRoot(handle, absolute);
+    return { absolute, handle, openedPath, stat };
+  } catch (error) {
+    await handle.close().catch(() => undefined);
+    throw error;
   }
 }
 
@@ -372,13 +433,17 @@ export async function writeTextFile(relativePath: string, content: string) {
   if (Buffer.byteLength(content, "utf8") > maxBytes) {
     throw new AppError("Text editing is limited to 2 MB per file", 413, "EDIT_TOO_LARGE");
   }
-  const absolute = await safeResolve(relativePath);
-  const stat = await fs.stat(absolute);
-  if (!stat.isFile()) throw new AppError("Only files can be edited", 400, "NOT_A_FILE");
-  const mime = getMime(absolute);
-  const editable = mime.startsWith("text/") || mime.includes("json") || mime.includes("javascript") || mime.includes("typescript");
-  if (!editable) throw new AppError("This file type cannot be edited as text", 415, "NOT_EDITABLE");
-  await fs.writeFile(absolute, content, { encoding: "utf8" });
+  const { absolute, handle, stat } = await openVerifiedFile(relativePath, "r+");
+  try {
+    if (!stat.isFile()) throw new AppError("Only files can be edited", 400, "NOT_A_FILE");
+    const mime = getMime(absolute);
+    const editable = mime.startsWith("text/") || mime.includes("json") || mime.includes("javascript") || mime.includes("typescript");
+    if (!editable) throw new AppError("This file type cannot be edited as text", 415, "NOT_EDITABLE");
+    await handle.truncate(0);
+    await handle.writeFile(content, { encoding: "utf8" });
+  } finally {
+    await handle.close();
+  }
   return toEntry(absolute);
 }
 

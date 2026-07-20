@@ -10,7 +10,7 @@ import {
   verifyPassword,
 } from "@/lib/auth";
 import { getCredentials } from "@/lib/credentials";
-import { assertMutationRequest, jsonError, AppError } from "@/lib/http";
+import { assertMutationRequest, jsonError, AppError, readJsonBody } from "@/lib/http";
 import { audit } from "@/lib/audit";
 
 export const runtime = "nodejs";
@@ -21,15 +21,17 @@ export async function POST(request: Request) {
     assertConfigured();
     const key = clientAddress(request);
     checkLoginRateLimit(key);
-    const body = (await request.json()) as { username?: string; password?: string };
-    const username = body.username?.trim() || "";
-    const password = body.password || "";
+    const parsed = await readJsonBody<unknown>(request, 8 * 1024);
+    const body = parsed && typeof parsed === "object" ? parsed as { username?: unknown; password?: unknown } : {};
+    const username = typeof body.username === "string" ? body.username.trim() : "";
+    const password = typeof body.password === "string" ? body.password : "";
+    const inputValid = username.length > 0 && username.length <= 64 && password.length > 0 && password.length <= 512;
     const credentials = await getCredentials();
-    const validUser = username === credentials.username;
-    const validPassword = await verifyPassword(password, credentials.passwordHash);
+    const validUser = inputValid && username === credentials.username;
+    const validPassword = await verifyPassword(inputValid ? password : "", credentials.passwordHash);
     if (!validUser || !validPassword) {
       recordLoginFailure(key);
-      await audit("login.failed", { username, client: key });
+      await audit("login.failed", { username: username.slice(0, 64), client: key });
       throw new AppError("Invalid username or password", 401, "INVALID_CREDENTIALS");
     }
 

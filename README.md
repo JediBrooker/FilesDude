@@ -49,8 +49,12 @@ password, and whether the service needs full root-level ownership management. It
 then installs a checksum-verified Node.js 22 runtime when necessary, builds an
 immutable release, writes a hardened systemd service, and starts FilesDude.
 
-Open `http://<proxmox-ip>:3000`. Keep this address on a trusted LAN/VPN, or put
-an HTTPS reverse proxy in front of it before allowing remote access.
+The installer binds to `127.0.0.1:3000` by default. Put an HTTPS reverse proxy
+on the same host in front of it, or reach it through an SSH tunnel or VPN. To
+bind directly to a trusted LAN, explicitly pass `--bind 0.0.0.0`; plain HTTP
+exposes passwords and session cookies to anyone able to observe that network.
+Loopback installs trust the local proxy's forwarded HTTPS headers so browser
+sessions receive the `Secure` cookie attribute.
 
 Useful service commands:
 
