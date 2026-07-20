@@ -445,11 +445,12 @@ export function FileManager() {
           </div>
         </div>
 
-        <button type="button" className="storage-card" title="Find the largest files" onClick={() => setDialog({ kind: "storage" })}>
+        <button type="button" className="storage-card" title="Find the largest files" aria-label="Storage usage. Open the largest-files scanner" onClick={() => setDialog({ kind: "storage" })}>
           <div className="storage-heading"><span><HardDrive size={16} /> Storage</span><strong>{diskPercent}%</strong></div>
           <div className="storage-track"><span style={{ width: `${diskPercent}%` }} /></div>
           <p>{disk ? `${formatBytes(disk.used)} of ${formatBytes(disk.total)} used` : "Calculating…"}</p>
           <small>{disk ? `${formatBytes(disk.available)} available` : ""}</small>
+          <span className="storage-action">Click to find and manage largest files <ChevronRight size={12} /></span>
         </button>
 
         <div className="sidebar-footer">
