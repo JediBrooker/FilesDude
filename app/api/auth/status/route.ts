@@ -12,5 +12,5 @@ export async function GET(request: Request) {
     username: session?.username || null,
     configured: issues.length === 0,
     configurationIssues: issues,
-  });
+  }, { headers: { "Cache-Control": "no-store" } });
 }

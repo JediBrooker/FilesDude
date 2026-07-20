@@ -8,7 +8,7 @@ CONFIG_DIR="/etc/filesdude"
 ENV_FILE="${CONFIG_DIR}/filesdude.env"
 STATE_DIR="/var/lib/filesdude"
 UNIT_FILE="/etc/systemd/system/filesdude.service"
-BIND_ADDRESS="0.0.0.0"
+BIND_ADDRESS="127.0.0.1"
 PORT="3000"
 MODE="install"
 ROOT_PATH=""
@@ -25,7 +25,7 @@ Usage: sudo bash install.sh [options]
 Options:
   --root PATH             Folder FilesDude may manage (default: /mnt/pve)
   --username NAME         Initial login username (default: admin)
-  --bind ADDRESS          Listening address (default: 0.0.0.0)
+  --bind ADDRESS          Listening address (default: 127.0.0.1)
   --port NUMBER           Listening port (default: 3000)
   --service-user USER     'filesdude' (safer) or 'root' (full chown access)
   --update                Update the application and keep all settings
@@ -153,12 +153,15 @@ prompt_password() {
 }
 
 write_environment() {
-  local username="$1" password="$2" root_path="$3" hash_line hash secret
+  local username="$1" password="$2" root_path="$3" hash_line hash secret trust_proxy="false"
   [[ ${username} =~ ^[A-Za-z0-9._-]{3,64}$ ]] || fail "Username must be 3–64 letters, numbers, dots, dashes, or underscores."
   hash_line="$(FILEDUDE_PASSWORD="${password}" node scripts/hash-password.mjs)"
   hash="${hash_line#FILEDUDE_PASSWORD_HASH=\'}"
   hash="${hash%\'}"
   secret="$(openssl rand -base64 48 | tr -d '\n')"
+  if [[ ${BIND_ADDRESS} == "127.0.0.1" || ${BIND_ADDRESS} == "::1" ]]; then
+    trust_proxy="true"
+  fi
   umask 077
   {
     printf 'NODE_ENV=production\n'
@@ -172,7 +175,7 @@ write_environment() {
     printf 'FILEDUDE_SESSION_HOURS=12\n'
     printf 'FILEDUDE_MAX_UPLOAD_MB=512\n'
     printf 'FILEDUDE_TRASH_ENABLED=true\n'
-    printf 'FILEDUDE_TRUST_PROXY=false\n'
+    printf 'FILEDUDE_TRUST_PROXY=%s\n' "${trust_proxy}"
   } >"${ENV_FILE}"
   chmod 600 "${ENV_FILE}"
 }
@@ -293,7 +296,7 @@ mapfile -t OLD_RELEASES < <(find "${APP_HOME}/releases" -mindepth 1 -maxdepth 1 
 if ((${#OLD_RELEASES[@]})); then rm -rf -- "${OLD_RELEASES[@]}"; fi
 
 say "Installation complete"
-printf 'Open: http://<proxmox-ip>:%s\n' "${PORT}"
+printf 'Listening on: http://%s:%s\n' "${BIND_ADDRESS}" "${PORT}"
 printf 'Status: systemctl status filesdude\n'
 printf 'Logs: journalctl -u filesdude -f\n'
 printf 'Update later: sudo filesdude-update\n'

@@ -6,7 +6,7 @@ import Busboy from "busboy";
 import { requireSession } from "@/lib/auth";
 import { config } from "@/lib/config";
 import { audit } from "@/lib/audit";
-import { isAvailableUploadOwnership, resolveOwnershipPair, safeResolve, uploadOwnershipOptions } from "@/lib/files";
+import { acquireFilesystemLock, isAvailableUploadOwnership, resolveOwnershipPair, safeResolve, uploadOwnershipOptions, verifyFileHandleWithinRoot, withFilesystemLock } from "@/lib/files";
 import { assertMutationRequest, AppError, jsonError } from "@/lib/http";
 import { getPreferences } from "@/lib/preferences";
 import { NextResponse } from "next/server";
@@ -17,7 +17,7 @@ export const dynamic = "force-dynamic";
 
 function uploadName(raw: string) {
   const name = path.basename(raw).trim();
-  if (!name || name === "." || name === ".." || name.includes("\0")) {
+  if (!name || name === "." || name === ".." || name.includes("\0") || name.includes("/") || name.includes("\\") || Buffer.byteLength(name, "utf8") > 255) {
     throw new AppError("An uploaded file has an invalid name", 400, "INVALID_NAME");
   }
   return name;
@@ -32,6 +32,12 @@ async function reserveTarget(directory: string, name: string) {
     const target = await safeResolve(relative, { mustExist: false });
     try {
       const handle = await fsp.open(target, "wx", 0o640);
+      try {
+        await verifyFileHandleWithinRoot(handle, target);
+      } catch (error) {
+        await handle.close().catch(() => undefined);
+        throw error;
+      }
       return { target, relative, handle };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
@@ -44,12 +50,14 @@ export async function GET(request: Request) {
   try {
     await requireSession(request);
     const directory = new URL(request.url).searchParams.get("path") || "";
-    const [options, preferences] = await Promise.all([uploadOwnershipOptions(directory), getPreferences()]);
-    const preference = preferences.uploadOwnership;
-    const defaultPair = preference.mode === "fixed"
-      ? await resolveOwnershipPair(preference.uid, preference.gid, "default")
-      : undefined;
-    const result: UploadOwnershipOptions = { ...options, preference, defaultPair };
+    const result = await withFilesystemLock(async () => {
+      const [options, preferences] = await Promise.all([uploadOwnershipOptions(directory), getPreferences()]);
+      const preference = preferences.uploadOwnership;
+      const defaultPair = preference.mode === "fixed"
+        ? await resolveOwnershipPair(preference.uid, preference.gid, "default")
+        : undefined;
+      return { ...options, preference, defaultPair } satisfies UploadOwnershipOptions;
+    });
     return NextResponse.json(result, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {
     return jsonError(error);
@@ -60,7 +68,9 @@ export async function POST(request: Request) {
   try {
     assertMutationRequest(request);
     const session = await requireSession(request);
-    const contentLength = Number(request.headers.get("content-length") || 0);
+    const releaseFilesystem = await acquireFilesystemLock();
+    try {
+      const contentLength = Number(request.headers.get("content-length") || 0);
     if (contentLength > config.maxUploadBytes + 1024 * 1024) {
       throw new AppError("Upload is larger than the configured limit", 413, "UPLOAD_TOO_LARGE");
     }
@@ -126,11 +136,11 @@ export async function POST(request: Request) {
           });
           stream.resume();
           try {
-            await pipeline(stream, meter, handle.createWriteStream());
+            await pipeline(stream, meter, handle.createWriteStream({ autoClose: false }));
             if (truncated) throw new AppError("Upload is larger than the configured limit", 413, "UPLOAD_TOO_LARGE");
             if (requestedOwnership) {
               try {
-                await fsp.chown(target, requestedOwnership.uid, requestedOwnership.gid);
+                await handle.chown(requestedOwnership.uid, requestedOwnership.gid);
               } catch (error) {
                 const code = (error as NodeJS.ErrnoException).code;
                 if (code === "EPERM" || code === "EACCES") {
@@ -139,6 +149,7 @@ export async function POST(request: Request) {
                 throw error;
               }
             }
+            await handle.close();
             uploaded.push(relative);
           } catch (error) {
             await handle.close().catch(() => undefined);
@@ -167,6 +178,9 @@ export async function POST(request: Request) {
 
     await audit("fs.upload", { username: session.username, directory, files: uploaded, bytes: totalBytes, ownership: requestedOwnership || "service" });
     return NextResponse.json({ ok: true, uploaded, ownership: requestedOwnership || null });
+    } finally {
+      releaseFilesystem();
+    }
   } catch (error) {
     return jsonError(error);
   }

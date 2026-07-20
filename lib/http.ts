@@ -19,12 +19,48 @@ export function jsonError(error: unknown) {
     );
   }
 
-  const message = error instanceof Error ? error.message : "Unexpected server error";
   console.error(error);
   return NextResponse.json(
-    { error: message, code: "INTERNAL_ERROR" },
+    { error: "Unexpected server error", code: "INTERNAL_ERROR" },
     { status: 500 },
   );
+}
+
+export async function readJsonBody<T>(request: Request, maxBytes = 64 * 1024): Promise<T> {
+  const contentType = request.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
+  if (contentType !== "application/json") {
+    throw new AppError("Request body must use application/json", 415, "INVALID_CONTENT_TYPE");
+  }
+
+  const declaredLength = Number(request.headers.get("content-length") || 0);
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+    throw new AppError("Request body is too large", 413, "REQUEST_TOO_LARGE");
+  }
+  if (!request.body) throw new AppError("Request body is missing", 400, "INVALID_JSON");
+
+  const reader = request.body.getReader();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        throw new AppError("Request body is too large", 413, "REQUEST_TOO_LARGE");
+      }
+      chunks.push(Buffer.from(value));
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  try {
+    return JSON.parse(Buffer.concat(chunks, total).toString("utf8")) as T;
+  } catch {
+    throw new AppError("Request body contains invalid JSON", 400, "INVALID_JSON");
+  }
 }
 
 export function assertMutationRequest(request: Request) {

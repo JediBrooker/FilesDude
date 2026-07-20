@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { config } from "./config";
+import { config, isValidPasswordHash } from "./config";
 import { AppError } from "./http";
 
 export interface StoredCredentials {
@@ -16,7 +16,7 @@ const credentialsFile = path.join(config.stateDir, "credentials.json");
 export async function getCredentials(): Promise<StoredCredentials> {
   try {
     const value = JSON.parse(await fs.readFile(credentialsFile, "utf8")) as Partial<StoredCredentials>;
-    if (typeof value.username !== "string" || typeof value.passwordHash !== "string" || !Number.isInteger(value.version)) {
+    if (typeof value.username !== "string" || typeof value.passwordHash !== "string" || !isValidPasswordHash(value.passwordHash) || !Number.isInteger(value.version)) {
       throw new AppError("Stored account settings are invalid", 503, "CREDENTIALS_INVALID");
     }
     return value as StoredCredentials;
