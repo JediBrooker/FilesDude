@@ -4,10 +4,10 @@ FilesDude is a secure, self-hosted web file manager designed for a Proxmox host,
 
 ## What is included
 
-- Browse folders in list or grid view, including an optional hidden-files view
+- Browse folders in list or grid view, including an optional hidden-files view; the browser's own back/forward buttons and gestures step through folder history instead of leaving the app
 - Use a SharePoint-style row menu for preview, text editing, downloads, organization, administration, properties, and deletion
 - Pin durable favourite folder locations to the sidebar from a folder menu, selection toolbar, or the current-location button
-- Create files and folders; edit text/code files up to 2 MB; rename, copy, move, soft-delete, and permanently delete
+- Create files and folders; edit text/code files up to 2 MB; rename, copy, move, soft-delete, and permanently delete, with a breadcrumb folder browser and autofill suggestions for picking a copy/move destination
 - Multi-file drag-and-drop upload with collision-safe names, a configurable size limit, and owner/group confirmation based on the destination folder and its existing contents
 - Direct file downloads and ZIP downloads for folders
 - Inline previews for text, code, JSON, images, PDF, audio, and video; media uses byte-range streaming
