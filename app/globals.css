@@ -324,6 +324,20 @@ kbd { padding: 3px 5px; border: 1px solid var(--line); border-bottom-width: 2px;
 .path-input span { padding-left: 11px; color: var(--ink-faint); }
 .path-input input { height: 40px; border: 0; background: transparent; box-shadow: none !important; }
 
+.folder-picker { margin-top: 14px; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: var(--panel-soft); }
+.folder-picker-crumbs { display: flex; align-items: center; gap: 2px; overflow-x: auto; padding: 8px 10px; border-bottom: 1px solid var(--line); scrollbar-width: thin; }
+.folder-picker-crumbs > span { display: flex; flex: 0 0 auto; align-items: center; gap: 2px; color: var(--ink-faint); }
+.folder-picker-crumbs button { padding: 3px 6px; border: 0; border-radius: 6px; background: transparent; color: inherit; cursor: pointer; font-size: 10px; font-weight: 600; white-space: nowrap; }
+.folder-picker-crumbs > span:last-child button { color: var(--ink); background: var(--panel-strong); }
+.folder-picker-crumbs button:hover { color: var(--brand); }
+.folder-picker-list { display: grid; max-height: 190px; gap: 1px; overflow-y: auto; scrollbar-width: thin; }
+.folder-picker-row { display: flex; width: 100%; align-items: center; gap: 8px; padding: 8px 10px; border: 0; background: transparent; color: var(--ink); cursor: pointer; font-size: 11px; font-weight: 600; text-align: left; }
+.folder-picker-row:hover { background: var(--panel-strong); }
+.folder-picker-row svg:first-child { flex: 0 0 auto; color: var(--ink-faint); }
+.folder-picker-row span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.folder-picker-row svg:last-child { flex: 0 0 auto; color: var(--ink-faint); }
+.folder-picker-empty { display: flex; align-items: center; justify-content: center; gap: 7px; padding: 16px 10px; color: var(--ink-faint); font-size: 10px; font-weight: 600; }
+
 .upload-form { padding-top: 16px !important; }
 .upload-file-summary { padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel-soft); }
 .upload-file-summary > div:first-child { display: flex; align-items: center; gap: 10px; }

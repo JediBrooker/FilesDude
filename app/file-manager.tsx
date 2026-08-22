@@ -120,6 +120,14 @@ function encodePath(value: string) {
   return encodeURIComponent(value);
 }
 
+function buildUrl(pathValue: string) {
+  const params = new URLSearchParams(window.location.search);
+  if (pathValue) params.set("path", pathValue);
+  else params.delete("path");
+  const query = params.toString();
+  return `${window.location.pathname}${query ? `?${query}` : ""}`;
+}
+
 function ownershipKey(pair: Pick<OwnershipPair, "uid" | "gid">) {
   return `${pair.uid}:${pair.gid}`;
 }
@@ -164,8 +172,8 @@ export function FileManager() {
   const [entries, setEntries] = useState<FileEntry[]>([]);
   const [favorites, setFavorites] = useState<FavoriteLocation[]>([]);
   const [disk, setDisk] = useState<DiskInfo | null>(null);
-  const [currentPath, setCurrentPath] = useState("");
-  const [history, setHistory] = useState<string[]>([""]);
+  const [currentPath, setCurrentPath] = useState(() => (typeof window !== "undefined" ? new URLSearchParams(window.location.search).get("path") || "" : ""));
+  const [history, setHistory] = useState<string[]>(() => [currentPath]);
   const [historyIndex, setHistoryIndex] = useState(0);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [showHidden, setShowHidden] = useState(false);
@@ -252,6 +260,24 @@ export function FileManager() {
   }, [auth.authenticated, loadFavorites]);
 
   useEffect(() => {
+    window.history.replaceState({ path: currentPath, index: 0 }, "", buildUrl(currentPath));
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only the path present at mount should seed the initial history entry
+  }, []);
+
+  useEffect(() => {
+    function onPopState(event: PopStateEvent) {
+      const state = event.state as { path: string; index: number } | null;
+      if (!state) return;
+      setCurrentPath(state.path);
+      setHistoryIndex(state.index);
+      setActiveSearch("");
+      setSearch("");
+    }
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
+
+  useEffect(() => {
     function onKeyDown(event: globalThis.KeyboardEvent) {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
         event.preventDefault();
@@ -286,16 +312,17 @@ export function FileManager() {
     if (record) {
       const nextHistory = history.slice(0, historyIndex + 1);
       nextHistory.push(nextPath);
+      const nextIndex = nextHistory.length - 1;
       setHistory(nextHistory);
-      setHistoryIndex(nextHistory.length - 1);
+      setHistoryIndex(nextIndex);
+      window.history.pushState({ path: nextPath, index: nextIndex }, "", buildUrl(nextPath));
     }
   }, [history, historyIndex]);
 
   const changeHistory = (direction: -1 | 1) => {
     const nextIndex = historyIndex + direction;
     if (nextIndex < 0 || nextIndex >= history.length) return;
-    setHistoryIndex(nextIndex);
-    navigate(history[nextIndex], false);
+    window.history.go(direction);
   };
 
   const openEntry = (entry: FileEntry) => {
@@ -773,7 +800,7 @@ function DialogHost({ dialog, selected, currentPath, username, onClose, onRun, n
   if (dialog.kind === "delete") return <DeleteDialog entries={selected} onClose={onClose} onRun={onRun} />;
   if (dialog.kind === "permissions") return <PermissionsDialog entries={selected} onClose={onClose} onRun={onRun} />;
   if (dialog.kind === "ownership") return <OwnershipDialog entries={selected} onClose={onClose} onRun={onRun} />;
-  if (dialog.kind === "transfer") return <TransferDialog mode={dialog.mode} entries={selected} onClose={onClose} onRun={onRun} />;
+  if (dialog.kind === "transfer") return <TransferDialog mode={dialog.mode} entries={selected} startPath={currentPath} onClose={onClose} onRun={onRun} />;
   if (dialog.kind === "bulk") return <BulkRenameDialog entries={selected} onClose={onClose} notify={notify} onRefresh={onRefresh} />;
   if (dialog.kind === "preview") return <PreviewDialog entry={dialog.entry} onClose={onClose} />;
   if (dialog.kind === "edit") return <EditDialog entry={dialog.entry} onClose={onClose} onRun={onRun} />;
@@ -785,8 +812,8 @@ function Modal({ title, subtitle, icon, onClose, children, wide = false }: { tit
   return <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className={`modal ${wide ? "modal-wide" : ""}`} role="dialog" aria-modal="true" aria-label={title}><header><div className="modal-title">{icon && <span>{icon}</span>}<div><h2>{title}</h2>{subtitle && <p>{subtitle}</p>}</div></div><button className="icon-button" aria-label="Close dialog" onClick={onClose}><X size={18} /></button></header>{children}</section></div>;
 }
 
-function ModalActions({ onClose, submitLabel, danger = false, busy = false }: { onClose: () => void; submitLabel: string; danger?: boolean; busy?: boolean }) {
-  return <div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className={`button ${danger ? "danger" : "primary"}`} disabled={busy}>{busy && <LoaderCircle className="spin" size={16} />}{submitLabel}</button></div>;
+function ModalActions({ onClose, submitLabel, danger = false, busy = false, disabled = false }: { onClose: () => void; submitLabel: string; danger?: boolean; busy?: boolean; disabled?: boolean }) {
+  return <div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className={`button ${danger ? "danger" : "primary"}`} disabled={busy || disabled}>{busy && <LoaderCircle className="spin" size={16} />}{submitLabel}</button></div>;
 }
 
 function StorageDialog({ onClose, onReveal, onPreview, notify }: { onClose: () => void; onReveal: (entry: FileEntry) => void; onPreview: (entry: FileEntry) => void; notify: (message: string, tone?: "error") => void }) {
@@ -1051,11 +1078,114 @@ function OwnershipDialog({ entries, onClose, onRun }: { entries: FileEntry[]; on
   return <Modal title="Change ownership" subtitle={`Apply a numeric user and group id to ${entries.length} ${entries.length === 1 ? "item" : "items"}`} icon={<UserRoundCog size={19} />} onClose={onClose}><form onSubmit={submit}><div className="field-pair"><FormField label="User ID (UID)"><input value={uid} onChange={(event) => setUid(event.target.value)} type="number" min="0" required /></FormField><FormField label="Group ID (GID)"><input value={gid} onChange={(event) => setGid(event.target.value)} type="number" min="0" required /></FormField></div><div className="info-box"><Info size={17} /> Use IDs from the Proxmox host or container, such as <code>0:0</code> for root.</div><ModalActions onClose={onClose} submitLabel="Apply ownership" busy={busy} /></form></Modal>;
 }
 
-function TransferDialog({ mode, entries, onClose, onRun }: { mode: "copy" | "move"; entries: FileEntry[]; onClose: () => void; onRun: (body: Record<string, unknown>, success: string) => Promise<boolean> }) {
-  const [destination, setDestination] = useState("");
+function TransferDialog({ mode, entries, startPath, onClose, onRun }: { mode: "copy" | "move"; entries: FileEntry[]; startPath: string; onClose: () => void; onRun: (body: Record<string, unknown>, success: string) => Promise<boolean> }) {
+  const [destination, setDestination] = useState(startPath);
   const [busy, setBusy] = useState(false);
-  const submit = async (event: FormEvent) => { event.preventDefault(); setBusy(true); await onRun({ action: mode, paths: entries.map((entry) => entry.path), destination }, `${entries.length} ${entries.length === 1 ? "item" : "items"} ${mode === "copy" ? "copied" : "moved"}`); setBusy(false); };
-  return <Modal title={`${mode === "copy" ? "Copy" : "Move"} ${entries.length} ${entries.length === 1 ? "item" : "items"}`} subtitle="Enter a destination relative to the configured root" icon={mode === "copy" ? <Copy size={19} /> : <FolderInput size={19} />} onClose={onClose}><form onSubmit={submit}><FormField label="Destination folder" hint="Leave empty to use the root folder"><div className="path-input"><span>/</span><input autoFocus value={destination} onChange={(event) => setDestination(event.target.value.replace(/^\/+/, ""))} placeholder="media/archive" /></div></FormField><ModalActions onClose={onClose} submitLabel={mode === "copy" ? "Copy here" : "Move here"} busy={busy} /></form></Modal>;
+  const blockedDirectories = useMemo(() => entries.filter((entry) => entry.type === "directory").map((entry) => entry.path), [entries]);
+  const blocked = blockedDirectories.some((dirPath) => destination === dirPath || destination.startsWith(`${dirPath}/`));
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (blocked) return;
+    setBusy(true);
+    await onRun({ action: mode, paths: entries.map((entry) => entry.path), destination }, `${entries.length} ${entries.length === 1 ? "item" : "items"} ${mode === "copy" ? "copied" : "moved"}`);
+    setBusy(false);
+  };
+  return (
+    <Modal title={`${mode === "copy" ? "Copy" : "Move"} ${entries.length} ${entries.length === 1 ? "item" : "items"}`} subtitle="Type a destination or browse the folder structure below" icon={mode === "copy" ? <Copy size={19} /> : <FolderInput size={19} />} onClose={onClose}>
+      <form onSubmit={submit}>
+        <FormField label="Destination folder" hint="Leave empty to use the root folder">
+          <div className="path-input"><span>/</span><input autoFocus value={destination} onChange={(event) => setDestination(event.target.value.replace(/^\/+/, ""))} placeholder="media/archive" /></div>
+        </FormField>
+        <FolderPicker value={destination} onChange={setDestination} />
+        {blocked && <div className="warning-box"><CircleAlert size={17} /> You can&apos;t {mode === "copy" ? "copy" : "move"} a folder into itself or one of its own subfolders.</div>}
+        <ModalActions onClose={onClose} submitLabel={mode === "copy" ? "Copy here" : "Move here"} busy={busy} disabled={blocked} />
+      </form>
+    </Modal>
+  );
+}
+
+type FolderListing = { browsePath: string; folders: FileEntry[]; filterPrefix: string | null };
+
+function FolderPicker({ value, onChange }: { value: string; onChange: (path: string) => void }) {
+  const [listing, setListing] = useState<FolderListing | null>(null);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+  const requestRef = useRef(0);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      const id = ++requestRef.current;
+      setLoading(true);
+      (async () => {
+        const normalized = value.replace(/\/+$/, "");
+        try {
+          const result = await requestJson<{ entries: FileEntry[] }>(`/api/fs?path=${encodePath(normalized)}`);
+          if (id !== requestRef.current) return;
+          setListing({ browsePath: normalized, folders: result.entries.filter((entry) => entry.type === "directory"), filterPrefix: null });
+          setError("");
+        } catch {
+          if (id !== requestRef.current) return;
+          const segments = normalized.split("/").filter(Boolean);
+          const parent = segments.slice(0, -1).join("/");
+          const partial = segments.at(-1) ?? "";
+          if (!partial) {
+            setListing(null);
+            setError("Folder not found");
+            return;
+          }
+          try {
+            const result = await requestJson<{ entries: FileEntry[] }>(`/api/fs?path=${encodePath(parent)}`);
+            if (id !== requestRef.current) return;
+            setListing({ browsePath: parent, folders: result.entries.filter((entry) => entry.type === "directory"), filterPrefix: partial });
+            setError("");
+          } catch {
+            if (id !== requestRef.current) return;
+            setListing(null);
+            setError("Folder not found");
+          }
+        } finally {
+          if (id === requestRef.current) setLoading(false);
+        }
+      })();
+    }, 150);
+    return () => window.clearTimeout(timer);
+  }, [value]);
+
+  const visibleFolders = useMemo(() => {
+    if (!listing) return [];
+    if (!listing.filterPrefix) return listing.folders;
+    const needle = listing.filterPrefix.toLowerCase();
+    return listing.folders.filter((folder) => folder.name.toLowerCase().startsWith(needle));
+  }, [listing]);
+
+  const crumbs = useMemo(() => {
+    const base = listing?.browsePath ?? "";
+    const parts = base ? base.split("/") : [];
+    return [{ label: "Root", path: "" }, ...parts.map((part, index) => ({ label: part, path: parts.slice(0, index + 1).join("/") }))];
+  }, [listing]);
+
+  return (
+    <div className="folder-picker">
+      <div className="folder-picker-crumbs">
+        {crumbs.map((crumb, index) => (
+          <span key={crumb.path || "root"}>
+            {index > 0 && <ChevronRight size={12} />}
+            <button type="button" onClick={() => onChange(crumb.path)}>{crumb.label}</button>
+          </span>
+        ))}
+      </div>
+      <div className="folder-picker-list">
+        {loading && !listing && <div className="folder-picker-empty"><LoaderCircle className="spin" size={16} /> Loading…</div>}
+        {!loading && listing && visibleFolders.length === 0 && <div className="folder-picker-empty">No matching folders</div>}
+        {error && <div className="folder-picker-empty"><CircleAlert size={14} />{error}</div>}
+        {visibleFolders.map((folder) => (
+          <button type="button" key={folder.path} className="folder-picker-row" onClick={() => onChange(folder.path)}>
+            <Folder size={15} /><span>{folder.name}</span><ChevronRight size={13} />
+          </button>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 function BulkRenameDialog({ entries, onClose, notify, onRefresh }: { entries: FileEntry[]; onClose: () => void; notify: (message: string, tone?: "error") => void; onRefresh: () => Promise<void> }) {
