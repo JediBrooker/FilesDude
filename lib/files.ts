@@ -5,7 +5,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { config } from "./config";
 import { AppError } from "./http";
-import type { BulkRenameRule, DiskInfo, FileEntry, IdentityOption, LargestFilesResult, OwnershipPair, RenamePreview } from "./types";
+import type { BulkRenameRule, DiskInfo, FileEntry, IdentityOption, LargestFilesResult, LargestFilesScanning, OwnershipPair, RenamePreview } from "./types";
 
 const INTERNAL_NAMES = new Set([".filedude"]);
 const mimeTypes: Record<string, string> = {
@@ -23,7 +23,7 @@ const mimeTypes: Record<string, string> = {
 let identitiesCache: { users: Map<number, string>; groups: Map<number, string>; at: number } | null = null;
 let canonicalRoot: string | null = null;
 let largestFilesCache: { at: number; index: LargestFilesIndex } | null = null;
-let largestFilesScan: Promise<LargestFilesIndex> | null = null;
+let largestFilesScan: { promise: Promise<LargestFilesIndex>; progress: LargestScanProgress } | null = null;
 let filesystemQueue: Promise<void> = Promise.resolve();
 
 export async function acquireFilesystemLock() {
@@ -540,20 +540,28 @@ type LargestFilesIndex = {
   durationMs: number;
   generatedAt: string;
 };
+type LargestScanProgress = {
+  scannedFiles: number;
+  scannedDirectories: number;
+  skippedEntries: number;
+  startedAt: number;
+};
 
-async function scanLargestFiles(): Promise<LargestFilesIndex> {
-  const startedAt = Date.now();
+// A whole-tree scan can take far longer than a single HTTP request should stay open
+// (large trees have exceeded gateway/proxy timeouts). Instead of awaiting it to
+// completion, each call waits up to this long and, if the scan is still running,
+// reports live progress so the caller can poll again against the same in-flight scan.
+const SCAN_POLL_TIMEOUT_MS = 8_000;
+
+async function scanLargestFiles(progress: LargestScanProgress): Promise<LargestFilesIndex> {
   const root = await ensureRoot();
   const directoryQueue = [root];
   const candidates: LargestCandidate[] = [];
-  let scannedFiles = 0;
-  let scannedDirectories = 0;
-  let skippedEntries = 0;
 
   while (directoryQueue.length) {
     const batch = directoryQueue.splice(0, 4);
     const discovered = await Promise.all(batch.map(async (directory) => {
-      scannedDirectories += 1;
+      progress.scannedDirectories += 1;
       let entries: Dirent[];
       try {
         const directoryStat = await fs.lstat(directory);
@@ -561,7 +569,7 @@ async function scanLargestFiles(): Promise<LargestFilesIndex> {
         if (!directoryStat.isDirectory() || !insideRoot(realDirectory)) throw new Error("Directory is no longer safe to scan");
         entries = await fs.readdir(directory, { withFileTypes: true });
       } catch {
-        skippedEntries += 1;
+        progress.skippedEntries += 1;
         return [] as string[];
       }
 
@@ -575,12 +583,12 @@ async function scanLargestFiles(): Promise<LargestFilesIndex> {
         })));
         for (const item of stats) {
           if (item.status !== "fulfilled") {
-            skippedEntries += 1;
+            progress.skippedEntries += 1;
             continue;
           }
           if (item.value.stat.isDirectory()) directories.push(item.value.absolute);
           else if (item.value.stat.isFile()) {
-            scannedFiles += 1;
+            progress.scannedFiles += 1;
             candidates.push({ absolute: item.value.absolute, size: item.value.stat.size });
           }
         }
@@ -593,32 +601,27 @@ async function scanLargestFiles(): Promise<LargestFilesIndex> {
   candidates.sort((a, b) => b.size - a.size || a.absolute.localeCompare(b.absolute));
   return {
     candidates,
-    scannedFiles,
-    scannedDirectories,
-    skippedEntries,
-    durationMs: Date.now() - startedAt,
+    scannedFiles: progress.scannedFiles,
+    scannedDirectories: progress.scannedDirectories,
+    skippedEntries: progress.skippedEntries,
+    durationMs: Date.now() - progress.startedAt,
     generatedAt: new Date().toISOString(),
   };
 }
 
-export async function largestFiles({ refresh = false, minBytes = 0, offset = 0, limit = 100 }: { refresh?: boolean; minBytes?: number; offset?: number; limit?: number } = {}): Promise<LargestFilesResult> {
-  let index: LargestFilesIndex;
-  let cached = false;
-  if (!refresh && largestFilesCache && Date.now() - largestFilesCache.at < 5 * 60_000) {
-    index = largestFilesCache.index;
-    cached = true;
-  } else {
-    if (!largestFilesScan) {
-      largestFilesScan = scanLargestFiles()
-        .then((value) => {
-          largestFilesCache = { at: Date.now(), index: value };
-          return value;
-        })
-        .finally(() => { largestFilesScan = null; });
-    }
-    index = await largestFilesScan;
-  }
+function scanningResult(progress: LargestScanProgress): LargestFilesScanning {
+  return {
+    status: "scanning",
+    progress: {
+      scannedFiles: progress.scannedFiles,
+      scannedDirectories: progress.scannedDirectories,
+      skippedEntries: progress.skippedEntries,
+      elapsedMs: Date.now() - progress.startedAt,
+    },
+  };
+}
 
+async function pageLargestFilesIndex(index: LargestFilesIndex, { minBytes, offset, limit, cached }: { minBytes: number; offset: number; limit: number; cached: boolean }): Promise<LargestFilesResult> {
   const matching = minBytes > 0 ? index.candidates.filter((candidate) => candidate.size >= minBytes) : index.candidates;
   const page = matching.slice(offset, offset + limit);
   const entries: FileEntry[] = [];
@@ -630,6 +633,7 @@ export async function largestFiles({ refresh = false, minBytes = 0, offset = 0, 
   }
   const nextOffset = Math.min(matching.length, offset + page.length);
   return {
+    status: "ready",
     entries,
     totalMatching: matching.length,
     matchingBytes: matching.reduce((total, candidate) => total + candidate.size, 0),
@@ -644,4 +648,27 @@ export async function largestFiles({ refresh = false, minBytes = 0, offset = 0, 
     generatedAt: index.generatedAt,
     cached,
   };
+}
+
+export async function largestFiles({ refresh = false, minBytes = 0, offset = 0, limit = 100, pollTimeoutMs = SCAN_POLL_TIMEOUT_MS }: { refresh?: boolean; minBytes?: number; offset?: number; limit?: number; pollTimeoutMs?: number } = {}): Promise<LargestFilesResult> {
+  if (!largestFilesScan && !refresh && largestFilesCache && Date.now() - largestFilesCache.at < 5 * 60_000) {
+    return pageLargestFilesIndex(largestFilesCache.index, { minBytes, offset, limit, cached: true });
+  }
+
+  if (!largestFilesScan) {
+    const progress: LargestScanProgress = { scannedFiles: 0, scannedDirectories: 0, skippedEntries: 0, startedAt: Date.now() };
+    const promise = scanLargestFiles(progress)
+      .then((value) => {
+        largestFilesCache = { at: Date.now(), index: value };
+        return value;
+      })
+      .finally(() => { largestFilesScan = null; });
+    largestFilesScan = { promise, progress };
+  }
+
+  const scan = largestFilesScan;
+  const timeout = new Promise<"timeout">((resolve) => { setTimeout(() => resolve("timeout"), pollTimeoutMs); });
+  const outcome = await Promise.race([scan.promise, timeout]);
+  if (outcome === "timeout") return scanningResult(scan.progress);
+  return pageLargestFilesIndex(outcome, { minBytes, offset, limit, cached: false });
 }
