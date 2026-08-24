@@ -52,7 +52,7 @@ import {
 } from "lucide-react";
 import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import type { BulkRenameRule, DiskInfo, FileEntry, IdentityOption, LargestFilesResult, OwnershipPair, RenamePreview, UploadOwnershipOptions, UploadOwnershipPreference } from "@/lib/types";
+import type { BulkRenameRule, DiskInfo, FileEntry, IdentityOption, LargestFilesProgress, LargestFilesReady, LargestFilesResult, OwnershipPair, RenamePreview, UploadOwnershipOptions, UploadOwnershipPreference } from "@/lib/types";
 
 type AuthState = {
   loading: boolean;
@@ -817,7 +817,8 @@ function ModalActions({ onClose, submitLabel, danger = false, busy = false, disa
 }
 
 function StorageDialog({ onClose, onReveal, onPreview, notify }: { onClose: () => void; onReveal: (entry: FileEntry) => void; onPreview: (entry: FileEntry) => void; notify: (message: string, tone?: "error") => void }) {
-  const [result, setResult] = useState<LargestFilesResult | null>(null);
+  const [result, setResult] = useState<LargestFilesReady | null>(null);
+  const [scanProgress, setScanProgress] = useState<LargestFilesProgress | null>(null);
   const [loading, setLoading] = useState(true);
   const [pageSize, setPageSize] = useState(100);
   const [minimumGb, setMinimumGb] = useState("0");
@@ -841,7 +842,14 @@ function StorageDialog({ onClose, onReveal, onPreview, notify }: { onClose: () =
     try {
       const params = new URLSearchParams({ limit: String(limit), offset: String(offset), minBytes: String(minBytes) });
       if (refresh) params.set("refresh", "true");
-      const value = await requestJson<LargestFilesResult>(`/api/fs/largest?${params}`, { signal: controller.signal });
+      let value = await requestJson<LargestFilesResult>(`/api/fs/largest?${params}`, { signal: controller.signal });
+      while (value.status === "scanning") {
+        if (requestRef.current !== controller) return;
+        setScanProgress(value.progress);
+        value = await requestJson<LargestFilesResult>(`/api/fs/largest?${params}`, { signal: controller.signal });
+      }
+      if (requestRef.current !== controller) return;
+      setScanProgress(null);
       nextOffsetRef.current = value.nextOffset;
       minBytesRef.current = minBytes;
       setResult((previous) => {
@@ -946,7 +954,7 @@ function StorageDialog({ onClose, onReveal, onPreview, notify }: { onClose: () =
     <Modal title="Largest files" subtitle="Find, export, and remove files across the entire directory tree" icon={<HardDrive size={19} />} onClose={onClose} wide>
       <div className="storage-browser">
         <div className="storage-scan-bar">
-          <div>{result ? <><strong>{result.totalMatching.toLocaleString()} matching files · {formatBytes(result.matchingBytes)}</strong><span>Showing {result.entries.length.toLocaleString()} · scanned {result.scannedFiles.toLocaleString()} files in {result.scannedDirectories.toLocaleString()} folders · {(result.durationMs / 1000).toFixed(1)}s{result.cached ? " · cached" : ""}</span></> : <><strong>Whole-tree storage scan</strong><span>Every accessible folder under the configured root</span></>}</div>
+          <div>{scanProgress ? <><strong>Scanning…</strong><span>Scanned {scanProgress.scannedFiles.toLocaleString()} files in {scanProgress.scannedDirectories.toLocaleString()} folders · {(scanProgress.elapsedMs / 1000).toFixed(0)}s so far</span></> : result ? <><strong>{result.totalMatching.toLocaleString()} matching files · {formatBytes(result.matchingBytes)}</strong><span>Showing {result.entries.length.toLocaleString()} · scanned {result.scannedFiles.toLocaleString()} files in {result.scannedDirectories.toLocaleString()} folders · {(result.durationMs / 1000).toFixed(1)}s{result.cached ? " · cached" : ""}</span></> : <><strong>Whole-tree storage scan</strong><span>Every accessible folder under the configured root</span></>}</div>
           <div className="storage-scan-actions"><button className="button secondary" disabled={!result?.entries.length} onClick={exportCurrentList}><ArrowDownToLine size={15} /> Export CSV</button><button className="button secondary" disabled={loading} onClick={() => void load({ refresh: true, minBytes: minBytesRef.current, limit: pageSizeRef.current })}><RefreshCw size={15} className={loading ? "spin" : ""} /> Refresh</button></div>
         </div>
         <form className="storage-filter" onSubmit={applyMinimum}>

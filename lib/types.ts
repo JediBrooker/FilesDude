@@ -53,7 +53,15 @@ export interface IdentityOption {
   name: string;
 }
 
-export interface LargestFilesResult {
+export interface LargestFilesProgress {
+  scannedFiles: number;
+  scannedDirectories: number;
+  skippedEntries: number;
+  elapsedMs: number;
+}
+
+export interface LargestFilesReady {
+  status: "ready";
   entries: FileEntry[];
   totalMatching: number;
   matchingBytes: number;
@@ -68,6 +76,13 @@ export interface LargestFilesResult {
   generatedAt: string;
   cached: boolean;
 }
+
+export interface LargestFilesScanning {
+  status: "scanning";
+  progress: LargestFilesProgress;
+}
+
+export type LargestFilesResult = LargestFilesReady | LargestFilesScanning;
 
 export interface BulkRenameRule {
   find?: string;
