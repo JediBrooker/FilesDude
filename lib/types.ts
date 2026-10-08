@@ -115,6 +115,35 @@ export interface DeleteResult {
   trashed: Array<{ path: string; id: string }>;
 }
 
+export interface ContentMatch {
+  line: number;
+  text: string;
+}
+
+export interface ContentSearchHit {
+  path: string;
+  name: string;
+  size: number;
+  modified: string;
+  mime: string;
+  /** The first few matching lines. */
+  matches: ContentMatch[];
+  /** How many lines in the file match. */
+  matchCount: number;
+}
+
+export interface ContentSearchResult {
+  query: string;
+  hits: ContentSearchHit[];
+  scannedFiles: number;
+  scannedBytes: number;
+  /** Files left out: binary, too large, unreadable, or too deeply nested. */
+  skippedFiles: number;
+  durationMs: number;
+  /** Why the search ended early, if it did. */
+  stoppedBy: null | "results" | "files" | "bytes" | "time";
+}
+
 export interface ShareLink {
   id: string;
   path: string;

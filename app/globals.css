@@ -582,6 +582,24 @@ kbd { padding: 3px 5px; border: 1px solid var(--line); border-bottom-width: 2px;
 .share-link-actions input { min-width: 0; height: 32px; flex: 1; padding: 0 9px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--panel); color: var(--ink); font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; font-size: 9px; }
 .share-link-actions .button { min-height: 32px; padding: 0 10px; font-size: 9px; }
 .button.danger-text { color: var(--danger); }
+.search-mode { display: flex; height: 39px; align-items: center; gap: 2px; padding: 3px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel); }
+.search-mode button { height: 100%; padding: 0 10px; border: 0; border-radius: 6px; background: transparent; color: var(--ink-faint); cursor: pointer; font-size: 10px; font-weight: 700; }
+.search-mode button.active { background: var(--panel-strong); color: var(--brand-strong); }
+.search-mode .match-case { margin-left: 2px; border-left: 1px solid var(--line); border-radius: 0 6px 6px 0; font-family: Georgia, serif; }
+.content-search-state { min-height: 300px; margin: 16px; }
+.content-results { display: grid; gap: 10px; padding: 14px; }
+.content-hit { overflow: hidden; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+.content-hit header { display: flex; min-width: 0; align-items: center; gap: 9px; padding: 9px 10px; border-bottom: 1px solid var(--line); background: var(--panel-soft); }
+.content-hit header .file-icon { width: 29px; height: 29px; }
+.content-hit header > div { display: flex; min-width: 0; flex: 1; flex-direction: column; }
+.content-hit header small { color: var(--ink-faint); font-size: 9px; }
+.content-hit header .icon-button { width: 30px; height: 30px; color: var(--ink-soft); }
+.content-hit ol { margin: 0; padding: 6px 0; list-style: none; }
+.content-hit li { display: grid; grid-template-columns: 48px minmax(0, 1fr); gap: 8px; padding: 3px 10px; }
+.content-hit li > span { color: var(--ink-faint); font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; font-size: 9px; text-align: right; }
+.content-hit li code { overflow: hidden; color: var(--ink-soft); font-size: 9px; text-overflow: ellipsis; white-space: pre; }
+.content-hit mark { border-radius: 3px; background: color-mix(in srgb, var(--accent) 45%, transparent); color: var(--ink); }
+.content-summary { margin: 2px 2px 0; color: var(--ink-faint); font-size: 9px; }
 .job-panel { position: fixed; z-index: 190; right: 22px; bottom: 78px; display: grid; width: min(330px, calc(100vw - 44px)); gap: 9px; padding: 11px 12px; border: 1px solid color-mix(in srgb, var(--brand) 30%, var(--line)); border-radius: 11px; background: var(--panel); box-shadow: var(--shadow); }
 .job-panel-head { display: flex; min-width: 0; align-items: center; gap: 9px; }
 .job-panel-head .file-icon { width: 29px; height: 29px; }
@@ -635,6 +653,7 @@ kbd { padding: 3px 5px; border: 1px solid var(--line); border-bottom-width: 2px;
   .file-toolbar { flex-wrap: wrap; }
   .sort-control { display: flex; }
   .search-field { order: 2; width: 100%; }
+  .search-mode { order: 3; }
   .file-row { grid-template-columns: 38px minmax(120px, 1fr) 78px 52px; }
   .file-row > div:nth-child(4), .file-row > div:nth-child(5), .file-row > div:nth-child(6) { display: none; }
   .file-header > div:last-child { display: block; }
