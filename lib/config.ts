@@ -15,6 +15,7 @@ export const config = {
   maxUploadBytes: Math.max(1, Number(process.env.FILEDUDE_MAX_UPLOAD_MB || 512)) * 1024 * 1024,
   trustProxy: process.env.FILEDUDE_TRUST_PROXY === "true",
   trashEnabled: process.env.FILEDUDE_TRASH_ENABLED !== "false",
+  sharingEnabled: process.env.FILEDUDE_SHARING_ENABLED !== "false",
 };
 
 export function isValidPasswordHash(encoded: string) {

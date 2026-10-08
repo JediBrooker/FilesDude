@@ -12,6 +12,7 @@ FilesDude is a secure, self-hosted web file manager designed for a Proxmox host,
 - Create files and folders; edit text/code files up to 2 MB; rename, copy, move, soft-delete, and permanently delete, with a breadcrumb folder browser and autofill suggestions for picking a copy/move destination
 - Multi-file drag-and-drop upload with live progress, transfer speed, time remaining, and cancel (cancelled or interrupted files are discarded and can be resumed), collision-safe names, a configurable size limit, and owner/group confirmation based on the destination folder and its existing contents
 - Direct file downloads and ZIP downloads for folders
+- Share links: let anyone with a private link download a file (or a folder as a ZIP) without signing in, for 1 hour to 30 days and optionally a limited number of downloads; links can be revoked at any time, follow renames and moves, and every download is audited
 - Compress selected items into `.zip` or `.tar.gz` and extract `.zip`, `.tar`, `.tar.gz`, and `.tgz` archives into a new folder, as background jobs with progress and cancel; extraction refuses archives with absolute or `..` paths, never creates links or devices, and stops before filling the disk
 - Inline previews for text, code, JSON, images, PDF, audio, and video; media uses byte-range streaming
 - POSIX `chmod` and numeric `chown` for one or many items
@@ -141,6 +142,26 @@ FilesDude's internal folder name as hostile and extracts nothing from it. Symlin
 hard links, and device entries are skipped and counted, and extraction stops (removing
 its partial folder) rather than leave less than 512 MB free or unpack more than
 100,000 entries. New files and folders take the owner of the folder they are created in.
+
+## Share links
+
+Right-click a file or folder and choose **Share link…** to create a link that anyone can
+use to download it without signing in. Every link expires (1 hour to 30 days) and can
+be limited to a number of downloads, including single use. Shared items show a link
+icon, and **Shared links** in the sidebar lists everything currently shared, with
+copy and revoke buttons.
+
+- Shared files are always downloaded, never displayed in the browser; folders
+  download as a ZIP of their current contents (without FilesDude's internal folders).
+- Links follow items that are renamed or moved, and are revoked when the item is deleted.
+- Each link is signed with `FILEDUDE_SESSION_SECRET`; rotating that secret invalidates
+  every link along with every session. Only link ids are stored, in `shares.json` in
+  the state directory.
+- Every public download is recorded in the audit log.
+- Links use the address you are browsing FilesDude on, so people can only open them
+  if they can reach that address. Over plain HTTP, links and downloads can be read by
+  anyone on the network path; use HTTPS for anything sensitive.
+- Set `FILEDUDE_SHARING_ENABLED=false` to turn sharing off entirely.
 
 ## Version
 

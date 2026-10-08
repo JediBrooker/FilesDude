@@ -115,6 +115,20 @@ export interface DeleteResult {
   trashed: Array<{ path: string; id: string }>;
 }
 
+export interface ShareLink {
+  id: string;
+  path: string;
+  name: string;
+  type: "file" | "directory";
+  createdAt: string;
+  expiresAt: string;
+  /** Null when downloads are unlimited until the link expires. */
+  maxDownloads: number | null;
+  downloads: number;
+  /** The public path to share, e.g. /s/<token>; the browser adds its own origin. */
+  url: string;
+}
+
 export type ArchiveFormat = "zip" | "tar.gz";
 
 export interface JobProgress {

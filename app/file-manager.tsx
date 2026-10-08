@@ -35,6 +35,7 @@ import {
   Info,
   KeyRound,
   LayoutGrid,
+  Link2,
   List,
   ListChecks,
   LoaderCircle,
@@ -66,6 +67,7 @@ import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState
 import { createPortal } from "react-dom";
 import { moveCursor, selectionRange } from "@/lib/selection";
 import { INITIAL_DIRECTION, nextSort, parseSort, sortEntries, type SortKey, type SortState } from "@/lib/sort";
+import type { ShareLink } from "@/lib/types";
 import type { ArchiveFormat, BulkRenameRule, DeleteResult, DiskInfo, FileEntry, JobState, TransferResult, IdentityOption, LargestFilesProgress, LargestFilesReady, LargestFilesResult, OwnershipPair, RenamePreview, TrashItem, TrashListing, TrashRestoreResult, UploadOwnershipOptions, UploadOwnershipPreference } from "@/lib/types";
 
 type AuthState = {
@@ -81,6 +83,8 @@ type DialogState =
   | { kind: "storage" }
   | { kind: "trash" }
   | { kind: "compress" }
+  | { kind: "share"; entry: FileEntry }
+  | { kind: "shares" }
   | { kind: "new" }
   | { kind: "rename"; entry: FileEntry }
   | { kind: "delete" }
@@ -95,7 +99,7 @@ type DialogState =
   | null;
 
 type ViewMode = "list" | "grid";
-type EntryAction = "open" | "edit" | "download" | "favorite" | "rename" | "cut" | "clipboard" | "paste" | "copy" | "move" | "compress" | "extract" | "permissions" | "ownership" | "details" | "delete";
+type EntryAction = "open" | "edit" | "download" | "favorite" | "rename" | "cut" | "clipboard" | "paste" | "copy" | "move" | "compress" | "extract" | "share" | "permissions" | "ownership" | "details" | "delete";
 type FavoriteLocation = { path: string; name: string; createdAt: string };
 type SelectOptions = { additive?: boolean; range?: boolean };
 type MenuPosition = { top: number; left: number };
@@ -109,6 +113,7 @@ type DropHandlers = Required<Pick<React.HTMLAttributes<HTMLElement>, "onDragOver
 type EntryInteractions = {
   menuPath: string | null;
   cutPaths: Set<string>;
+  sharedPaths: Set<string>;
   dropTarget: string | null;
   dropHandlers: DropHandlers;
   onMenuButton: (entry: FileEntry, trigger: DOMRect) => void;
@@ -207,6 +212,37 @@ function fileIcon(entry: Pick<FileEntry, "type" | "mime">, size = 20) {
   if (entry.mime.startsWith("text/") || entry.mime.includes("json")) return <FileCode2 size={size} strokeWidth={1.8} />;
   if (entry.mime === "application/pdf") return <FileText size={size} strokeWidth={1.8} />;
   return <File size={size} strokeWidth={1.8} />;
+}
+
+// navigator.clipboard only exists on HTTPS or localhost, so plain-HTTP LAN access falls back to
+// the older copy command.
+async function copyText(text: string) {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // Fall through to the fallback.
+  }
+  const area = document.createElement("textarea");
+  area.value = text;
+  area.setAttribute("readonly", "");
+  area.style.position = "fixed";
+  area.style.opacity = "0";
+  document.body.appendChild(area);
+  area.select();
+  const copied = document.execCommand("copy");
+  area.remove();
+  return copied;
+}
+
+function shareAddress(link: ShareLink) {
+  return `${window.location.origin}${link.url}`;
+}
+
+function formatDateTime(value: string) {
+  return new Date(value).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
 }
 
 function isArchive(entry: Pick<FileEntry, "type" | "name">) {
@@ -319,6 +355,7 @@ export function FileManager() {
   const [auth, setAuth] = useState<AuthState>(initialAuth);
   const [entries, setEntries] = useState<FileEntry[]>([]);
   const [favorites, setFavorites] = useState<FavoriteLocation[]>([]);
+  const [sharedPaths, setSharedPaths] = useState<Set<string>>(new Set());
   const [disk, setDisk] = useState<DiskInfo | null>(null);
   const [currentPath, setCurrentPath] = useState(() => (typeof window !== "undefined" ? new URLSearchParams(window.location.search).get("path") || "" : ""));
   const [history, setHistory] = useState<string[]>(() => [currentPath]);
@@ -409,6 +446,9 @@ export function FileManager() {
     try {
       const result = await requestJson<{ favorites: FavoriteLocation[] }>("/api/favorites");
       setFavorites(result.favorites);
+      // Shared links follow renames and moves too, so they refresh alongside favourites.
+      const { shares } = await requestJson<{ shares: ShareLink[] }>("/api/shares");
+      setSharedPaths(new Set(shares.map((share) => share.path)));
     } catch (error) {
       const typed = error as Error & { status?: number };
       if (typed.status === 401) await refreshAuth();
@@ -751,6 +791,7 @@ export function FileManager() {
   const interactions: EntryInteractions = {
     menuPath: menu?.kind === "entry" ? menu.entry.path : null,
     cutPaths,
+    sharedPaths,
     dropTarget,
     dropHandlers,
     onMenuButton: (entry, trigger) => openEntryMenu(entry, trigger.right - MENU_WIDTH, trigger.bottom + 6, trigger.top - 6),
@@ -825,6 +866,9 @@ export function FileManager() {
         break;
       case "extract":
         void startArchiveJob({ action: "extract", path: entry.path });
+        break;
+      case "share":
+        setDialog({ kind: "share", entry });
         break;
       case "copy":
       case "move":
@@ -981,6 +1025,7 @@ export function FileManager() {
           <button className={`nav-item ${currentPath === "" ? "active" : ""} ${dropTarget === "" ? "drop-target" : ""}`} data-drop-path="" {...dropHandlers} onClick={() => { navigate(""); setSidebarOpen(false); }}><Home size={18} /><span>All files</span><ChevronRight size={15} /></button>
           <button className="nav-item" onClick={() => { setShowHidden(true); navigate(""); setSidebarOpen(false); }}><Eye size={18} /><span>Hidden files</span></button>
           <button className="nav-item" onClick={() => { setDialog({ kind: "trash" }); setSidebarOpen(false); }}><Trash2 size={18} /><span>Trash</span></button>
+          <button className="nav-item" onClick={() => { setDialog({ kind: "shares" }); setSidebarOpen(false); }}><Link2 size={18} /><span>Shared links</span>{sharedPaths.size > 0 && <em className="nav-count">{sharedPaths.size}</em>}</button>
         </nav>
 
         <div className="sidebar-section favorites-section">
@@ -1128,6 +1173,7 @@ export function FileManager() {
           notify={notify}
           onRefresh={() => loadDirectory()}
           onStartJob={startArchiveJob}
+          onSharesChanged={() => loadFavorites()}
           username={auth.username || ""}
           onCredentialsUpdated={async () => { setDialog(null); await refreshAuth(); notify("Account preferences updated"); }}
           onReveal={(entry) => { setDialog(null); navigate(entry.path.split("/").slice(0, -1).join("/")); }}
@@ -1246,7 +1292,7 @@ function FileTable({ entries, sort, onSort, selected, cursor, interactions, allS
         return (
           <div key={entry.path} data-path={entry.path} aria-selected={isSelected} className={`file-row ${isSelected ? "selected" : ""} ${cursor === entry.path ? "cursor" : ""} ${entryStateClasses(entry, interactions)}`} role="row" {...entryItemProps(entry, interactions)} onMouseDown={(event) => { if (event.shiftKey) event.preventDefault(); }} onDoubleClick={(event) => { if (!(event.target as HTMLElement).closest("button,input,label")) onOpen(entry); }} onClick={(event) => { if ((event.target as HTMLElement).closest("button,input,label")) return; onToggle(entry, { additive: event.metaKey || event.ctrlKey, range: event.shiftKey }); }}>
             <div role="cell"><CheckBox checked={isSelected} onChange={(event) => onToggle(entry, { additive: true, range: event.shiftKey })} label={`Select ${entry.name}`} /></div>
-            <div className="file-name-cell" role="cell"><span className={`file-icon ${entry.type}`}>{fileIcon(entry)}</span><button className="file-name" onClick={() => onOpen(entry)}>{entry.name}</button>{entry.symlinkBlocked && <span className="warning-badge" title="This link points outside the allowed root"><CircleAlert size={13} /></span>}</div>
+            <div className="file-name-cell" role="cell"><span className={`file-icon ${entry.type}`}>{fileIcon(entry)}</span><button className="file-name" onClick={() => onOpen(entry)}>{entry.name}</button>{interactions.sharedPaths.has(entry.path) && <span className="shared-badge" title="Shared by link"><Link2 size={13} /></span>}{entry.symlinkBlocked && <span className="warning-badge" title="This link points outside the allowed root"><CircleAlert size={13} /></span>}</div>
             <div className="muted" role="cell">{entry.type === "directory" ? "—" : formatBytes(entry.size)}</div>
             <div className="owner-cell" role="cell"><span className="mini-avatar">{entry.owner.slice(0, 1).toUpperCase()}</span><span>{entry.owner}:{entry.group}</span></div>
             <div role="cell"><code className="mode-chip">{entry.mode}</code></div>
@@ -1300,6 +1346,7 @@ function FileActionMenu({ entry, targets, position, menuRef, favoritePaths, canP
       <div className="file-menu-section">
         {item("permissions", "Change permissions", <KeyRound size={16} />)}
         {item("ownership", "Change ownership", <UserRoundCog size={16} />)}
+        {!multiple && (entry.type === "file" || entry.type === "directory") && item("share", "Share link…", <Link2 size={16} />)}
         {!multiple && item("details", "Properties", <Info size={16} />)}
       </div>
       <div className="file-menu-section">
@@ -1353,7 +1400,7 @@ function FileSkeleton() {
   return <div className="file-skeleton">{Array.from({ length: 6 }).map((_, index) => <div key={index}><span /><span /><span /><span /></div>)}</div>;
 }
 
-function DialogHost({ dialog, selected, currentPath, username, onClose, onRun, notify, onRefresh, onStartJob, onCredentialsUpdated, onReveal, onPreview }: {
+function DialogHost({ dialog, selected, currentPath, username, onClose, onRun, notify, onRefresh, onStartJob, onSharesChanged, onCredentialsUpdated, onReveal, onPreview }: {
   dialog: NonNullable<DialogState>;
   selected: FileEntry[];
   currentPath: string;
@@ -1363,6 +1410,7 @@ function DialogHost({ dialog, selected, currentPath, username, onClose, onRun, n
   notify: (message: string, tone?: "error") => void;
   onRefresh: () => Promise<void>;
   onStartJob: (body: Record<string, unknown>) => Promise<boolean>;
+  onSharesChanged: () => Promise<void>;
   onCredentialsUpdated: () => Promise<void>;
   onReveal: (entry: FileEntry) => void;
   onPreview: (entry: FileEntry) => void;
@@ -1371,6 +1419,8 @@ function DialogHost({ dialog, selected, currentPath, username, onClose, onRun, n
   if (dialog.kind === "storage") return <StorageDialog onClose={onClose} onReveal={onReveal} onPreview={onPreview} notify={notify} />;
   if (dialog.kind === "trash") return <TrashDialog onClose={onClose} notify={notify} onRefresh={onRefresh} />;
   if (dialog.kind === "compress") return <CompressDialog entries={selected} currentPath={currentPath} onClose={onClose} onStart={onStartJob} />;
+  if (dialog.kind === "share") return <ShareDialog entry={dialog.entry} onClose={onClose} notify={notify} onChanged={onSharesChanged} />;
+  if (dialog.kind === "shares") return <SharesDialog onClose={onClose} notify={notify} onChanged={onSharesChanged} />;
   if (dialog.kind === "new") return <NewDialog path={currentPath} onClose={onClose} onRun={onRun} />;
   if (dialog.kind === "rename") return <RenameDialog entry={dialog.entry} onClose={onClose} onRun={onRun} />;
   if (dialog.kind === "delete") return <DeleteDialog entries={selected} onClose={onClose} onRun={onRun} />;
@@ -1557,6 +1607,107 @@ function StorageDialog({ onClose, onReveal, onPreview, notify }: { onClose: () =
 }
 
 type TrashConfirmation = { kind: "delete"; items: TrashItem[] } | { kind: "empty" };
+
+const SHARE_EXPIRY_OPTIONS = [{ hours: 1, label: "1 hour" }, { hours: 24, label: "1 day" }, { hours: 168, label: "7 days" }, { hours: 720, label: "30 days" }];
+const SHARE_LIMIT_OPTIONS = [{ value: "none", label: "No limit" }, { value: "1", label: "1 download (single use)" }, { value: "5", label: "5 downloads" }, { value: "25", label: "25 downloads" }];
+
+function useShareLinks(notify: (message: string, tone?: "error") => void, onChanged: () => Promise<void>) {
+  const [links, setLinks] = useState<ShareLink[] | null>(null);
+  const [enabled, setEnabled] = useState(true);
+  const load = useCallback(async () => {
+    try {
+      const result = await requestJson<{ enabled: boolean; shares: ShareLink[] }>("/api/shares");
+      setEnabled(result.enabled);
+      setLinks(result.shares);
+    } catch (error) {
+      notify((error as Error).message, "error");
+      setLinks([]);
+    }
+  }, [notify]);
+  useEffect(() => {
+    const timer = window.setTimeout(() => void load(), 0);
+    return () => window.clearTimeout(timer);
+  }, [load]);
+  const copy = async (link: ShareLink) => notify(await copyText(shareAddress(link)) ? "Link copied" : "Couldn't copy automatically; select the link and copy it", undefined);
+  const revoke = async (link: ShareLink) => {
+    try {
+      await requestJson("/api/shares", { method: "POST", body: JSON.stringify({ action: "revoke", id: link.id }) });
+      setLinks((current) => current?.filter((item) => item.id !== link.id) ?? null);
+      notify(`Link to ${link.name} revoked`);
+      await onChanged();
+    } catch (error) {
+      notify((error as Error).message, "error");
+    }
+  };
+  return { links, setLinks, enabled, copy, revoke };
+}
+
+function ShareLinkRow({ link, showLocation, onCopy, onRevoke }: { link: ShareLink; showLocation?: boolean; onCopy: (link: ShareLink) => void; onRevoke: (link: ShareLink) => void }) {
+  return (
+    <div className="share-link-row">
+      <div className="share-link-info">
+        {showLocation && <strong title={`/${link.path}`}>{link.type === "directory" ? <Folder size={14} /> : <File size={14} />}{link.name}<small>{folderLabel(parentOf(link.path))}</small></strong>}
+        <span>Expires {formatDateTime(link.expiresAt)} · {link.maxDownloads === null ? `${link.downloads} ${link.downloads === 1 ? "download" : "downloads"}` : `${link.downloads} of ${link.maxDownloads} downloads used`}</span>
+      </div>
+      <div className="share-link-actions">
+        <input readOnly value={shareAddress(link)} aria-label={`Link to ${link.name}`} onFocus={(event) => event.currentTarget.select()} />
+        <button type="button" className="button secondary" onClick={() => onCopy(link)}><Copy size={14} /> Copy</button>
+        <button type="button" className="button secondary danger-text" onClick={() => onRevoke(link)}><X size={14} /> Revoke</button>
+      </div>
+    </div>
+  );
+}
+
+function ShareDialog({ entry, onClose, notify, onChanged }: { entry: FileEntry; onClose: () => void; notify: (message: string, tone?: "error") => void; onChanged: () => Promise<void> }) {
+  const { links, setLinks, enabled, copy, revoke } = useShareLinks(notify, onChanged);
+  const [hours, setHours] = useState(168);
+  const [limit, setLimit] = useState("none");
+  const [busy, setBusy] = useState(false);
+  const mine = links?.filter((link) => link.path === entry.path) ?? [];
+  const create = async (event: FormEvent) => {
+    event.preventDefault();
+    setBusy(true);
+    try {
+      const { share } = await requestJson<{ share: ShareLink }>("/api/shares", { method: "POST", body: JSON.stringify({ action: "create", path: entry.path, hours, maxDownloads: limit === "none" ? null : Number(limit) }) });
+      setLinks((current) => [share, ...(current ?? [])]);
+      notify(await copyText(shareAddress(share)) ? "Link created and copied" : "Link created");
+      await onChanged();
+    } catch (error) {
+      notify((error as Error).message, "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Modal title={`Share ${entry.name}`} subtitle="Anyone with the link can download it without signing in" icon={<Link2 size={19} />} onClose={onClose} wide>
+      <form onSubmit={create}>
+        {!enabled && <div className="warning-box"><CircleAlert size={17} /> Sharing is turned off on this server (FILEDUDE_SHARING_ENABLED=false).</div>}
+        <div className="field-pair">
+          <FormField label="Link expires after"><select value={hours} onChange={(event) => setHours(Number(event.target.value))} disabled={!enabled}>{SHARE_EXPIRY_OPTIONS.map((option) => <option key={option.hours} value={option.hours}>{option.label}</option>)}</select></FormField>
+          <FormField label="Downloads allowed"><select value={limit} onChange={(event) => setLimit(event.target.value)} disabled={!enabled}>{SHARE_LIMIT_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></FormField>
+        </div>
+        <div className="info-box"><Info size={17} /> {entry.type === "directory" ? "The folder downloads as a ZIP file of its current contents." : "The file always downloads; it never opens in the browser."} Links use this address ({typeof window === "undefined" ? "" : window.location.host}), so people can only open them if they can reach FilesDude here.</div>
+        {links === null ? <div className="ownership-loading"><LoaderCircle className="spin" size={18} /> Loading links…</div> : mine.length > 0 && <div className="share-links"><p className="share-links-title">Active links to this {entry.type === "directory" ? "folder" : "file"}</p>{mine.map((link) => <ShareLinkRow key={link.id} link={link} onCopy={copy} onRevoke={revoke} />)}</div>}
+        <ModalActions onClose={onClose} submitLabel={mine.length ? "Create another link" : "Create link"} busy={busy} disabled={!enabled} />
+      </form>
+    </Modal>
+  );
+}
+
+function SharesDialog({ onClose, notify, onChanged }: { onClose: () => void; notify: (message: string, tone?: "error") => void; onChanged: () => Promise<void> }) {
+  const { links, enabled, copy, revoke } = useShareLinks(notify, onChanged);
+  return (
+    <Modal title="Shared links" subtitle="Everything currently downloadable without signing in" icon={<Link2 size={19} />} onClose={onClose} wide>
+      <div className="storage-browser">
+        {!enabled && <div className="warning-box"><CircleAlert size={17} /> Sharing is turned off on this server, so no links work.</div>}
+        {links === null ? <div className="storage-scan-state"><LoaderCircle className="spin" size={25} /><strong>Loading links…</strong></div>
+          : links.length === 0 ? <div className="storage-scan-state"><Link2 size={25} /><strong>Nothing is shared</strong><span>Right-click a file or folder and choose Share link to create one.</span></div>
+          : <div className="share-links">{links.map((link) => <ShareLinkRow key={link.id} link={link} showLocation onCopy={copy} onRevoke={revoke} />)}</div>}
+        <div className="storage-scan-foot"><span>Expired and used-up links are removed automatically.</span><button className="button primary" onClick={onClose}>Done</button></div>
+      </div>
+    </Modal>
+  );
+}
 
 function TrashDialog({ onClose, notify, onRefresh }: { onClose: () => void; notify: (message: string, tone?: "error") => void; onRefresh: () => Promise<void> }) {
   const [listing, setListing] = useState<TrashListing | null>(null);
