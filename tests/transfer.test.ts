@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { config } from "../lib/config";
-import { copyOrMove, deleteEntries, listTrash, PartialTransferError, restoreTrashItems } from "../lib/files";
+import { copyOrMove, deleteEntries, listTrash, PartialTransferError, renameEntry, restoreTrashItems } from "../lib/files";
 
 async function withTempRoot<T>(run: (root: string) => Promise<T>) {
   const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "filesdude-transfer-")));
@@ -70,6 +70,25 @@ test("a move that fails part-way reports the items that already moved", async ()
       return true;
     });
     assert.equal(await fs.readFile(path.join(root, "b", "x.txt"), "utf8"), "b");
+  });
+});
+
+test("renaming a symlink to its target's name refuses instead of overwriting the target", async () => {
+  await withTempRoot(async (root) => {
+    await fs.writeFile(path.join(root, "a.txt"), "precious");
+    await fs.symlink("a.txt", path.join(root, "link"));
+    await assert.rejects(renameEntry("link", "a.txt"), /already exists/);
+    assert.equal(await fs.readFile(path.join(root, "a.txt"), "utf8"), "precious");
+    assert.ok((await fs.lstat(path.join(root, "link"))).isSymbolicLink());
+
+    await fs.symlink("missing-target", path.join(root, "dangling"));
+    await fs.writeFile(path.join(root, "b.txt"), "b");
+    await assert.rejects(renameEntry("b.txt", "dangling"), /already exists/);
+    assert.equal(await fs.readFile(path.join(root, "b.txt"), "utf8"), "b");
+
+    await fs.writeFile(path.join(root, "Readme.txt"), "r");
+    assert.equal((await renameEntry("Readme.txt", "README.txt")).name, "README.txt");
+    assert.equal(await fs.readFile(path.join(root, "README.txt"), "utf8"), "r");
   });
 });
 
