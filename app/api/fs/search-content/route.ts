@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { requireSession } from "@/lib/auth";
+import { withAccess } from "@/lib/access";
 import { searchContents } from "@/lib/content-search";
 import { assertSameOriginFetch, AppError, jsonError } from "@/lib/http";
 
@@ -22,7 +22,7 @@ function newSlot(): Slot {
 export async function GET(request: Request) {
   try {
     assertSameOriginFetch(request);
-    await requireSession(request);
+    return await withAccess(request, "read", async () => {
     const url = new URL(request.url);
     const slot = newSlot();
     const previous = current;
@@ -44,6 +44,7 @@ export async function GET(request: Request) {
       slot.finish();
       if (current === slot) current = null;
     }
+    });
   } catch (error) {
     return jsonError(error);
   }

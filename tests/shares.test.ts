@@ -34,7 +34,8 @@ test("links resolve only with their exact signed token", async () => {
     const token = tokenOf(share.url);
     assert.equal((await resolveShareToken(token))?.path, "report.pdf");
     const [id, signature] = token.split(".");
-    for (const bad of [`${id}.${signature.slice(0, -1)}A`, `${id}.`, id, `${id}.${signature}.x`, `AAAAAAAAAAAAAAAA.${signature}`, "", "../../etc"]) {
+    const tampered = `${signature.slice(0, -1)}${signature.endsWith("A") ? "E" : "A"}`;
+    for (const bad of [`${id}.${tampered}`, `${id}.`, id, `${id}.${signature}.x`, `AAAAAAAAAAAAAAAA.${signature}`, "", "../../etc"]) {
       assert.equal(await resolveShareToken(bad), null, bad);
     }
     config.sessionSecret = "a-different-rotated-session-secret-of-enough-length";

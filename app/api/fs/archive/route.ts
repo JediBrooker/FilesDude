@@ -1,7 +1,7 @@
 import path from "node:path";
 import { NextResponse } from "next/server";
 import { compressEntries, extractArchive } from "@/lib/archives";
-import { requireSession } from "@/lib/auth";
+import { withAccess } from "@/lib/access";
 import { audit } from "@/lib/audit";
 import { assertMutationRequest, AppError, jsonError, readJsonBody } from "@/lib/http";
 import { cancelJob, getJob, listJobs, startJob } from "@/lib/jobs";
@@ -12,12 +12,13 @@ export const dynamic = "force-dynamic";
 
 export async function GET(request: Request) {
   try {
-    await requireSession(request);
-    const id = new URL(request.url).searchParams.get("id");
-    if (!id) return NextResponse.json({ jobs: listJobs() }, { headers: { "Cache-Control": "no-store" } });
-    const job = getJob(id);
-    if (!job) throw new AppError("That job no longer exists", 404, "NOT_FOUND");
-    return NextResponse.json({ job }, { headers: { "Cache-Control": "no-store" } });
+    return await withAccess(request, "read", async () => {
+      const id = new URL(request.url).searchParams.get("id");
+      if (!id) return NextResponse.json({ jobs: listJobs() }, { headers: { "Cache-Control": "no-store" } });
+      const job = getJob(id);
+      if (!job) throw new AppError("That job no longer exists", 404, "NOT_FOUND");
+      return NextResponse.json({ job }, { headers: { "Cache-Control": "no-store" } });
+    });
   } catch (error) {
     return jsonError(error);
   }
@@ -33,7 +34,7 @@ function stringField(value: unknown, label: string, maxLength = 4096) {
 export async function POST(request: Request) {
   try {
     assertMutationRequest(request);
-    const session = await requireSession(request);
+    return await withAccess(request, "write", async (session) => {
     const parsed = await readJsonBody<unknown>(request, 1024 * 1024);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new AppError("Request body is invalid", 400, "INVALID_REQUEST");
     const body = parsed as ArchiveBody;
@@ -72,6 +73,7 @@ export async function POST(request: Request) {
         throw new AppError("Unknown archive operation", 400, "UNKNOWN_ACTION");
     }
     return NextResponse.json({ ok: true, job }, { headers: { "Cache-Control": "no-store" } });
+    });
   } catch (error) {
     return jsonError(error);
   }

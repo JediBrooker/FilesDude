@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { requireSession } from "@/lib/auth";
+import { assertPermission, withAccess, type Permission } from "@/lib/access";
 import { audit } from "@/lib/audit";
 import { assertMutationRequest, AppError, jsonError, readJsonBody } from "@/lib/http";
 import {
@@ -33,17 +33,25 @@ async function rewriteLinkedPaths(changes: Array<{ from: string; to?: string }>,
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
+// Viewing details is reading; changing permissions or ownership is for the owner; the rest edits.
+function actionPermission(action: unknown): Permission {
+  if (action === "details") return "read";
+  if (action === "chmod" || action === "chown") return "owner";
+  return "write";
+}
+
 export async function GET(request: Request) {
   try {
-    await requireSession(request);
-    const url = new URL(request.url);
-    const relativePath = url.searchParams.get("path") || "";
-    const search = url.searchParams.get("search")?.trim();
-    const showHidden = url.searchParams.get("hidden") === "true";
-    const result = await withFilesystemLock(() => search
-      ? searchFiles(relativePath, search, showHidden)
-      : listDirectory(relativePath, showHidden));
-    return NextResponse.json(result, { headers: { "Cache-Control": "no-store" } });
+    return await withAccess(request, "read", async () => {
+      const url = new URL(request.url);
+      const relativePath = url.searchParams.get("path") || "";
+      const search = url.searchParams.get("search")?.trim();
+      const showHidden = url.searchParams.get("hidden") === "true";
+      const result = await withFilesystemLock(() => search
+        ? searchFiles(relativePath, search, showHidden)
+        : listDirectory(relativePath, showHidden));
+      return NextResponse.json(result, { headers: { "Cache-Control": "no-store" } });
+    });
   } catch (error) {
     return jsonError(error);
   }
@@ -70,7 +78,7 @@ type ActionBody = {
 export async function POST(request: Request) {
   try {
     assertMutationRequest(request);
-    const session = await requireSession(request);
+    return await withAccess(request, "read", async (session) => {
     const rewriteLinked = (changes: Array<{ from: string; to?: string }>) => rewriteLinkedPaths(changes, session.username);
     const parsed = await readJsonBody<unknown>(request, 16 * 1024 * 1024);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new AppError("Request body is invalid", 400, "INVALID_REQUEST");
@@ -82,6 +90,7 @@ export async function POST(request: Request) {
     if (paths.length > 1_000 || paths.some((item) => typeof item !== "string" || item.length > 4096)) {
       throw new AppError("Too many or invalid paths", 400, "INVALID_PATHS");
     }
+    assertPermission(session, actionPermission(body.action));
     const result = await withFilesystemLock(async () => {
       let operationResult: unknown = { ok: true };
       switch (body.action) {
@@ -157,6 +166,7 @@ export async function POST(request: Request) {
       permanent: body.permanent,
     });
     return NextResponse.json({ ok: true, result }, { headers: { "Cache-Control": "no-store" } });
+    });
   } catch (error) {
     return jsonError(error);
   }

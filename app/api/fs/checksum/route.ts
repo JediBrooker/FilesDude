@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import { NextResponse } from "next/server";
 import { reservedPathCheck } from "@/lib/archives";
-import { requireSession } from "@/lib/auth";
+import { withAccess } from "@/lib/access";
 import { acquireFilesystemLock, openVerifiedFile } from "@/lib/files";
 import { AppError, assertSameOriginFetch, jsonError } from "@/lib/http";
 
@@ -16,7 +16,7 @@ let activeChecksums = 0;
 export async function GET(request: Request) {
   try {
     assertSameOriginFetch(request);
-    await requireSession(request);
+    return await withAccess(request, "read", async () => {
     if (activeChecksums >= MAX_ACTIVE_CHECKSUMS) throw new AppError("Other checksums are still being calculated; try again shortly", 503, "CHECKSUMS_BUSY");
     const isReserved = await reservedPathCheck();
     const unlock = await acquireFilesystemLock();
@@ -58,6 +58,7 @@ export async function GET(request: Request) {
       activeChecksums -= 1;
     }
     return NextResponse.json({ sha256: sha256.digest("hex"), md5: md5.digest("hex"), bytes }, { headers: { "Cache-Control": "no-store" } });
+    });
   } catch (error) {
     return jsonError(error);
   }

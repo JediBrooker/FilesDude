@@ -3,6 +3,17 @@ import net from "node:net";
 import { config, configurationIssues, isValidPasswordHash } from "./config";
 import { getCredentials } from "./credentials";
 import { AppError } from "./http";
+import type { Role } from "./scope";
+import { findUserById } from "./users";
+
+export interface Session {
+  username: string;
+  credentialsVersion: number;
+  /** "owner" for the installer's login, otherwise the account id. */
+  accountKey: string;
+  role: Role;
+  root: string;
+}
 
 const COOKIE = "fd_session";
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
@@ -54,11 +65,12 @@ export async function verifyPassword(password: string, encoded = config.password
   return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
 }
 
-export function createSession(username: string, credentialsVersion: number) {
+export function createSession(username: string, credentialsVersion: number, accountKey = "owner") {
   assertConfigured();
   const payload = base64url(
     JSON.stringify({
       u: username,
+      k: accountKey,
       v: credentialsVersion,
       exp: Date.now() + config.sessionHours * 60 * 60 * 1000,
       nonce: crypto.randomBytes(16).toString("hex"),
@@ -83,7 +95,7 @@ function cookieValue(request: Request, name: string) {
   return match ? match.slice(name.length + 1) : "";
 }
 
-export async function getSession(request: Request): Promise<{ username: string; credentialsVersion: number } | null> {
+export async function getSession(request: Request): Promise<Session | null> {
   if (configurationIssues().length) return null;
   const token = cookieValue(request, COOKIE);
   const [payload, suppliedSignature, extra] = token.split(".");
@@ -96,9 +108,17 @@ export async function getSession(request: Request): Promise<{ username: string; 
 
   try {
     const value = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
-    const credentials = await getCredentials();
-    if (value.u !== credentials.username || value.v !== credentials.version || typeof value.exp !== "number" || value.exp < Date.now()) return null;
-    return { username: value.u, credentialsVersion: value.v };
+    if (typeof value.exp !== "number" || value.exp < Date.now() || typeof value.u !== "string") return null;
+    // Sessions from before accounts existed carry no account key and belong to the owner.
+    if (value.k === undefined || value.k === "owner") {
+      const credentials = await getCredentials();
+      if (value.u !== credentials.username || value.v !== credentials.version) return null;
+      return { username: value.u, credentialsVersion: value.v, accountKey: "owner", role: "owner", root: "" };
+    }
+    if (typeof value.k !== "string") return null;
+    const user = await findUserById(value.k);
+    if (!user || user.username !== value.u || user.version !== value.v) return null;
+    return { username: user.username, credentialsVersion: user.version, accountKey: user.id, role: user.role, root: user.root };
   } catch {
     return null;
   }

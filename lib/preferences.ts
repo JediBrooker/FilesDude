@@ -10,7 +10,9 @@ export interface StoredPreferences {
   updatedAt?: string;
 }
 
-const preferencesFile = path.join(config.stateDir, "preferences.json");
+function preferencesFile() {
+  return path.join(config.stateDir, "preferences.json");
+}
 const defaults: StoredPreferences = { uploadOwnership: { mode: "destination" } };
 
 export function parseUploadOwnershipPreference(value: unknown): UploadOwnershipPreference {
@@ -25,7 +27,7 @@ export function parseUploadOwnershipPreference(value: unknown): UploadOwnershipP
 
 export async function getPreferences(): Promise<StoredPreferences> {
   try {
-    const value = JSON.parse(await fs.readFile(preferencesFile, "utf8")) as Partial<StoredPreferences>;
+    const value = JSON.parse(await fs.readFile(preferencesFile(), "utf8")) as Partial<StoredPreferences>;
     return {
       uploadOwnership: value.uploadOwnership ? parseUploadOwnershipPreference(value.uploadOwnership) : defaults.uploadOwnership,
       updatedAt: typeof value.updatedAt === "string" ? value.updatedAt : undefined,
@@ -41,5 +43,5 @@ export async function savePreferences(preferences: StoredPreferences) {
   await fs.mkdir(config.stateDir, { recursive: true, mode: 0o700 });
   const temporary = path.join(config.stateDir, `preferences-${crypto.randomUUID()}.tmp`);
   await fs.writeFile(temporary, `${JSON.stringify(preferences, null, 2)}\n`, { mode: 0o600 });
-  await fs.rename(temporary, preferencesFile);
+  await fs.rename(temporary, preferencesFile());
 }

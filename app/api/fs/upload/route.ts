@@ -3,7 +3,7 @@ import path from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import Busboy from "busboy";
-import { requireSession } from "@/lib/auth";
+import { withAccess } from "@/lib/access";
 import { config } from "@/lib/config";
 import { audit } from "@/lib/audit";
 import { acquireFilesystemLock, isAvailableUploadOwnership, resolveOwnershipPair, safeResolve, uploadOwnershipOptions, verifyFileHandleWithinRoot, withFilesystemLock } from "@/lib/files";
@@ -48,7 +48,8 @@ async function reserveTarget(directory: string, name: string) {
 
 export async function GET(request: Request) {
   try {
-    await requireSession(request);
+    // Ownership options list the server's users and groups, so they are for the owner only.
+    return await withAccess(request, "owner", async () => {
     const directory = new URL(request.url).searchParams.get("path") || "";
     const result = await withFilesystemLock(async () => {
       const [options, preferences] = await Promise.all([uploadOwnershipOptions(directory), getPreferences()]);
@@ -59,6 +60,7 @@ export async function GET(request: Request) {
       return { ...options, preference, defaultPair } satisfies UploadOwnershipOptions;
     });
     return NextResponse.json(result, { headers: { "Cache-Control": "no-store" } });
+    });
   } catch (error) {
     return jsonError(error);
   }
@@ -67,7 +69,7 @@ export async function GET(request: Request) {
 export async function POST(request: Request) {
   try {
     assertMutationRequest(request);
-    const session = await requireSession(request);
+    return await withAccess(request, "write", async (session) => {
     const releaseFilesystem = await acquireFilesystemLock();
     try {
       const contentLength = Number(request.headers.get("content-length") || 0);
@@ -85,7 +87,15 @@ export async function POST(request: Request) {
     const gidValue = url.searchParams.get("gid");
     if ((uidValue === null) !== (gidValue === null)) throw new AppError("Choose both an owner and group", 400, "INVALID_UPLOAD_OWNERSHIP");
     let requestedOwnership: { uid: number; gid: number } | null = null;
-    if (uidValue !== null && gidValue !== null) {
+    if (session.role !== "owner") {
+      // Only the owner chooses ownership; other accounts' uploads take the destination folder's
+      // owner, so files a root service writes stay usable by that folder's users.
+      if (uidValue !== null || gidValue !== null) throw new AppError("Only the owner account can choose upload ownership", 403, "FORBIDDEN");
+      if (typeof process.getuid === "function" && process.getuid() === 0) {
+        const folder = await fsp.stat(destination);
+        requestedOwnership = { uid: folder.uid, gid: folder.gid };
+      }
+    } else if (uidValue !== null && gidValue !== null) {
       const uid = Number(uidValue);
       const gid = Number(gidValue);
       const preference = (await getPreferences()).uploadOwnership;
@@ -194,6 +204,7 @@ export async function POST(request: Request) {
     } finally {
       releaseFilesystem();
     }
+    });
   } catch (error) {
     return jsonError(error);
   }

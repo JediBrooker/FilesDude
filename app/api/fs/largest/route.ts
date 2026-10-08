@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { requireSession } from "@/lib/auth";
+import { withAccess } from "@/lib/access";
 import { largestFiles, withFilesystemLock } from "@/lib/files";
 import { jsonError } from "@/lib/http";
 
@@ -8,7 +8,8 @@ export const dynamic = "force-dynamic";
 
 export async function GET(request: Request) {
   try {
-    await requireSession(request);
+    // The whole-tree scan spans every account's folders, so it is for the owner only.
+    return await withAccess(request, "owner", async () => {
     const url = new URL(request.url);
     const requestedLimit = Number(url.searchParams.get("limit") || 100);
     const requestedOffset = Number(url.searchParams.get("offset") || 0);
@@ -18,6 +19,7 @@ export async function GET(request: Request) {
     const minBytes = Number.isFinite(requestedMinBytes) ? Math.max(0, Math.floor(requestedMinBytes)) : 0;
     const result = await withFilesystemLock(() => largestFiles({ refresh: url.searchParams.get("refresh") === "true", minBytes, offset, limit }));
     return NextResponse.json(result, { headers: { "Cache-Control": "no-store" } });
+    });
   } catch (error) {
     return jsonError(error);
   }

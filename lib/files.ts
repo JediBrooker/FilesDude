@@ -5,6 +5,21 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { config } from "./config";
 import { AppError } from "./http";
+import { currentScope, scopeRoot, withinScope } from "./scope";
+
+// An account confined to a folder can't rename, move, or delete that folder itself.
+function assertNotHome(relativePath: string) {
+  const home = scopeRoot();
+  if (home && relativePath.replace(/\/+$/, "") === home) throw new AppError("You can't rename, move, or delete your home folder", 403, "HOME_FOLDER");
+}
+
+// Confined accounts only see trash items deleted from inside their folder; the owner sees all,
+// including items trashed before origins were recorded.
+function trashItemVisible(originalPath: string | null) {
+  const scope = currentScope();
+  if (!scope || scope.role === "owner") return true;
+  return originalPath !== null && withinScope(originalPath, scope.root);
+}
 import type { BulkRenameRule, DeleteResult, DiskInfo, EntryType, FileEntry, IdentityOption, LargestFilesResult, LargestFilesScanning, OwnershipPair, RenamePreview, TransferResult, TrashItem, TrashListing, TrashRestoreResult } from "./types";
 
 export const INTERNAL_NAMES = new Set([".filedude"]);
@@ -64,9 +79,14 @@ export function normalizeRelative(input = "") {
   return normalized;
 }
 
+// Inside the configured root and, for a signed-in account confined to a folder, inside that folder.
+// Everything that resolves or verifies a path goes through here, so confinement can't be bypassed
+// by a symlink inside the account's folder pointing elsewhere in the root.
 function insideRoot(candidate: string) {
   const root = canonicalRoot || config.root;
-  return candidate === root || candidate.startsWith(`${root}${path.sep}`);
+  const scoped = scopeRoot();
+  const base = scoped ? path.join(root, ...scoped.split("/")) : root;
+  return candidate === base || candidate.startsWith(`${base}${path.sep}`);
 }
 
 export async function ensureRoot() {
@@ -77,6 +97,7 @@ export async function ensureRoot() {
 
 export async function safeResolve(input = "", options: { mustExist?: boolean; allowInternal?: boolean; followSymlink?: boolean } = {}) {
   const relative = normalizeRelative(input);
+  if (!withinScope(relative.replace(/\/+$/, ""))) throw new AppError("That location is outside your folder", 403, "OUTSIDE_SCOPE");
   if (!options.allowInternal && relative.split("/").some((part) => INTERNAL_NAMES.has(part))) {
     throw new AppError("That path is reserved by FilesDude", 403, "RESERVED_PATH");
   }
@@ -351,6 +372,7 @@ export async function createEntry(parentPath: string, name: string, type: "file"
 
 export async function renameEntry(sourcePath: string, newName: string) {
   const source = await safeResolve(sourcePath, { followSymlink: false });
+  assertNotHome(relativeFromAbsolute(source));
   const target = path.join(path.dirname(source), validateName(newName));
   if (target === source) return toEntry(source);
   await safeResolve(relativeFromAbsolute(target), { mustExist: false });
@@ -392,6 +414,7 @@ export async function deleteEntries(paths: string[], permanent = false): Promise
   for (const relativePath of paths) {
     const source = await safeResolve(relativePath, { followSymlink: false });
     if (source === root) throw new AppError("The configured root cannot be deleted", 403);
+    assertNotHome(relativeFromAbsolute(source));
     if (trash) trashed.push({ path: relativeFromAbsolute(source), id: await moveToTrash(source, trash) });
     else await fs.rm(source, { recursive: true, force: false });
   }
@@ -561,7 +584,7 @@ export async function listTrash(): Promise<TrashListing> {
   // Read records in batches so a very large trash cannot exhaust file descriptors.
   for (let offset = 0; offset < ids.length; offset += 64) {
     const described = await Promise.all(ids.slice(offset, offset + 64).map((id) => describeTrashItem(trash, id)));
-    items.push(...described.filter((item): item is TrashItem => item !== null));
+    items.push(...described.filter((item): item is TrashItem => item !== null && trashItemVisible(item.originalPath)));
   }
   items.sort((a, b) => b.deletedAt.localeCompare(a.deletedAt) || a.name.localeCompare(b.name));
   return { enabled: config.trashEnabled, items, totalBytes: items.reduce((total, item) => total + item.size, 0) };
@@ -621,6 +644,7 @@ export async function restoreTrashItems(ids: string[]): Promise<TrashRestoreResu
   for (const id of ids) {
     const source = await existingTrashItem(trash, id);
     const info = await readTrashInfo(trash!, id);
+    if (!trashItemVisible(info?.originalPath ?? null)) throw new AppError("That item is no longer in the trash", 404, "NOT_FOUND");
     const originalPath = info?.originalPath ?? validateName(LEGACY_TRASH_ID.exec(id)?.[1] ?? id);
     const parentRelative = path.posix.dirname(originalPath) === "." ? "" : path.posix.dirname(originalPath);
     const type = info?.type ?? entryType(await fs.lstat(source));
@@ -637,7 +661,9 @@ export async function deleteTrashItems(ids: string[]) {
   if (!ids.length) throw new AppError("Choose at least one item", 400);
   const trash = await trashDirectories();
   for (const id of ids) {
-    await fs.rm(await existingTrashItem(trash, id), { recursive: true, force: false });
+    const item = await existingTrashItem(trash, id);
+    if (!trashItemVisible((await readTrashInfo(trash!, id))?.originalPath ?? null)) throw new AppError("That item is no longer in the trash", 404, "NOT_FOUND");
+    await fs.rm(item, { recursive: true, force: false });
     await fs.rm(path.join(trash!.info, `${id}.json`), { force: true });
   }
   return { removed: ids.length };
@@ -688,6 +714,7 @@ export async function copyOrMove(paths: string[], destinationPath: string, move:
 async function transferOne(sourcePath: string, destination: string, destinationRelative: string, move: boolean): Promise<TransferResult> {
   {
     const source = await safeResolve(sourcePath, { followSymlink: false });
+    if (move) assertNotHome(relativeFromAbsolute(source));
     if (destination === source || destination.startsWith(`${source}${path.sep}`)) {
       throw new AppError(`You can't ${move ? "move" : "copy"} a folder into itself or one of its own subfolders`, 400, "INVALID_DESTINATION");
     }
@@ -790,6 +817,7 @@ export async function previewBulkRename(paths: string[], rule: BulkRenameRule): 
 }
 
 export async function applyBulkRename(paths: string[], rule: BulkRenameRule) {
+  for (const item of paths) assertNotHome(normalizeRelative(item));
   const previews = await previewBulkRename(paths, rule);
   if (previews.some((item) => item.error)) throw new AppError("Resolve bulk rename conflicts before applying", 409, "RENAME_CONFLICT");
 

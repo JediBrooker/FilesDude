@@ -1,40 +1,68 @@
 import { NextResponse } from "next/server";
-import { createSession, requireSession, sessionCookie, verifyPassword } from "@/lib/auth";
+import { withAccess } from "@/lib/access";
+import { createSession, sessionCookie, verifyPassword } from "@/lib/auth";
 import { audit } from "@/lib/audit";
 import { getCredentials, hashPassword, saveCredentials, validateNewPassword, validateUsername } from "@/lib/credentials";
 import { identityCatalog, isKnownIdentityPair } from "@/lib/files";
 import { assertMutationRequest, AppError, jsonError, readJsonBody } from "@/lib/http";
 import { getPreferences, parseUploadOwnershipPreference, savePreferences } from "@/lib/preferences";
 import type { UploadOwnershipPreference } from "@/lib/types";
+import { changeOwnPassword, findUserById, isUserUsername } from "@/lib/users";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function GET(request: Request) {
   try {
-    const session = await requireSession(request);
-    const [preferences, identities] = await Promise.all([getPreferences(), identityCatalog()]);
-    return NextResponse.json({
-      username: session.username,
-      uploadOwnership: preferences.uploadOwnership,
-      identities,
-    }, { headers: { "Cache-Control": "no-store" } });
+    return await withAccess(request, "read", async (session) => {
+      // Server-wide settings and the list of system users are only for the owner.
+      if (session.role !== "owner") return NextResponse.json({ username: session.username, role: session.role, root: session.root }, { headers: { "Cache-Control": "no-store" } });
+      const [preferences, identities] = await Promise.all([getPreferences(), identityCatalog()]);
+      return NextResponse.json({
+        username: session.username,
+        role: session.role,
+        root: session.root,
+        uploadOwnership: preferences.uploadOwnership,
+        identities,
+      }, { headers: { "Cache-Control": "no-store" } });
+    });
   } catch (error) {
     return jsonError(error);
   }
 }
+
 export async function POST(request: Request) {
   try {
     assertMutationRequest(request);
-    const session = await requireSession(request);
+    return await withAccess(request, "read", async (session) => {
     const parsed = await readJsonBody<unknown>(request, 16 * 1024);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new AppError("Request body is invalid", 400, "INVALID_REQUEST");
     const body = parsed as { currentPassword?: unknown; username?: unknown; newPassword?: unknown; uploadOwnership?: UploadOwnershipPreference };
     if (body.currentPassword !== undefined && typeof body.currentPassword !== "string") throw new AppError("Current password is invalid", 400, "INVALID_REQUEST");
     if (body.username !== undefined && typeof body.username !== "string") throw new AppError("Username is invalid", 400, "INVALID_REQUEST");
     if (body.newPassword !== undefined && typeof body.newPassword !== "string") throw new AppError("New password is invalid", 400, "INVALID_REQUEST");
+
+    // Editors and viewers can only change their own password; the owner manages everything else.
+    if (session.role !== "owner") {
+      if (body.username !== undefined || body.uploadOwnership !== undefined) throw new AppError("Only the owner account can change that", 403, "FORBIDDEN");
+      if (!body.newPassword) throw new AppError("No preference changes to save", 400, "NO_CHANGES");
+      const user = await findUserById(session.accountKey);
+      if (!user) throw new AppError("Sign in required", 401, "UNAUTHORIZED");
+      if (!body.currentPassword || !(await verifyPassword(body.currentPassword as string, user.passwordHash))) {
+        await audit("settings.credentials.failed", { username: session.username });
+        throw new AppError("Current password is incorrect", 401, "INVALID_CURRENT_PASSWORD");
+      }
+      const version = await changeOwnPassword(user.id, body.newPassword as string);
+      await audit("settings.password.changed", { username: session.username });
+      const response = NextResponse.json({ ok: true, username: user.username });
+      response.headers.set("Set-Cookie", sessionCookie(createSession(user.username, version, user.id), request));
+      response.headers.set("Cache-Control", "no-store");
+      return response;
+    }
+
     const [current, storedPreferences] = await Promise.all([getCredentials(), getPreferences()]);
     const username = validateUsername((body.username as string | undefined) || current.username);
+    if (username.toLowerCase() !== current.username.toLowerCase() && await isUserUsername(username)) throw new AppError("That username is already in use", 409, "USERNAME_TAKEN");
     const passwordChanged = Boolean(body.newPassword);
     const credentialsChanged = username !== current.username || passwordChanged;
     const uploadOwnership = body.uploadOwnership === undefined
@@ -80,6 +108,7 @@ export async function POST(request: Request) {
     if (credentialsChanged) response.headers.set("Set-Cookie", sessionCookie(createSession(username, credentialVersion), request));
     response.headers.set("Cache-Control", "no-store");
     return response;
+    });
   } catch (error) {
     return jsonError(error);
   }

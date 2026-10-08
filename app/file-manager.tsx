@@ -61,6 +61,7 @@ import {
   Undo2,
   Upload,
   UserRoundCog,
+  Users,
   X,
 } from "lucide-react";
 import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -70,13 +71,20 @@ import { INITIAL_DIRECTION, nextSort, parseSort, sortEntries, type SortKey, type
 import type { ContentSearchHit, ContentSearchResult, ShareLink } from "@/lib/types";
 import type { ArchiveFormat, BulkRenameRule, DeleteResult, DiskInfo, FileEntry, JobState, TransferResult, IdentityOption, LargestFilesProgress, LargestFilesReady, LargestFilesResult, OwnershipPair, RenamePreview, TrashItem, TrashListing, TrashRestoreResult, UploadOwnershipOptions, UploadOwnershipPreference } from "@/lib/types";
 
+type Role = "owner" | "editor" | "viewer";
 type AuthState = {
   loading: boolean;
   authenticated: boolean;
   configured: boolean;
   username: string | null;
+  role: Role | null;
+  /** The folder the account is confined to; "" for the whole root. */
+  root: string | null;
   configurationIssues: string[];
 };
+type ManagedUser = { id: string; username: string; role: "editor" | "viewer"; root: string; createdAt: string; updatedAt: string };
+
+const ROLE_LABELS: Record<Role, string> = { owner: "Owner", editor: "Editor", viewer: "Viewer" };
 
 type DialogState =
   | { kind: "upload"; files: File[] }
@@ -85,6 +93,7 @@ type DialogState =
   | { kind: "compress" }
   | { kind: "share"; entry: FileEntry }
   | { kind: "shares" }
+  | { kind: "users" }
   | { kind: "new" }
   | { kind: "rename"; entry: FileEntry }
   | { kind: "delete" }
@@ -114,6 +123,7 @@ type EntryInteractions = {
   menuPath: string | null;
   cutPaths: Set<string>;
   sharedPaths: Set<string>;
+  canWrite: boolean;
   dropTarget: string | null;
   dropHandlers: DropHandlers;
   onMenuButton: (entry: FileEntry, trigger: DOMRect) => void;
@@ -153,6 +163,8 @@ const initialAuth: AuthState = {
   authenticated: false,
   configured: true,
   username: null,
+  role: null,
+  root: null,
   configurationIssues: [],
 };
 
@@ -396,6 +408,12 @@ export function FileManager() {
   const undoRef = useRef<UndoAction | null>(null);
   const dragPathsRef = useRef<string[]>([]);
   const sortedEntries = useMemo(() => sortEntries(entries, sort), [entries, sort]);
+  // What the signed-in account may do. The server enforces all of this; the UI just hides what
+  // would be refused.
+  const home = auth.root ?? "";
+  const canWrite = auth.role !== "viewer";
+  const isOwner = auth.role === "owner";
+  const withinHome = (pathValue: string) => !home || pathValue === home || pathValue.startsWith(`${home}/`);
   const cutPaths = useMemo(() => new Set(clipboard?.mode === "cut" ? clipboard.paths : []), [clipboard]);
 
   // An undo is only offered while its own toast is showing: any newer message, or the toast
@@ -493,10 +511,20 @@ export function FileManager() {
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
-      if (auth.authenticated) void loadDirectory(currentPath, activeSearch);
+      if (auth.authenticated && withinHome(currentPath)) void loadDirectory(currentPath, activeSearch);
     }, 0);
     return () => window.clearTimeout(timer);
   }, [auth.authenticated, activeSearch, currentPath, showHidden, searchMode]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // An account confined to a folder starts there and can't wander above it.
+  useEffect(() => {
+    if (!auth.authenticated || withinHome(currentPath)) return;
+    const timer = window.setTimeout(() => {
+      setCurrentPath(home);
+      window.history.replaceState({ path: home, index: historyIndex }, "", buildUrl(home));
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [auth.authenticated, currentPath, home]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -827,6 +855,7 @@ export function FileManager() {
     menuPath: menu?.kind === "entry" ? menu.entry.path : null,
     cutPaths,
     sharedPaths,
+    canWrite,
     dropTarget,
     dropHandlers,
     onMenuButton: (entry, trigger) => openEntryMenu(entry, trigger.right - MENU_WIDTH, trigger.bottom + 6, trigger.top - 6),
@@ -934,6 +963,7 @@ export function FileManager() {
         return;
       }
       if (dialog || menu || isTypingTarget(event.target)) return;
+      if (!canWrite && (key === "delete" || key === "f2" || (modifier && ["z", "v", "c", "x", "backspace"].includes(key)))) return;
       if (modifier && !event.shiftKey && key === "z") {
         if (undoRef.current) {
           event.preventDefault();
@@ -1035,9 +1065,10 @@ export function FileManager() {
   };
 
   const crumbs = useMemo(() => {
-    const parts = currentPath ? currentPath.split("/") : [];
-    return [{ label: "Root", path: "" }, ...parts.map((part, index) => ({ label: part, path: parts.slice(0, index + 1).join("/") }))];
-  }, [currentPath]);
+    const below = home && currentPath.startsWith(home) ? currentPath.slice(home.length).replace(/^\//, "") : currentPath;
+    const parts = below ? below.split("/") : [];
+    return [{ label: home ? "Home" : "Root", path: home }, ...parts.map((part, index) => ({ label: part, path: [home, ...parts.slice(0, index + 1)].filter(Boolean).join("/") }))];
+  }, [currentPath, home]);
 
   const selectedEntries = entries.filter((entry) => selected.has(entry.path));
   const favoritePaths = new Set(favorites.map((favorite) => favorite.path));
@@ -1048,7 +1079,7 @@ export function FileManager() {
   if (!auth.authenticated) return <LoginScreen auth={auth} onSuccess={refreshAuth} theme={theme} onToggleTheme={toggleTheme} />;
 
   return (
-    <div className="app-shell" onDragOver={(event) => { event.preventDefault(); if (event.dataTransfer.types.includes(DRAG_TYPE)) event.dataTransfer.dropEffect = "none"; }} onDrop={(event) => { event.preventDefault(); if (!event.dataTransfer.types.includes(DRAG_TYPE)) queueUpload(event.dataTransfer.files); }}>
+    <div className="app-shell" onDragOver={(event) => { event.preventDefault(); if (event.dataTransfer.types.includes(DRAG_TYPE)) event.dataTransfer.dropEffect = "none"; }} onDrop={(event) => { event.preventDefault(); if (canWrite && !event.dataTransfer.types.includes(DRAG_TYPE)) queueUpload(event.dataTransfer.files); }}>
       <aside className={`sidebar ${sidebarOpen ? "sidebar-open" : ""}`}>
         <div className="brand-row">
           <div className="brand-mark"><FolderOpen size={21} /></div>
@@ -1057,10 +1088,11 @@ export function FileManager() {
         </div>
 
         <nav className="primary-nav" aria-label="File locations">
-          <button className={`nav-item ${currentPath === "" ? "active" : ""} ${dropTarget === "" ? "drop-target" : ""}`} data-drop-path="" {...dropHandlers} onClick={() => { navigate(""); setSidebarOpen(false); }}><Home size={18} /><span>All files</span><ChevronRight size={15} /></button>
-          <button className="nav-item" onClick={() => { setShowHidden(true); navigate(""); setSidebarOpen(false); }}><Eye size={18} /><span>Hidden files</span></button>
-          <button className="nav-item" onClick={() => { setDialog({ kind: "trash" }); setSidebarOpen(false); }}><Trash2 size={18} /><span>Trash</span></button>
-          <button className="nav-item" onClick={() => { setDialog({ kind: "shares" }); setSidebarOpen(false); }}><Link2 size={18} /><span>Shared links</span>{sharedPaths.size > 0 && <em className="nav-count">{sharedPaths.size}</em>}</button>
+          <button className={`nav-item ${currentPath === home ? "active" : ""} ${dropTarget === home ? "drop-target" : ""}`} data-drop-path={home} {...(canWrite ? dropHandlers : {})} onClick={() => { navigate(home); setSidebarOpen(false); }}><Home size={18} /><span>{home ? "My files" : "All files"}</span><ChevronRight size={15} /></button>
+          <button className="nav-item" onClick={() => { setShowHidden(true); navigate(home); setSidebarOpen(false); }}><Eye size={18} /><span>Hidden files</span></button>
+          {canWrite && <button className="nav-item" onClick={() => { setDialog({ kind: "trash" }); setSidebarOpen(false); }}><Trash2 size={18} /><span>Trash</span></button>}
+          {isOwner && <button className="nav-item" onClick={() => { setDialog({ kind: "shares" }); setSidebarOpen(false); }}><Link2 size={18} /><span>Shared links</span>{sharedPaths.size > 0 && <em className="nav-count">{sharedPaths.size}</em>}</button>}
+          {isOwner && <button className="nav-item" onClick={() => { setDialog({ kind: "users" }); setSidebarOpen(false); }}><Users size={18} /><span>Users</span></button>}
         </nav>
 
         <div className="sidebar-section favorites-section">
@@ -1077,16 +1109,16 @@ export function FileManager() {
           </div>
         </div>
 
-        <button type="button" className="storage-card" title="Find the largest files" aria-label="Storage usage. Open the largest-files scanner" onClick={() => setDialog({ kind: "storage" })}>
+        <button type="button" className={`storage-card ${isOwner ? "" : "static"}`} title={isOwner ? "Find the largest files" : undefined} aria-label={isOwner ? "Storage usage. Open the largest-files scanner" : "Storage usage"} disabled={!isOwner} onClick={() => setDialog({ kind: "storage" })}>
           <div className="storage-heading"><span><HardDrive size={16} /> Storage</span><strong>{diskPercent}%</strong></div>
           <div className="storage-track"><span style={{ width: `${diskPercent}%` }} /></div>
           <p>{disk ? `${formatBytes(disk.used)} of ${formatBytes(disk.total)} used` : "Calculating…"}</p>
           <small>{disk ? `${formatBytes(disk.available)} available` : ""}</small>
-          <span className="storage-action">Click to find and manage largest files <ChevronRight size={12} /></span>
+          {isOwner && <span className="storage-action">Click to find and manage largest files <ChevronRight size={12} /></span>}
         </button>
 
         <div className="sidebar-footer">
-          <button className="user-chip" title="Open preferences" onClick={() => setDialog({ kind: "preferences" })}><span className="avatar">{auth.username?.slice(0, 1).toUpperCase()}</span><span><strong>{auth.username}</strong><small>Administrator</small></span></button>
+          <button className="user-chip" title="Open preferences" onClick={() => setDialog({ kind: "preferences" })}><span className="avatar">{auth.username?.slice(0, 1).toUpperCase()}</span><span><strong>{auth.username}</strong><small>{auth.role ? ROLE_LABELS[auth.role] : ""}</small></span></button>
           <button className="icon-button" aria-label="Preferences" title="Preferences" onClick={() => setDialog({ kind: "preferences" })}><Settings2 size={17} /></button>
           <button className="icon-button" aria-label="Sign out" title="Sign out" onClick={() => void logout()}><LogOut size={17} /></button>
         </div>
@@ -1124,9 +1156,9 @@ export function FileManager() {
             <div className="primary-actions">
               <input ref={uploadRef} className="visually-hidden" type="file" multiple onChange={(event) => event.target.files && queueUpload(event.target.files)} />
               {currentPath && <button className={`button secondary favorite-location ${favoritePaths.has(currentPath) ? "active" : ""}`} title={favoritePaths.has(currentPath) ? "Remove this folder from favourites" : "Add this folder to favourites"} onClick={() => void toggleFavorite(currentPath)}><Star size={16} fill={favoritePaths.has(currentPath) ? "currentColor" : "none"} /> <span>{favoritePaths.has(currentPath) ? "Favourited" : "Favourite"}</span></button>}
-              {clipboard && <div className="clipboard-chip"><button className="button secondary" title={`Paste into ${folderLabel(currentPath)} (${modifierLabel()}V)`} onClick={() => void pasteInto(currentPath)}><ClipboardPaste size={16} /> <span>Paste {itemCount(clipboard.paths.length)}</span></button><button className="icon-button" aria-label="Clear clipboard" title="Clear clipboard" onClick={() => setClipboard(null)}><X size={15} /></button></div>}
-              <button className="button secondary" onClick={() => uploadRef.current?.click()}><Upload size={17} /> Upload</button>
-              <button className="button primary" onClick={() => setDialog({ kind: "new" })}><Plus size={17} /> New <ChevronDown size={14} /></button>
+              {canWrite && clipboard && <div className="clipboard-chip"><button className="button secondary" title={`Paste into ${folderLabel(currentPath)} (${modifierLabel()}V)`} onClick={() => void pasteInto(currentPath)}><ClipboardPaste size={16} /> <span>Paste {itemCount(clipboard.paths.length)}</span></button><button className="icon-button" aria-label="Clear clipboard" title="Clear clipboard" onClick={() => setClipboard(null)}><X size={15} /></button></div>}
+              {canWrite && <button className="button secondary" onClick={() => uploadRef.current?.click()}><Upload size={17} /> Upload</button>}
+              {canWrite && <button className="button primary" onClick={() => setDialog({ kind: "new" })}><Plus size={17} /> New <ChevronDown size={14} /></button>}
             </div>
           </div>
 
@@ -1161,18 +1193,18 @@ export function FileManager() {
               <div><span className="selection-count">{selected.size}</span><strong>{selected.size === 1 ? "item" : "items"} selected</strong></div>
               <div className="selection-actions">
                 {selected.size === 1 && <button onClick={() => openEntry(selectedEntries[0])}><Eye size={16} /> Open</button>}
-                {selected.size === 1 && isEditable(selectedEntries[0]) && <button onClick={() => setDialog({ kind: "edit", entry: selectedEntries[0] })}><FilePenLine size={16} /> Edit</button>}
+                {canWrite && selected.size === 1 && isEditable(selectedEntries[0]) && <button onClick={() => setDialog({ kind: "edit", entry: selectedEntries[0] })}><FilePenLine size={16} /> Edit</button>}
                 {selected.size === 1 && <button onClick={downloadSelected}><Download size={16} /> Download</button>}
                 {selected.size === 1 && selectedEntries[0].type === "directory" && <button onClick={() => void toggleFavorite(selectedEntries[0].path)}><Star size={16} fill={favoritePaths.has(selectedEntries[0].path) ? "currentColor" : "none"} /> {favoritePaths.has(selectedEntries[0].path) ? "Unfavourite" : "Favourite"}</button>}
-                {selected.size === 1 && <button onClick={() => setDialog({ kind: "rename", entry: selectedEntries[0] })}><Pencil size={16} /> Rename</button>}
-                <button onClick={() => setDialog({ kind: "transfer", mode: "copy" })}><Copy size={16} /> Copy</button>
-                <button onClick={() => setDialog({ kind: "transfer", mode: "move" })}><FolderInput size={16} /> Move</button>
-                <button onClick={() => setDialog({ kind: "permissions" })}><KeyRound size={16} /> Permissions</button>
-                <button onClick={() => setDialog({ kind: "ownership" })}><UserRoundCog size={16} /> Ownership</button>
-                <button onClick={() => setDialog({ kind: "compress" })}><FileArchive size={16} /> Compress</button>
-                {selected.size > 1 && <button onClick={() => setDialog({ kind: "bulk" })}><Sparkles size={16} /> Bulk rename</button>}
+                {canWrite && selected.size === 1 && <button onClick={() => setDialog({ kind: "rename", entry: selectedEntries[0] })}><Pencil size={16} /> Rename</button>}
+                {canWrite && <button onClick={() => setDialog({ kind: "transfer", mode: "copy" })}><Copy size={16} /> Copy</button>}
+                {canWrite && <button onClick={() => setDialog({ kind: "transfer", mode: "move" })}><FolderInput size={16} /> Move</button>}
+                {isOwner && <button onClick={() => setDialog({ kind: "permissions" })}><KeyRound size={16} /> Permissions</button>}
+                {isOwner && <button onClick={() => setDialog({ kind: "ownership" })}><UserRoundCog size={16} /> Ownership</button>}
+                {canWrite && <button onClick={() => setDialog({ kind: "compress" })}><FileArchive size={16} /> Compress</button>}
+                {canWrite && selected.size > 1 && <button onClick={() => setDialog({ kind: "bulk" })}><Sparkles size={16} /> Bulk rename</button>}
                 {selected.size === 1 && <button onClick={() => setDialog({ kind: "details", entry: selectedEntries[0] })}><Info size={16} /> Properties</button>}
-                <button className="danger-action" onClick={() => setDialog({ kind: "delete" })}><Trash2 size={16} /> Delete</button>
+                {canWrite && <button className="danger-action" onClick={() => setDialog({ kind: "delete" })}><Trash2 size={16} /> Delete</button>}
                 <button className="icon-button" aria-label="Clear selection" onClick={() => setSelected(new Set())}><X size={16} /></button>
               </div>
             </div>
@@ -1222,6 +1254,8 @@ export function FileManager() {
           notify={notify}
           onRefresh={() => loadDirectory()}
           onStartJob={startArchiveJob}
+          role={auth.role ?? "viewer"}
+          home={home}
           onSharesChanged={() => loadFavorites()}
           username={auth.username || ""}
           onCredentialsUpdated={async () => { setDialog(null); await refreshAuth(); notify("Account preferences updated"); }}
@@ -1230,8 +1264,8 @@ export function FileManager() {
         />
       )}
       {menu && createPortal(menu.kind === "entry"
-        ? <FileActionMenu entry={menu.entry} targets={menuTargets(menu.entry)} position={{ top: menu.top, left: menu.left }} menuRef={menuRef} favoritePaths={favoritePaths} canPaste={Boolean(clipboard) && menu.entry.type === "directory"} onAction={(action, entry) => { setMenu(null); handleEntryAction(action, entry); }} />
-        : <BackgroundMenu position={{ top: menu.top, left: menu.left }} menuRef={menuRef} folder={currentPath ? currentPath.split("/").at(-1) || "" : "All files"} clipboardCount={clipboard?.paths.length ?? 0} canSelectAll={sortedEntries.length > 0} onChoose={chooseBackground} />,
+        ? <FileActionMenu entry={menu.entry} targets={menuTargets(menu.entry)} position={{ top: menu.top, left: menu.left }} menuRef={menuRef} favoritePaths={favoritePaths} canWrite={canWrite} isOwner={isOwner} canPaste={canWrite && Boolean(clipboard) && menu.entry.type === "directory"} onAction={(action, entry) => { setMenu(null); handleEntryAction(action, entry); }} />
+        : <BackgroundMenu canWrite={canWrite} position={{ top: menu.top, left: menu.left }} menuRef={menuRef} folder={currentPath ? currentPath.split("/").at(-1) || "" : "All files"} clipboardCount={clipboard?.paths.length ?? 0} canSelectAll={sortedEntries.length > 0} onChoose={chooseBackground} />,
       document.body)}
       {activeJob && <div className="job-panel" role="status" aria-live="polite">
         <div className="job-panel-head"><span className="file-icon">{activeJob.kind === "compress" ? <FileArchive size={17} /> : <PackageOpen size={17} />}</span><div><strong title={activeJob.label}>{activeJob.label}</strong><small>{activeJob.status === "running" ? jobProgressText(activeJob) : "Finishing…"}</small></div>{activeJob.status === "running" && <button className="icon-button" aria-label="Cancel job" title="Cancel" onClick={() => void cancelArchiveJob(activeJob)}><X size={16} /></button>}</div>
@@ -1293,11 +1327,14 @@ function LoginScreen({ auth, onSuccess, theme, onToggleTheme }: { auth: AuthStat
 
 // Drag, drop, context-menu, and clipboard props shared by list rows and grid cards.
 function entryItemProps(entry: FileEntry, interactions: EntryInteractions) {
+  const onContextMenu = (event: React.MouseEvent) => interactions.onContextMenu(entry, event);
+  // Read-only accounts can't drag items around.
+  if (!interactions.canWrite) return { draggable: false, onContextMenu };
   return {
     draggable: true,
     onDragStart: (event: React.DragEvent<HTMLElement>) => interactions.onDragStart(entry, event),
     onDragEnd: interactions.onDragEnd,
-    onContextMenu: (event: React.MouseEvent) => interactions.onContextMenu(entry, event),
+    onContextMenu,
     ...(entry.type === "directory" ? { "data-drop-path": entry.path, ...interactions.dropHandlers } : {}),
   };
 }
@@ -1356,12 +1393,14 @@ function FileTable({ entries, sort, onSort, selected, cursor, interactions, allS
   );
 }
 
-function FileActionMenu({ entry, targets, position, menuRef, favoritePaths, canPaste, onAction }: {
+function FileActionMenu({ entry, targets, position, menuRef, favoritePaths, canWrite, isOwner, canPaste, onAction }: {
   entry: FileEntry;
   targets: FileEntry[];
   position: MenuPosition;
   menuRef: React.RefObject<HTMLDivElement | null>;
   favoritePaths: Set<string>;
+  canWrite: boolean;
+  isOwner: boolean;
   canPaste: boolean;
   onAction: (action: EntryAction, entry: FileEntry) => void;
 }) {
@@ -1376,36 +1415,37 @@ function FileActionMenu({ entry, targets, position, menuRef, favoritePaths, canP
         : <div className="file-menu-heading"><span className={`file-icon ${entry.type}`}>{fileIcon(entry, 17)}</span><div><strong>{entry.name}</strong><span>{entry.type === "directory" ? "Folder" : `${extension(entry.name)} · ${formatBytes(entry.size)}`}</span></div></div>}
       {!multiple && <div className="file-menu-section">
         {item("open", entry.type === "directory" ? "Open" : "Preview", entry.type === "directory" ? <FolderOpen size={16} /> : <Eye size={16} />)}
-        {entry.type === "file" && item("edit", "Edit", <FilePenLine size={16} />, { disabled: !isEditable(entry) })}
+        {canWrite && entry.type === "file" && item("edit", "Edit", <FilePenLine size={16} />, { disabled: !isEditable(entry) })}
         {item("download", "Download", <Download size={16} />)}
       </div>}
       <div className="file-menu-section">
-        {!multiple && item("rename", "Rename", <Pencil size={16} />)}
+        {canWrite && !multiple && item("rename", "Rename", <Pencil size={16} />)}
         {!multiple && entry.type === "directory" && item("favorite", favoritePaths.has(entry.path) ? "Remove from favourites" : "Add to favourites", <Star size={16} fill={favoritePaths.has(entry.path) ? "currentColor" : "none"} />)}
-        {item("cut", "Cut", <Scissors size={16} />)}
-        {item("clipboard", "Copy", <ClipboardCopy size={16} />)}
+        {canWrite && item("cut", "Cut", <Scissors size={16} />)}
+        {canWrite && item("clipboard", "Copy", <ClipboardCopy size={16} />)}
         {!multiple && canPaste && item("paste", "Paste into folder", <ClipboardPaste size={16} />)}
-        {item("copy", "Copy to…", <Copy size={16} />)}
-        {item("move", "Move to…", <FolderInput size={16} />)}
+        {canWrite && item("copy", "Copy to…", <Copy size={16} />)}
+        {canWrite && item("move", "Move to…", <FolderInput size={16} />)}
       </div>
-      <div className="file-menu-section">
+      {canWrite && <div className="file-menu-section">
         {item("compress", multiple ? `Compress ${itemCount(targets.length)}…` : "Compress…", <FileArchive size={16} />)}
         {!multiple && isArchive(entry) && item("extract", "Extract here", <PackageOpen size={16} />)}
-      </div>
+      </div>}
       <div className="file-menu-section">
-        {item("permissions", "Change permissions", <KeyRound size={16} />)}
-        {item("ownership", "Change ownership", <UserRoundCog size={16} />)}
-        {!multiple && (entry.type === "file" || entry.type === "directory") && item("share", "Share link…", <Link2 size={16} />)}
+        {isOwner && item("permissions", "Change permissions", <KeyRound size={16} />)}
+        {isOwner && item("ownership", "Change ownership", <UserRoundCog size={16} />)}
+        {isOwner && !multiple && (entry.type === "file" || entry.type === "directory") && item("share", "Share link…", <Link2 size={16} />)}
         {!multiple && item("details", "Properties", <Info size={16} />)}
       </div>
-      <div className="file-menu-section">
+      {canWrite && <div className="file-menu-section">
         {item("delete", multiple ? `Delete ${itemCount(targets.length)}` : "Delete", <Trash2 size={16} />, { danger: true })}
-      </div>
+      </div>}
     </div>
   );
 }
 
-function BackgroundMenu({ position, menuRef, folder, clipboardCount, canSelectAll, onChoose }: {
+function BackgroundMenu({ canWrite, position, menuRef, folder, clipboardCount, canSelectAll, onChoose }: {
+  canWrite: boolean;
   position: MenuPosition;
   menuRef: React.RefObject<HTMLDivElement | null>;
   folder: string;
@@ -1419,11 +1459,11 @@ function BackgroundMenu({ position, menuRef, folder, clipboardCount, canSelectAl
   return (
     <div ref={menuRef} className="file-action-menu" role="menu" aria-label="Folder actions" style={position}>
       <div className="file-menu-heading"><span className="file-icon directory"><FolderOpen size={17} /></span><div><strong>{folder}</strong><span>This folder</span></div></div>
-      <div className="file-menu-section">
+      {canWrite && <div className="file-menu-section">
         {item("new", "New folder or file", <FolderPlus size={16} />)}
         {item("upload", "Upload files", <Upload size={16} />)}
         {item("paste", clipboardCount ? `Paste ${itemCount(clipboardCount)}` : "Paste", <ClipboardPaste size={16} />, !clipboardCount)}
-      </div>
+      </div>}
       <div className="file-menu-section">
         {item("selectAll", "Select all", <ListChecks size={16} />, !canSelectAll)}
         {item("refresh", "Refresh", <RefreshCw size={16} />)}
@@ -1530,11 +1570,13 @@ function FileSkeleton() {
   return <div className="file-skeleton">{Array.from({ length: 6 }).map((_, index) => <div key={index}><span /><span /><span /><span /></div>)}</div>;
 }
 
-function DialogHost({ dialog, selected, currentPath, username, onClose, onRun, notify, onRefresh, onStartJob, onSharesChanged, onCredentialsUpdated, onReveal, onPreview }: {
+function DialogHost({ dialog, selected, currentPath, username, role, home, onClose, onRun, notify, onRefresh, onStartJob, onSharesChanged, onCredentialsUpdated, onReveal, onPreview }: {
   dialog: NonNullable<DialogState>;
   selected: FileEntry[];
   currentPath: string;
   username: string;
+  role: Role;
+  home: string;
   onClose: () => void;
   onRun: (body: Record<string, unknown>, success: string) => Promise<boolean>;
   notify: (message: string, tone?: "error") => void;
@@ -1545,7 +1587,8 @@ function DialogHost({ dialog, selected, currentPath, username, onClose, onRun, n
   onReveal: (entry: FileEntry) => void;
   onPreview: (entry: FileEntry) => void;
 }) {
-  if (dialog.kind === "upload") return <UploadDialog files={dialog.files} currentPath={currentPath} onClose={onClose} notify={notify} onComplete={onRefresh} />;
+  if (dialog.kind === "upload") return <UploadDialog files={dialog.files} currentPath={currentPath} chooseOwnership={role === "owner"} onClose={onClose} notify={notify} onComplete={onRefresh} />;
+  if (dialog.kind === "users") return <UsersDialog onClose={onClose} notify={notify} />;
   if (dialog.kind === "storage") return <StorageDialog onClose={onClose} onReveal={onReveal} onPreview={onPreview} notify={notify} />;
   if (dialog.kind === "trash") return <TrashDialog onClose={onClose} notify={notify} onRefresh={onRefresh} />;
   if (dialog.kind === "compress") return <CompressDialog entries={selected} currentPath={currentPath} onClose={onClose} onStart={onStartJob} />;
@@ -1556,11 +1599,13 @@ function DialogHost({ dialog, selected, currentPath, username, onClose, onRun, n
   if (dialog.kind === "delete") return <DeleteDialog entries={selected} onClose={onClose} onRun={onRun} />;
   if (dialog.kind === "permissions") return <PermissionsDialog entries={selected} onClose={onClose} onRun={onRun} />;
   if (dialog.kind === "ownership") return <OwnershipDialog entries={selected} onClose={onClose} onRun={onRun} />;
-  if (dialog.kind === "transfer") return <TransferDialog mode={dialog.mode} entries={selected} startPath={currentPath} onClose={onClose} onRun={onRun} />;
+  if (dialog.kind === "transfer") return <TransferDialog mode={dialog.mode} entries={selected} startPath={currentPath} home={home} onClose={onClose} onRun={onRun} />;
   if (dialog.kind === "bulk") return <BulkRenameDialog entries={selected} onClose={onClose} notify={notify} onRefresh={onRefresh} />;
   if (dialog.kind === "preview") return <PreviewDialog entry={dialog.entry} onClose={onClose} />;
   if (dialog.kind === "edit") return <EditDialog entry={dialog.entry} onClose={onClose} onRun={onRun} />;
-  if (dialog.kind === "preferences") return <PreferencesDialog username={username} onClose={onClose} onUpdated={onCredentialsUpdated} />;
+  if (dialog.kind === "preferences") return role === "owner"
+    ? <PreferencesDialog username={username} onClose={onClose} onUpdated={onCredentialsUpdated} />
+    : <AccountPasswordDialog username={username} role={role} home={home} onClose={onClose} onUpdated={onCredentialsUpdated} />;
   return <DetailsDialog entry={dialog.entry} onClose={onClose} />;
 }
 
@@ -1957,7 +2002,8 @@ function TrashDialog({ onClose, notify, onRefresh }: { onClose: () => void; noti
   );
 }
 
-function UploadDialog({ files, currentPath, onClose, notify, onComplete }: { files: File[]; currentPath: string; onClose: () => void; notify: (message: string, tone?: "error") => void; onComplete: () => Promise<void> }) {
+// Only the owner picks upload ownership; other accounts' uploads take the destination folder's owner.
+function UploadDialog({ files, currentPath, chooseOwnership, onClose, notify, onComplete }: { files: File[]; currentPath: string; chooseOwnership: boolean; onClose: () => void; notify: (message: string, tone?: "error") => void; onComplete: () => Promise<void> }) {
   const [options, setOptions] = useState<UploadOwnershipOptions | null>(null);
   const [selectedOwnership, setSelectedOwnership] = useState("service");
   const [error, setError] = useState("");
@@ -1978,6 +2024,7 @@ function UploadDialog({ files, currentPath, onClose, notify, onComplete }: { fil
   }, []);
 
   useEffect(() => {
+    if (!chooseOwnership) return;
     const controller = new AbortController();
     requestJson<UploadOwnershipOptions>(`/api/fs/upload?path=${encodePath(currentPath)}`, { signal: controller.signal })
       .then((result) => {
@@ -1988,7 +2035,7 @@ function UploadDialog({ files, currentPath, onClose, notify, onComplete }: { fil
       })
       .catch((caught) => { if ((caught as Error).name !== "AbortError") setError((caught as Error).message); });
     return () => controller.abort();
-  }, [currentPath]);
+  }, [currentPath, chooseOwnership]);
 
   const ownershipPairs = useMemo(() => {
     if (!options) return [];
@@ -2007,7 +2054,7 @@ function UploadDialog({ files, currentPath, onClose, notify, onComplete }: { fil
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (!options) return;
+    if (chooseOwnership && !options) return;
     setBusy(true);
     setError("");
     const params = new URLSearchParams({ path: currentPath });
@@ -2057,7 +2104,7 @@ function UploadDialog({ files, currentPath, onClose, notify, onComplete }: { fil
   const currentFile = progress ? files[progress.index] : null;
   const progressPanel = progress && currentFile && <div className="upload-progress" role="status" aria-live="polite"><div className="upload-progress-head"><strong title={currentFile.name}>{progress.loaded >= currentFile.size ? "Finishing" : "Uploading"} {currentFile.name}</strong><span>File {progress.index + 1} of {files.length}</span></div><div className="upload-progress-track" role="progressbar" aria-label="Upload progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent}><span style={{ width: `${percent}%` }} /></div><div className="upload-progress-meta"><span>{formatBytes(sentBytes)} of {formatBytes(totalBytes)} · {percent}%</span><span>{progress.bytesPerSecond > 0 ? `${formatBytes(progress.bytesPerSecond)}/s · ${formatRemaining((totalBytes - sentBytes) / progress.bytesPerSecond) || "almost done"}` : "Measuring speed…"}</span></div></div>;
 
-  return <Modal title={`Upload ${files.length} ${files.length === 1 ? "file" : "files"}`} subtitle={`Choose ownership before uploading to /${currentPath}`} icon={<Upload size={19} />} onClose={onClose}><form className="upload-form" onSubmit={submit}><div className="upload-file-summary"><div><Upload size={18} /><span><strong>{files.length} {files.length === 1 ? "file" : "files"}</strong><small>{formatBytes(files.reduce((total, file) => total + file.size, 0))} total{uploadedCount ? ` · ${uploadedCount} uploaded` : ""}</small></span></div><div className="upload-file-list">{files.slice(0, 4).map((file) => <span key={`${file.name}-${file.size}`}>{file.name}</span>)}{files.length > 4 && <span>and {files.length - 4} more…</span>}</div></div>{progressPanel}<div className="ownership-heading"><div><UserRoundCog size={17} /><span><strong>Owner and group</strong><small>Detected from this folder and its contents</small></span></div>{options?.truncated && <small>Based on the first 2,000 items</small>}</div>{!options && !error ? <div className="ownership-loading"><LoaderCircle className="spin" size={18} /> Detecting ownership…</div> : options && <div className="ownership-options"><label className={`ownership-option ${selectedOwnership === "service" ? "active" : ""}`}><input type="radio" name="upload-ownership" value="service" checked={selectedOwnership === "service"} onChange={(event) => setSelectedOwnership(event.target.value)} /><span className="ownership-radio" /><span><strong>Keep FilesDude service ownership</strong><small>{options.service.owner}:{options.service.group} · {options.service.uid}:{options.service.gid}</small></span>{preferredKey === "service" && <em>Default</em>}</label>{ownershipPairs.map((pair) => { const key = ownershipKey(pair); const destination = key === ownershipKey(options.destination); return <label key={key} className={`ownership-option ${selectedOwnership === key ? "active" : ""} ${!options.canChangeOwnership ? "disabled" : ""}`}><input type="radio" name="upload-ownership" value={key} checked={selectedOwnership === key} disabled={!options.canChangeOwnership} onChange={(event) => setSelectedOwnership(event.target.value)} /><span className="ownership-radio" /><span><strong>{pair.owner}:{pair.group}</strong><small>{pair.uid}:{pair.gid}{destination ? " · destination folder" : pair.source === "default" ? " · saved default" : ` · ${pair.count || 0} existing ${pair.count === 1 ? "item" : "items"}`}</small></span>{preferredKey === key && <em>Default</em>}</label>; })}</div>}{options && !options.canChangeOwnership && <div className="warning-box"><CircleAlert size={17} /> Ownership changes require FilesDude&apos;s systemd service to run as root. This upload will keep <code>{options.service.uid}:{options.service.gid}</code>.</div>}<div className="info-box"><Info size={17} /> Uploaded files use mode <code>640</code>. Owner/group selection does not change those read and write permissions.</div>{error && <div className="form-error"><CircleAlert size={16} />{error}</div>}{busy ? <div className="modal-actions"><button type="button" className="button danger" onClick={() => controllerRef.current?.abort()}><X size={16} /> Cancel upload</button></div> : <ModalActions onClose={onClose} submitLabel={uploadedCount ? "Upload remaining files" : `Upload ${files.length === 1 ? "file" : "files"}`} busy={!options} />}</form></Modal>;
+  return <Modal title={`Upload ${files.length} ${files.length === 1 ? "file" : "files"}`} subtitle={`Choose ownership before uploading to /${currentPath}`} icon={<Upload size={19} />} onClose={onClose}><form className="upload-form" onSubmit={submit}><div className="upload-file-summary"><div><Upload size={18} /><span><strong>{files.length} {files.length === 1 ? "file" : "files"}</strong><small>{formatBytes(files.reduce((total, file) => total + file.size, 0))} total{uploadedCount ? ` · ${uploadedCount} uploaded` : ""}</small></span></div><div className="upload-file-list">{files.slice(0, 4).map((file) => <span key={`${file.name}-${file.size}`}>{file.name}</span>)}{files.length > 4 && <span>and {files.length - 4} more…</span>}</div></div>{progressPanel}{chooseOwnership && <><div className="ownership-heading"><div><UserRoundCog size={17} /><span><strong>Owner and group</strong><small>Detected from this folder and its contents</small></span></div>{options?.truncated && <small>Based on the first 2,000 items</small>}</div>{!options && !error ? <div className="ownership-loading"><LoaderCircle className="spin" size={18} /> Detecting ownership…</div> : options && <div className="ownership-options"><label className={`ownership-option ${selectedOwnership === "service" ? "active" : ""}`}><input type="radio" name="upload-ownership" value="service" checked={selectedOwnership === "service"} onChange={(event) => setSelectedOwnership(event.target.value)} /><span className="ownership-radio" /><span><strong>Keep FilesDude service ownership</strong><small>{options.service.owner}:{options.service.group} · {options.service.uid}:{options.service.gid}</small></span>{preferredKey === "service" && <em>Default</em>}</label>{ownershipPairs.map((pair) => { const key = ownershipKey(pair); const destination = key === ownershipKey(options.destination); return <label key={key} className={`ownership-option ${selectedOwnership === key ? "active" : ""} ${!options.canChangeOwnership ? "disabled" : ""}`}><input type="radio" name="upload-ownership" value={key} checked={selectedOwnership === key} disabled={!options.canChangeOwnership} onChange={(event) => setSelectedOwnership(event.target.value)} /><span className="ownership-radio" /><span><strong>{pair.owner}:{pair.group}</strong><small>{pair.uid}:{pair.gid}{destination ? " · destination folder" : pair.source === "default" ? " · saved default" : ` · ${pair.count || 0} existing ${pair.count === 1 ? "item" : "items"}`}</small></span>{preferredKey === key && <em>Default</em>}</label>; })}</div>}{options && !options.canChangeOwnership && <div className="warning-box"><CircleAlert size={17} /> Ownership changes require FilesDude&apos;s systemd service to run as root. This upload will keep <code>{options.service.uid}:{options.service.gid}</code>.</div>}</>}<div className="info-box"><Info size={17} /> Uploaded files use mode <code>640</code>. Owner/group selection does not change those read and write permissions.</div>{error && <div className="form-error"><CircleAlert size={16} />{error}</div>}{busy ? <div className="modal-actions"><button type="button" className="button danger" onClick={() => controllerRef.current?.abort()}><X size={16} /> Cancel upload</button></div> : <ModalActions onClose={onClose} submitLabel={uploadedCount ? "Upload remaining files" : `Upload ${files.length === 1 ? "file" : "files"}`} busy={chooseOwnership && !options} />}</form></Modal>;
 }
 
 function CompressDialog({ entries, currentPath, onClose, onStart }: { entries: FileEntry[]; currentPath: string; onClose: () => void; onStart: (body: Record<string, unknown>) => Promise<boolean> }) {
@@ -2114,7 +2161,7 @@ function OwnershipDialog({ entries, onClose, onRun }: { entries: FileEntry[]; on
   return <Modal title="Change ownership" subtitle={`Apply a numeric user and group id to ${entries.length} ${entries.length === 1 ? "item" : "items"}`} icon={<UserRoundCog size={19} />} onClose={onClose}><form onSubmit={submit}><div className="field-pair"><FormField label="User ID (UID)"><input value={uid} onChange={(event) => setUid(event.target.value)} type="number" min="0" required /></FormField><FormField label="Group ID (GID)"><input value={gid} onChange={(event) => setGid(event.target.value)} type="number" min="0" required /></FormField></div><div className="info-box"><Info size={17} /> Use IDs from the Proxmox host or container, such as <code>0:0</code> for root.</div><ModalActions onClose={onClose} submitLabel="Apply ownership" busy={busy} /></form></Modal>;
 }
 
-function TransferDialog({ mode, entries, startPath, onClose, onRun }: { mode: "copy" | "move"; entries: FileEntry[]; startPath: string; onClose: () => void; onRun: (body: Record<string, unknown>, success: string) => Promise<boolean> }) {
+function TransferDialog({ mode, entries, startPath, home, onClose, onRun }: { mode: "copy" | "move"; entries: FileEntry[]; startPath: string; home: string; onClose: () => void; onRun: (body: Record<string, unknown>, success: string) => Promise<boolean> }) {
   const [destination, setDestination] = useState(startPath);
   const [busy, setBusy] = useState(false);
   const blockedDirectories = useMemo(() => entries.filter((entry) => entry.type === "directory").map((entry) => entry.path), [entries]);
@@ -2132,7 +2179,7 @@ function TransferDialog({ mode, entries, startPath, onClose, onRun }: { mode: "c
         <FormField label="Destination folder" hint="Leave empty to use the root folder">
           <div className="path-input"><span>/</span><input autoFocus value={destination} onChange={(event) => setDestination(event.target.value.replace(/^\/+/, ""))} placeholder="media/archive" /></div>
         </FormField>
-        <FolderPicker value={destination} onChange={setDestination} />
+        <FolderPicker value={destination} onChange={setDestination} home={home} />
         {blocked && <div className="warning-box"><CircleAlert size={17} /> You can&apos;t {mode === "copy" ? "copy" : "move"} a folder into itself or one of its own subfolders.</div>}
         <ModalActions onClose={onClose} submitLabel={mode === "copy" ? "Copy here" : "Move here"} busy={busy} disabled={blocked} />
       </form>
@@ -2142,7 +2189,7 @@ function TransferDialog({ mode, entries, startPath, onClose, onRun }: { mode: "c
 
 type FolderListing = { browsePath: string; folders: FileEntry[]; filterPrefix: string | null };
 
-function FolderPicker({ value, onChange }: { value: string; onChange: (path: string) => void }) {
+function FolderPicker({ value, onChange, home = "" }: { value: string; onChange: (path: string) => void; home?: string }) {
   const [listing, setListing] = useState<FolderListing | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
@@ -2195,10 +2242,11 @@ function FolderPicker({ value, onChange }: { value: string; onChange: (path: str
   }, [listing]);
 
   const crumbs = useMemo(() => {
-    const base = listing?.browsePath ?? "";
-    const parts = base ? base.split("/") : [];
-    return [{ label: "Root", path: "" }, ...parts.map((part, index) => ({ label: part, path: parts.slice(0, index + 1).join("/") }))];
-  }, [listing]);
+    const base = listing?.browsePath ?? home;
+    const below = home && base.startsWith(home) ? base.slice(home.length).replace(/^\//, "") : base;
+    const parts = below ? below.split("/") : [];
+    return [{ label: home ? "Home" : "Root", path: home }, ...parts.map((part, index) => ({ label: part, path: [home, ...parts.slice(0, index + 1)].filter(Boolean).join("/") }))];
+  }, [listing, home]);
 
   return (
     <div className="folder-picker">
@@ -2344,6 +2392,115 @@ function PreferencesDialog({ username: initialUsername, onClose, onUpdated }: { 
   };
 
   return <Modal title="Preferences" subtitle="Account, sign-in security, and upload defaults" icon={<Settings2 size={19} />} onClose={onClose}><form className="preferences-form" onSubmit={submit}><div className="preferences-intro"><div className="avatar large-avatar">{initialUsername.slice(0, 1).toUpperCase()}</div><div><strong>Administrator account</strong><span>Account changes invalidate other signed-in sessions.</span></div></div><div className="settings-section"><div className="settings-section-title"><span><Upload size={16} /></span><div><strong>Default upload ownership</strong><small>This choice is preselected for confirmation before every upload</small></div></div><FormField label="Default owner and group"><select value={uploadMode} onChange={(event) => setUploadMode(event.target.value as UploadOwnershipPreference["mode"])} disabled={!loaded}><option value="destination">Match the destination folder</option><option value="service">Keep FilesDude service ownership</option><option value="fixed">Use a fixed owner and group</option></select></FormField>{uploadMode === "fixed" && <div className="field-pair preference-identity-pair"><FormField label="Owner"><select value={fixedUid} onChange={(event) => setFixedUid(event.target.value)} required>{!users.some((user) => String(user.id) === fixedUid) && <option value={fixedUid}>UID {fixedUid}</option>}{users.map((user) => <option key={user.id} value={user.id}>{user.name} ({user.id})</option>)}</select></FormField><FormField label="Group"><select value={fixedGid} onChange={(event) => setFixedGid(event.target.value)} required>{!groups.some((group) => String(group.id) === fixedGid) && <option value={fixedGid}>GID {fixedGid}</option>}{groups.map((group) => <option key={group.id} value={group.id}>{group.name} ({group.id})</option>)}</select></FormField></div>}<div className="info-box"><Info size={17} /> FilesDude still shows the detected owner/group choices each time, so unusual folders can be handled safely.</div></div><div className="settings-section"><div className="settings-section-title"><span><UserRoundCog size={16} /></span><div><strong>Username</strong><small>Used on the FilesDude sign-in screen</small></div></div><FormField label="Username"><input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" minLength={3} maxLength={64} pattern="[A-Za-z0-9._-]+" required /></FormField></div><div className="settings-section"><div className="settings-section-title"><span><LockKeyhole size={16} /></span><div><strong>Password</strong><small>Only required when changing the username or password</small></div></div><FormField label="Current password" hint={credentialsChanged ? "Required to save account changes" : "Not needed for upload preferences"}><div className="password-field"><input type={showPasswords ? "text" : "password"} value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} autoComplete="current-password" required={credentialsChanged} /><LockKeyhole size={15} /></div></FormField><div className="field-pair preferences-passwords"><FormField label="New password"><input type={showPasswords ? "text" : "password"} value={newPassword} onChange={(event) => setNewPassword(event.target.value)} autoComplete="new-password" minLength={newPassword ? 12 : undefined} placeholder="At least 12 characters" /></FormField><FormField label="Confirm new password"><input type={showPasswords ? "text" : "password"} value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} autoComplete="new-password" placeholder="Repeat new password" /></FormField></div><label className="show-passwords"><input type="checkbox" checked={showPasswords} onChange={(event) => setShowPasswords(event.target.checked)} />{showPasswords ? <EyeOff size={15} /> : <Eye size={15} />} Show passwords</label></div>{error && <div className="form-error"><CircleAlert size={16} />{error}</div>}<div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy || !loaded}>{busy ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}Save preferences</button></div></form></Modal>;
+}
+
+function AccountPasswordDialog({ username, role, home, onClose, onUpdated }: { username: string; role: Role; home: string; onClose: () => void; onUpdated: () => Promise<void> }) {
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    setError("");
+    if (newPassword !== confirmPassword) {
+      setError("New passwords do not match");
+      return;
+    }
+    setBusy(true);
+    try {
+      await requestJson("/api/auth/preferences", { method: "POST", body: JSON.stringify({ currentPassword, newPassword }) });
+      await onUpdated();
+    } catch (caught) {
+      setError((caught as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return <Modal title="Your account" subtitle="Change your password" icon={<Settings2 size={19} />} onClose={onClose}><form className="preferences-form" onSubmit={submit}><div className="preferences-intro"><div className="avatar large-avatar">{username.slice(0, 1).toUpperCase()}</div><div><strong>{username} · {ROLE_LABELS[role]}</strong><span>{role === "viewer" ? "Can view and download" : "Can view and change"} files in {folderLabel(home)}. The owner manages your access.</span></div></div><FormField label="Current password"><input type="password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} autoComplete="current-password" required /></FormField><div className="field-pair preferences-passwords"><FormField label="New password"><input type="password" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} autoComplete="new-password" minLength={12} placeholder="At least 12 characters" required /></FormField><FormField label="Confirm new password"><input type="password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} autoComplete="new-password" required /></FormField></div><div className="info-box"><Info size={17} /> Changing your password signs you out on your other devices.</div>{error && <div className="form-error"><CircleAlert size={16} />{error}</div>}<ModalActions onClose={onClose} submitLabel="Change password" busy={busy} /></form></Modal>;
+}
+
+function UsersDialog({ onClose, notify }: { onClose: () => void; notify: (message: string, tone?: "error") => void }) {
+  const [users, setUsers] = useState<ManagedUser[] | null>(null);
+  const [editing, setEditing] = useState<ManagedUser | "new" | null>(null);
+  const [removing, setRemoving] = useState<ManagedUser | null>(null);
+  const [form, setForm] = useState({ username: "", password: "", role: "editor" as ManagedUser["role"], root: "" });
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    requestJson<{ users: ManagedUser[] }>("/api/users", { signal: controller.signal })
+      .then((result) => setUsers(result.users))
+      .catch((caught) => { if ((caught as Error).name !== "AbortError") setError((caught as Error).message); });
+    return () => controller.abort();
+  }, []);
+
+  const startEditing = (user: ManagedUser | "new") => {
+    setError("");
+    setRemoving(null);
+    setEditing(user);
+    setForm(user === "new" ? { username: "", password: "", role: "editor", root: "" } : { username: user.username, password: "", role: user.role, root: user.root });
+  };
+
+  const send = async (body: Record<string, unknown>, success: string) => {
+    setBusy(true);
+    setError("");
+    try {
+      const result = await requestJson<{ users: ManagedUser[] }>("/api/users", { method: "POST", body: JSON.stringify(body) });
+      setUsers(result.users);
+      setEditing(null);
+      setRemoving(null);
+      notify(success);
+    } catch (caught) {
+      setError((caught as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const save = (event: FormEvent) => {
+    event.preventDefault();
+    if (editing === "new") void send({ action: "create", ...form }, `${form.username} can now sign in`);
+    else if (editing) void send({ action: "update", id: editing.id, role: form.role, root: form.root, password: form.password || undefined }, `${editing.username} updated and signed out`);
+  };
+
+  return (
+    <Modal title="Users" subtitle="Accounts that can sign in, each limited to one folder" icon={<Users size={19} />} onClose={onClose} wide>
+      <div className="storage-browser users-dialog">
+        <div className="user-row owner-row"><span className="avatar"><ShieldCheck size={15} /></span><div><strong>You</strong><small>Owner · all files · manages users, sharing, and permissions</small></div></div>
+        {users === null ? <div className="ownership-loading"><LoaderCircle className="spin" size={18} /> Loading accounts…</div>
+          : users.map((user) => (
+            <div key={user.id} className="user-row">
+              <span className="avatar">{user.username.slice(0, 1).toUpperCase()}</span>
+              <div><strong>{user.username}</strong><small>{ROLE_LABELS[user.role]} · {folderLabel(user.root)}</small></div>
+              <button className="button secondary" disabled={busy} onClick={() => startEditing(user)}><Pencil size={14} /> Edit</button>
+              <button className="button secondary danger-text" disabled={busy} onClick={() => { setEditing(null); setRemoving(user); }}><Trash2 size={14} /> Remove</button>
+            </div>
+          ))}
+        {removing && <div className="storage-delete-confirm trash-confirm" role="alert"><div><Trash2 size={19} /><span><strong>Remove {removing.username}?</strong><small>They are signed out straight away. Their files stay where they are.</small></span></div><div><button className="button secondary" disabled={busy} onClick={() => setRemoving(null)}>Cancel</button><button className="button danger" disabled={busy} onClick={() => void send({ action: "delete", id: removing.id }, `${removing.username} removed`)}>Remove account</button></div></div>}
+        {editing ? (
+          <form className="user-form" onSubmit={save}>
+            <strong>{editing === "new" ? "Add an account" : `Edit ${editing.username}`}</strong>
+            <div className="field-pair">
+              <FormField label="Username"><input value={form.username} onChange={(event) => setForm({ ...form, username: event.target.value })} disabled={editing !== "new"} autoComplete="off" minLength={3} maxLength={64} pattern="[A-Za-z0-9._-]+" required /></FormField>
+              <FormField label={editing === "new" ? "Password" : "New password"} hint={editing === "new" ? "At least 12 characters" : "Leave blank to keep the current one"}><input type="password" value={form.password} onChange={(event) => setForm({ ...form, password: event.target.value })} autoComplete="new-password" minLength={form.password || editing === "new" ? 12 : undefined} required={editing === "new"} /></FormField>
+            </div>
+            <FormField label="Role"><select value={form.role} onChange={(event) => setForm({ ...form, role: event.target.value as ManagedUser["role"] })}><option value="editor">Editor — can view, upload, and change files</option><option value="viewer">Viewer — can only view and download</option></select></FormField>
+            <FormField label="Folder" hint="The account sees only this folder and what's inside it"><div className="path-input"><span>/</span><input value={form.root} onChange={(event) => setForm({ ...form, root: event.target.value.replace(/^\/+/, "") })} placeholder="home/name" /></div></FormField>
+            <FolderPicker value={form.root} onChange={(root) => setForm({ ...form, root })} />
+            {error && <div className="form-error"><CircleAlert size={16} />{error}</div>}
+            <div className="modal-actions"><button type="button" className="button secondary" onClick={() => setEditing(null)}>Cancel</button><button className="button primary" disabled={busy}>{busy && <LoaderCircle className="spin" size={16} />}{editing === "new" ? "Add account" : "Save changes"}</button></div>
+          </form>
+        ) : (
+          <>
+            {error && <div className="form-error"><CircleAlert size={16} />{error}</div>}
+            <div className="storage-scan-foot"><button className="button secondary" onClick={() => startEditing("new")}><Plus size={15} /> Add account</button><button className="button primary" onClick={onClose}>Done</button></div>
+          </>
+        )}
+      </div>
+    </Modal>
+  );
 }
 
 function PreviewDialog({ entry, onClose }: { entry: FileEntry; onClose: () => void }) {

@@ -11,11 +11,13 @@ export interface StoredCredentials {
   updatedAt?: string;
 }
 
-const credentialsFile = path.join(config.stateDir, "credentials.json");
+function credentialsFile() {
+  return path.join(config.stateDir, "credentials.json");
+}
 
 export async function getCredentials(): Promise<StoredCredentials> {
   try {
-    const value = JSON.parse(await fs.readFile(credentialsFile, "utf8")) as Partial<StoredCredentials>;
+    const value = JSON.parse(await fs.readFile(credentialsFile(), "utf8")) as Partial<StoredCredentials>;
     if (typeof value.username !== "string" || typeof value.passwordHash !== "string" || !isValidPasswordHash(value.passwordHash) || !Number.isInteger(value.version)) {
       throw new AppError("Stored account settings are invalid", 503, "CREDENTIALS_INVALID");
     }
@@ -56,5 +58,5 @@ export async function saveCredentials(credentials: StoredCredentials) {
   await fs.mkdir(config.stateDir, { recursive: true, mode: 0o700 });
   const temporary = path.join(config.stateDir, `credentials-${crypto.randomUUID()}.tmp`);
   await fs.writeFile(temporary, `${JSON.stringify(credentials, null, 2)}\n`, { mode: 0o600 });
-  await fs.rename(temporary, credentialsFile);
+  await fs.rename(temporary, credentialsFile());
 }
