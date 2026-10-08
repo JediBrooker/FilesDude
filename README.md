@@ -4,18 +4,20 @@ FilesDude is a secure, self-hosted web file manager designed for a Proxmox host,
 
 ## What is included
 
-- Browse folders in list or grid view, including an optional hidden-files view; the browser's own back/forward buttons and gestures step through folder history instead of leaving the app
-- Use a SharePoint-style row menu for preview, text editing, downloads, organization, administration, properties, and deletion
+- Browse folders in list or grid view, sorted by name, size, owner, permissions, or modified time (folders stay first and the choice is remembered per browser), including an optional hidden-files view; the browser's own back/forward buttons and gestures step through folder history instead of leaving the app
+- Use a SharePoint-style row menu, also available by right-clicking any item (or empty space for folder actions), for preview, text editing, downloads, organization, administration, properties, and deletion; with several items selected it acts on all of them
+- Cut, copy, and paste items between folders, or drag them onto a folder, favourite, or breadcrumb to move them (hold Option/Alt to copy); copies into a folder that already has the name are saved as `name (copy)`
+- Undo the latest rename, move, copy, or delete from the confirmation toast or with `Command/Ctrl + Z`; deletes are undone by restoring from protected trash
 - Pin durable favourite folder locations to the sidebar from a folder menu, selection toolbar, or the current-location button
 - Create files and folders; edit text/code files up to 2 MB; rename, copy, move, soft-delete, and permanently delete, with a breadcrumb folder browser and autofill suggestions for picking a copy/move destination
-- Multi-file drag-and-drop upload with collision-safe names, a configurable size limit, and owner/group confirmation based on the destination folder and its existing contents
+- Multi-file drag-and-drop upload with live progress, transfer speed, time remaining, and cancel (cancelled or interrupted files are discarded and can be resumed), collision-safe names, a configurable size limit, and owner/group confirmation based on the destination folder and its existing contents
 - Direct file downloads and ZIP downloads for folders
 - Inline previews for text, code, JSON, images, PDF, audio, and video; media uses byte-range streaming
 - POSIX `chmod` and numeric `chown` for one or many items
 - Bulk rename with find/replace, regular expressions, prefix, suffix, sequential numbering, live conflict detection, and two-phase application
 - Recursive filename search, disk usage, owner/group display, symlink escape warnings, and a cached whole-tree largest-files view from the clickable Storage card
 - Filter largest files by a minimum size, load 100, 250, or 500 more at a time, export the currently loaded results to CSV, and move one or many selected files to protected trash (or permanently delete them after confirmation)
-- Protected trash by default, persistent favourites, and a JSON Lines audit log inside the protected state directory
+- Protected trash by default with a Trash view for restoring items to their original folders, deleting them forever, or emptying the trash; persistent favourites; and a JSON Lines audit log inside the protected state directory
 - Signed, expiring, HTTP-only, SameSite login sessions; scrypt password hashes; login throttling; same-origin mutation checks; and hardened response headers
 - Account preferences for changing the username and password; credential changes invalidate other sessions
 - Multi-selection toolbar actions, responsive UI, dark mode, keyboard shortcuts, and no external analytics or storage services
@@ -109,6 +111,21 @@ Use the row checkboxes (or the header checkbox for all loaded rows) to select
 files for bulk deletion. Deletion uses FilesDude's protected trash unless you
 explicitly enable permanent deletion in the confirmation panel.
 
+## Restore or empty the trash
+
+Deleting an item moves it to FilesDude's protected trash (`.filedude/trash` inside
+the managed root) unless you choose permanent deletion. Open **Trash** in the
+sidebar to see each item's original location, size, and deletion time.
+
+- **Restore** puts items back in their original folder, recreating missing parent
+  folders. If something with the same name now exists there, the restored item is
+  renamed (for example `notes (restored).md`) rather than overwriting it.
+- **Delete forever** removes the selected items permanently.
+- **Empty trash** permanently removes everything in the trash and frees its space.
+
+Items trashed by FilesDude versions that did not record original locations are
+listed with an unknown location and restore to the root folder.
+
 ## Manual development setup
 
 FilesDude deliberately refuses to sign users in until a password hash and a strong session secret are configured.
@@ -174,9 +191,16 @@ The container runs as UID/GID `1001:1001` by default. Give that account access t
 ## Useful keyboard shortcuts
 
 - `Command/Ctrl + K`: focus search
+- `Command/Ctrl + A`: select every item in the folder; `Escape` clears the selection
+- Arrow keys, `Home`, and `End`: move between items (`Shift` extends the selection); `Enter` opens the current item
+- `Shift`-click: select a range; `Command/Ctrl`-click: add or remove one item
+- `Command/Ctrl + X`, `C`, `V`: cut or copy the selection, then paste it into the open folder
+- `Command/Ctrl + Z`: undo the latest rename, move, copy, or delete
 - `F2`: rename the selected item
 - `Space`: preview the selected file
 - `Delete`: delete selected items
+
+Shortcuts are ignored while you are typing in a field such as search.
 
 ## Good next features
 
@@ -184,7 +208,7 @@ The safest default set is already included. These are strong next additions when
 
 - OIDC or WebAuthn/passkeys for multi-user sign-in and two-factor authentication
 - Role-based roots and read-only accounts instead of one server administrator
-- Restore and retention management UI for protected trash
+- Automatic retention (age-based purging) for protected trash
 - Archive creation/extraction with path-traversal scanning
 - Content search, thumbnails, checksums, duplicate detection, and media metadata
 - Antivirus scanning and upload quarantine for environments with untrusted uploaders

@@ -5,7 +5,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { config } from "./config";
 import { AppError } from "./http";
-import type { BulkRenameRule, DiskInfo, FileEntry, IdentityOption, LargestFilesResult, LargestFilesScanning, OwnershipPair, RenamePreview } from "./types";
+import type { BulkRenameRule, DeleteResult, DiskInfo, EntryType, FileEntry, IdentityOption, LargestFilesResult, LargestFilesScanning, OwnershipPair, RenamePreview, TransferResult, TrashItem, TrashListing, TrashRestoreResult } from "./types";
 
 const INTERNAL_NAMES = new Set([".filedude"]);
 const mimeTypes: Record<string, string> = {
@@ -377,42 +377,330 @@ async function renameAcrossDevices(source: string, target: string) {
   }
 }
 
-export async function deleteEntries(paths: string[], permanent = false) {
+export async function deleteEntries(paths: string[], permanent = false): Promise<DeleteResult> {
   if (!paths.length) throw new AppError("Choose at least one item", 400);
   const root = await ensureRoot();
-  const trash = path.join(root, ".filedude", "trash");
-  if (!permanent && config.trashEnabled) await fs.mkdir(trash, { recursive: true, mode: 0o700 });
+  const trash = !permanent && config.trashEnabled ? await trashDirectories(true) : null;
+  const trashed: DeleteResult["trashed"] = [];
 
   for (const relativePath of paths) {
     const source = await safeResolve(relativePath, { followSymlink: false });
     if (source === root) throw new AppError("The configured root cannot be deleted", 403);
-    if (!permanent && config.trashEnabled) {
-      const suffix = `${Date.now()}-${crypto.randomBytes(3).toString("hex")}`;
-      await renameAcrossDevices(source, path.join(trash, `${path.basename(source)}.${suffix}`));
-    } else {
-      await fs.rm(source, { recursive: true, force: false });
+    if (trash) trashed.push({ path: relativeFromAbsolute(source), id: await moveToTrash(source, trash) });
+    else await fs.rm(source, { recursive: true, force: false });
+  }
+  return { trashed };
+}
+
+// Trashed items live in .filedude/trash/<id>, with a matching .filedude/trash-info/<id>.json
+// recording where each came from. Items trashed before the info files existed were named
+// "<original name>.<ms timestamp>-<6 hex>" and are restored to the root.
+type TrashDirectories = { items: string; info: string };
+type TrashInfo = { name: string; originalPath: string; type: EntryType; size: number; sizeComplete: boolean; deletedAt: string };
+
+const LEGACY_TRASH_ID = /^(.+)\.(\d{13})-[0-9a-f]{6}$/;
+const legacyTrashSizes = new Map<string, { bytes: number; complete: boolean }>();
+const TRASH_MEASURE_LIMIT = 50_000;
+
+function entryType(stat: { isDirectory(): boolean; isSymbolicLink(): boolean }): EntryType {
+  return stat.isDirectory() ? "directory" : stat.isSymbolicLink() ? "symlink" : "file";
+}
+
+async function trashDirectories(create: true): Promise<TrashDirectories>;
+async function trashDirectories(create?: boolean): Promise<TrashDirectories | null>;
+async function trashDirectories(create = false) {
+  const internal = path.join(await ensureRoot(), ".filedude");
+  const directories = { items: path.join(internal, "trash"), info: path.join(internal, "trash-info") };
+  for (const directory of Object.values(directories)) {
+    if (create) await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+    try {
+      if ((await fs.realpath(directory)) !== directory) {
+        throw new AppError("FilesDude's trash folder is not a regular folder inside the root", 500, "TRASH_UNSAFE");
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      if (directory === directories.items) return null;
+      await fs.mkdir(directory, { recursive: true, mode: 0o700 });
     }
+  }
+  return directories;
+}
+
+async function measureTree(absolute: string) {
+  let bytes = 0;
+  let visited = 0;
+  let complete = true;
+  const stack = [absolute];
+  while (stack.length) {
+    if (visited >= TRASH_MEASURE_LIMIT) return { bytes, complete: false };
+    const current = stack.pop()!;
+    visited += 1;
+    const stat = await fs.lstat(current).catch(() => null);
+    if (!stat) {
+      complete = false;
+    } else if (stat.isFile()) {
+      bytes += stat.size;
+    } else if (stat.isDirectory()) {
+      const names = await fs.readdir(current).catch(() => null);
+      if (names) stack.push(...names.map((name) => path.join(current, name)));
+      else complete = false;
+    }
+  }
+  return { bytes, complete };
+}
+
+async function moveToTrash(source: string, trash: TrashDirectories) {
+  const id = `${Date.now()}-${crypto.randomBytes(6).toString("hex")}`;
+  const stat = await fs.lstat(source);
+  const type = entryType(stat);
+  const measured = type === "directory" ? await measureTree(source) : { bytes: stat.size, complete: true };
+  const info: TrashInfo = {
+    name: path.basename(source),
+    originalPath: relativeFromAbsolute(source),
+    type,
+    size: measured.bytes,
+    sizeComplete: measured.complete,
+    deletedAt: new Date().toISOString(),
+  };
+  // Write the record first so a trashed item is never left without its original location.
+  const infoPath = path.join(trash.info, `${id}.json`);
+  await fs.writeFile(infoPath, JSON.stringify(info), { flag: "wx", mode: 0o600 });
+  try {
+    await renameAcrossDevices(source, path.join(trash.items, id));
+  } catch (error) {
+    await fs.rm(infoPath, { force: true });
+    throw error;
+  }
+  return id;
+}
+
+function trashItemPath(trash: TrashDirectories, id: string) {
+  if (typeof id !== "string" || !id || id === "." || id === ".." || /[/\\\0]/.test(id) || Buffer.byteLength(id, "utf8") > 255) {
+    throw new AppError("Trash item is invalid", 400, "INVALID_TRASH_ITEM");
+  }
+  return path.join(trash.items, id);
+}
+
+async function existingTrashItem(trash: TrashDirectories | null, id: string) {
+  if (!trash) throw new AppError("That item is no longer in the trash", 404, "NOT_FOUND");
+  const absolute = trashItemPath(trash, id);
+  try {
+    await fs.lstat(absolute);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new AppError("That item is no longer in the trash", 404, "NOT_FOUND");
+    throw error;
+  }
+  return absolute;
+}
+
+// Returns null when an item has no usable record (trashed before records existed, or corrupt).
+// Other read failures are thrown so a restore never falls back to the wrong location.
+async function readTrashInfo(trash: TrashDirectories, id: string): Promise<TrashInfo | null> {
+  let raw: string;
+  try {
+    raw = await fs.readFile(path.join(trash.info, `${id}.json`), "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+  try {
+    const parsed = JSON.parse(raw) as Partial<TrashInfo>;
+    if (typeof parsed.originalPath !== "string" || !parsed.originalPath || typeof parsed.deletedAt !== "string") return null;
+    const originalPath = normalizeRelative(parsed.originalPath);
+    if (!originalPath) return null;
+    return {
+      name: path.posix.basename(originalPath),
+      originalPath,
+      type: parsed.type === "directory" || parsed.type === "symlink" ? parsed.type : "file",
+      size: Number.isFinite(parsed.size) ? Number(parsed.size) : 0,
+      sizeComplete: parsed.sizeComplete !== false,
+      deletedAt: parsed.deletedAt,
+    };
+  } catch {
+    return null;
   }
 }
 
-export async function copyOrMove(paths: string[], destinationPath: string, move: boolean) {
+async function describeTrashItem(trash: TrashDirectories, id: string): Promise<TrashItem | null> {
+  const absolute = path.join(trash.items, id);
+  const stat = await fs.lstat(absolute).catch(() => null);
+  if (!stat) return null;
+  const info = await readTrashInfo(trash, id);
+  const legacy = info ? null : LEGACY_TRASH_ID.exec(id);
+  const type = info?.type ?? entryType(stat);
+  const name = info?.name ?? legacy?.[1] ?? id;
+  let measured = info ? { bytes: info.size, complete: info.sizeComplete } : type === "directory" ? legacyTrashSizes.get(id) : { bytes: stat.size, complete: true };
+  if (!measured) {
+    // Legacy folders have no recorded size; measure once rather than on every listing.
+    measured = await measureTree(absolute);
+    legacyTrashSizes.set(id, measured);
+  }
+  return {
+    id,
+    name,
+    originalPath: info?.originalPath ?? null,
+    deletedAt: info?.deletedAt ?? (legacy ? new Date(Number(legacy[2])).toISOString() : stat.ctime.toISOString()),
+    type,
+    mime: type === "file" ? getMime(name) : "inode/directory",
+    size: measured.bytes,
+    sizeComplete: measured.complete,
+  };
+}
+
+export async function listTrash(): Promise<TrashListing> {
+  const trash = await trashDirectories();
+  if (!trash) return { enabled: config.trashEnabled, items: [], totalBytes: 0 };
+  const ids = await fs.readdir(trash.items);
+  const items: TrashItem[] = [];
+  // Read records in batches so a very large trash cannot exhaust file descriptors.
+  for (let offset = 0; offset < ids.length; offset += 64) {
+    const described = await Promise.all(ids.slice(offset, offset + 64).map((id) => describeTrashItem(trash, id)));
+    items.push(...described.filter((item): item is TrashItem => item !== null));
+  }
+  items.sort((a, b) => b.deletedAt.localeCompare(a.deletedAt) || a.name.localeCompare(b.name));
+  return { enabled: config.trashEnabled, items, totalBytes: items.reduce((total, item) => total + item.size, 0) };
+}
+
+// Recreates any missing folders on the way to relativePath and returns it.
+async function ensureDirectoryPath(relativePath: string) {
+  const parts = relativePath ? relativePath.split("/") : [];
+  let existing = parts.length;
+  while (existing > 0) {
+    try {
+      await safeResolve(parts.slice(0, existing).join("/"));
+      break;
+    } catch (error) {
+      const missing = error instanceof AppError ? error.code === "NOT_FOUND" : (error as NodeJS.ErrnoException).code === "ENOTDIR";
+      if (!missing) throw error;
+      existing -= 1;
+    }
+  }
+  const base = parts.slice(0, existing).join("/");
+  if (!(await fs.stat(await safeResolve(base))).isDirectory()) {
+    throw new AppError(`/${base} is no longer a folder, so the item cannot be restored there`, 409, "RESTORE_CONFLICT");
+  }
+  for (let index = existing + 1; index <= parts.length; index += 1) {
+    const folder = parts.slice(0, index).join("/");
+    try {
+      await fs.mkdir(await safeResolve(folder, { mustExist: false }));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      throw new AppError(`/${folder} is in the way of the original location, so the item cannot be restored there`, 409, "RESTORE_CONFLICT");
+    }
+  }
+  return relativePath;
+}
+
+// Picks name, then "name (label).ext", "name (label 2).ext", ... in parentRelative, whichever is free.
+async function availableTarget(parentRelative: string, name: string, type: EntryType, label: string) {
+  const extension = type === "directory" ? "" : path.extname(name);
+  const stem = extension ? name.slice(0, -extension.length) : name;
+  for (let index = 0; index < 1_000; index += 1) {
+    const candidateName = index === 0 ? name : `${stem} (${label}${index > 1 ? ` ${index}` : ""})${extension}`;
+    const target = await safeResolve([parentRelative, candidateName].filter(Boolean).join("/"), { mustExist: false, followSymlink: false });
+    try {
+      await fs.lstat(target);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return { target, renamed: index > 0 };
+      throw error;
+    }
+  }
+  throw new AppError(`Unable to choose an available name for ${name}`, 409, "NAME_CONFLICT");
+}
+
+export async function restoreTrashItems(ids: string[]): Promise<TrashRestoreResult[]> {
+  if (!ids.length) throw new AppError("Choose at least one item", 400);
+  const trash = await trashDirectories();
+  const restored: TrashRestoreResult[] = [];
+  for (const id of ids) {
+    const source = await existingTrashItem(trash, id);
+    const info = await readTrashInfo(trash!, id);
+    const originalPath = info?.originalPath ?? validateName(LEGACY_TRASH_ID.exec(id)?.[1] ?? id);
+    const parentRelative = path.posix.dirname(originalPath) === "." ? "" : path.posix.dirname(originalPath);
+    const type = info?.type ?? entryType(await fs.lstat(source));
+    await ensureDirectoryPath(parentRelative);
+    const { target, renamed } = await availableTarget(parentRelative, path.posix.basename(originalPath), type, "restored");
+    await renameAcrossDevices(source, target);
+    await fs.rm(path.join(trash!.info, `${id}.json`), { force: true });
+    restored.push({ id, path: relativeFromAbsolute(target), renamed });
+  }
+  return restored;
+}
+
+export async function deleteTrashItems(ids: string[]) {
+  if (!ids.length) throw new AppError("Choose at least one item", 400);
+  const trash = await trashDirectories();
+  for (const id of ids) {
+    await fs.rm(await existingTrashItem(trash, id), { recursive: true, force: false });
+    await fs.rm(path.join(trash!.info, `${id}.json`), { force: true });
+  }
+  return { removed: ids.length };
+}
+
+export async function emptyTrash() {
+  const trash = await trashDirectories();
+  if (!trash) return { removed: 0 };
+  const ids = await fs.readdir(trash.items);
+  for (const id of ids) await fs.rm(path.join(trash.items, id), { recursive: true, force: true });
+  legacyTrashSizes.clear();
+  // Also clears records whose items were removed outside FilesDude.
+  for (const name of await fs.readdir(trash.info)) await fs.rm(path.join(trash.info, name), { force: true });
+  return { removed: ids.length };
+}
+
+// Thrown when a multi-item transfer fails part-way, so callers can account for what already moved.
+export class PartialTransferError extends AppError {
+  constructor(cause: unknown, public completed: TransferResult[], move: boolean) {
+    const known = cause instanceof AppError;
+    if (!known) console.error(cause);
+    super(
+      `${known ? cause.message : "An item could not be transferred"}. ${completed.length} ${completed.length === 1 ? "item was" : "items were"} ${move ? "moved" : "copied"} before this.`,
+      known ? cause.status : 500,
+      known ? cause.code : "TRANSFER_FAILED",
+    );
+  }
+}
+
+// Copies that would collide get a free "name (copy).ext" name; moves never rename and fail on a conflict.
+export async function copyOrMove(paths: string[], destinationPath: string, move: boolean): Promise<TransferResult[]> {
   const destination = await safeResolve(destinationPath);
   if (!(await fs.stat(destination)).isDirectory()) throw new AppError("Destination is not a folder", 400);
+  const destinationRelative = relativeFromAbsolute(destination);
+  const results: TransferResult[] = [];
 
   for (const sourcePath of paths) {
-    const source = await safeResolve(sourcePath, { followSymlink: false });
-    const target = path.join(destination, path.basename(source));
-    if (target === source) throw new AppError("The item is already in that folder", 409, "SAME_DESTINATION");
-    await safeResolve(relativeFromAbsolute(target), { mustExist: false });
     try {
-      await fs.access(target);
-      throw new AppError("An item with that name already exists in the destination", 409, "NAME_CONFLICT");
+      results.push(await transferOne(sourcePath, destination, destinationRelative, move));
+    } catch (error) {
+      if (results.length) throw new PartialTransferError(error, results, move);
+      throw error;
+    }
+  }
+  return results;
+}
+
+async function transferOne(sourcePath: string, destination: string, destinationRelative: string, move: boolean): Promise<TransferResult> {
+  {
+    const source = await safeResolve(sourcePath, { followSymlink: false });
+    if (destination === source || destination.startsWith(`${source}${path.sep}`)) {
+      throw new AppError(`You can't ${move ? "move" : "copy"} a folder into itself or one of its own subfolders`, 400, "INVALID_DESTINATION");
+    }
+    const name = path.basename(source);
+    let target = path.join(destination, name);
+    if (move && target === source) throw new AppError("The item is already in that folder", 409, "SAME_DESTINATION");
+    await safeResolve(relativeFromAbsolute(target), { mustExist: false });
+    let renamed = false;
+    try {
+      await fs.lstat(target);
+      if (move) throw new AppError("An item with that name already exists in the destination", 409, "NAME_CONFLICT");
+      ({ target, renamed } = await availableTarget(destinationRelative, name, entryType(await fs.lstat(source)), "copy"));
     } catch (error) {
       if (error instanceof AppError) throw error;
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
     if (move) await renameAcrossDevices(source, target);
     else await fs.cp(source, target, { recursive: true, errorOnExist: true, force: false });
+    return { source: relativeFromAbsolute(source), path: relativeFromAbsolute(target), renamed };
   }
 }
 

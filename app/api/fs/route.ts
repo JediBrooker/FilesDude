@@ -10,6 +10,7 @@ import {
   createEntry,
   deleteEntries,
   details,
+  PartialTransferError,
   listDirectory,
   previewBulkRename,
   renameEntry,
@@ -19,6 +20,7 @@ import {
 } from "@/lib/files";
 import type { BulkRenameRule } from "@/lib/types";
 import { rewriteFavoritePaths } from "@/lib/favorites";
+import { config } from "@/lib/config";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -47,6 +49,8 @@ type ActionBody = {
   type?: "file" | "directory";
   destination?: string;
   permanent?: boolean;
+  /** Refuse instead of deleting permanently when protected trash is turned off (used by undo). */
+  requireTrash?: boolean;
   mode?: string;
   uid?: number;
   gid?: number;
@@ -82,18 +86,29 @@ export async function POST(request: Request) {
         await rewriteFavoritePaths([{ from: body.path, to: (operationResult as { path: string }).path }]);
         break;
       case "delete":
-        await deleteEntries(paths, Boolean(body.permanent));
+        if (body.requireTrash && (body.permanent || !config.trashEnabled)) {
+          throw new AppError("Protected trash is turned off, so nothing was deleted", 409, "TRASH_DISABLED");
+        }
+        operationResult = await deleteEntries(paths, Boolean(body.permanent));
         await rewriteFavoritePaths(paths.map((favoritePath) => ({ from: favoritePath })));
         break;
       case "copy":
-      case "move":
+      case "move": {
         if (body.destination === undefined) throw new AppError("Destination is required");
-        await copyOrMove(paths, body.destination, body.action === "move");
-        if (body.action === "move") {
-          const destination = body.destination.replaceAll("\\", "/").replace(/^\/+|\/+$/g, "");
-          await rewriteFavoritePaths(paths.map((source) => ({ from: source, to: [destination, source.split("/").at(-1)].filter(Boolean).join("/") })));
+        let transferred;
+        try {
+          transferred = await copyOrMove(paths, body.destination, body.action === "move");
+        } catch (error) {
+          // Keep favourites pointing at items that moved before the failure.
+          if (error instanceof PartialTransferError && body.action === "move") {
+            await rewriteFavoritePaths(error.completed.map((item) => ({ from: item.source, to: item.path })));
+          }
+          throw error;
         }
+        if (body.action === "move") await rewriteFavoritePaths(transferred.map((item) => ({ from: item.source, to: item.path })));
+        operationResult = transferred;
         break;
+      }
       case "chmod":
         if (!body.mode) throw new AppError("Permissions are required");
         await changeMode(paths, body.mode);
