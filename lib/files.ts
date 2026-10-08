@@ -7,7 +7,7 @@ import { config } from "./config";
 import { AppError } from "./http";
 import type { BulkRenameRule, DeleteResult, DiskInfo, EntryType, FileEntry, IdentityOption, LargestFilesResult, LargestFilesScanning, OwnershipPair, RenamePreview, TransferResult, TrashItem, TrashListing, TrashRestoreResult } from "./types";
 
-const INTERNAL_NAMES = new Set([".filedude"]);
+export const INTERNAL_NAMES = new Set([".filedude"]);
 const mimeTypes: Record<string, string> = {
   ".txt": "text/plain", ".md": "text/markdown", ".json": "application/json",
   ".js": "text/javascript", ".ts": "text/typescript", ".tsx": "text/typescript",
@@ -143,7 +143,7 @@ export async function openVerifiedFile(relativePath: string, flags: string | num
   }
 }
 
-function relativeFromAbsolute(absolute: string) {
+export function relativeFromAbsolute(absolute: string) {
   return path.relative(canonicalRoot || config.root, absolute).split(path.sep).join("/");
 }
 
@@ -329,7 +329,7 @@ export async function searchFiles(relativePath: string, query: string, showHidde
   return { path: normalizeRelative(relativePath), entries: results, disk: await diskInfo(), truncated: results.length >= 500 };
 }
 
-function validateName(name: string) {
+export function validateName(name: string) {
   const trimmed = name.trim();
   if (!trimmed || trimmed === "." || trimmed === ".." || trimmed.includes("/") || trimmed.includes("\\") || trimmed.includes("\0")) {
     throw new AppError("Enter a valid name without slashes", 400, "INVALID_NAME");
@@ -426,7 +426,7 @@ async function trashDirectories(create = false) {
   return directories;
 }
 
-async function measureTree(absolute: string) {
+export async function measureTree(absolute: string) {
   let bytes = 0;
   let visited = 0;
   let complete = true;

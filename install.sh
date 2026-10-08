@@ -118,9 +118,13 @@ if ! curl -fsSL --retry 3 --header 'Accept: application/vnd.github+json' \
 fi
 mkdir -p "${BUILD_ROOT}/source"
 tar -xzf "${ARCHIVE}" --strip-components=1 -C "${BUILD_ROOT}/source"
+# GitHub names the tarball's top folder <owner>-<repo>-<short commit>; the app shows that commit.
+BUILD_COMMIT="$(tar -tzf "${ARCHIVE}" 2>/dev/null | awk -F/ 'NR == 1 { print $1 }' || true)"
+BUILD_COMMIT="${BUILD_COMMIT##*-}"
+[[ ${BUILD_COMMIT} =~ ^[0-9a-f]{7,40}$ ]] || BUILD_COMMIT=""
 cd "${BUILD_ROOT}/source"
 npm ci --no-audit --no-fund >/dev/null
-NEXT_TELEMETRY_DISABLED=1 npm run build >/dev/null
+FILEDUDE_BUILD_COMMIT="${BUILD_COMMIT}" NEXT_TELEMETRY_DISABLED=1 npm run build >/dev/null
 
 RELEASE="${APP_HOME}/releases/$(date -u +%Y%m%d%H%M%S)"
 mkdir -p "${RELEASE}/.next"

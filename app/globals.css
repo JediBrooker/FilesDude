@@ -116,6 +116,7 @@ a { color: inherit; text-decoration: none; }
 .storage-action { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin-top: 9px; padding-top: 8px; border-top: 1px solid var(--line); color: var(--brand); font-size: 9px; font-weight: 700; }
 .storage-action svg { flex: 0 0 auto; transition: transform .15s ease; }
 .storage-card:hover .storage-action svg { transform: translateX(2px); }
+.app-version { margin: 8px 4px 0; color: var(--ink-faint); font-size: 8px; letter-spacing: .02em; }
 .sidebar-footer { display: flex; align-items: center; gap: 6px; margin-top: 12px; padding: 10px 4px 0; border-top: 1px solid var(--line); }
 .user-chip { display: flex; min-width: 0; flex: 1; align-items: center; gap: 8px; padding: 4px; border: 0; border-radius: 8px; background: transparent; cursor: pointer; text-align: left; }
 .user-chip:hover { background: var(--panel-soft); }
@@ -539,6 +540,16 @@ kbd { padding: 3px 5px; border: 1px solid var(--line); border-bottom-width: 2px;
 .audio-preview audio { width: min(440px, 80%); }
 
 .toast { position: fixed; z-index: 200; right: 22px; bottom: 22px; display: flex; max-width: min(390px, calc(100vw - 44px)); min-height: 44px; align-items: center; gap: 9px; padding: 10px 14px; border: 1px solid color-mix(in srgb, var(--brand) 30%, var(--line)); border-radius: 10px; background: var(--panel); color: var(--brand-strong); box-shadow: var(--shadow); font-size: 10px; font-weight: 700; animation: toast-in .2s ease both; }
+.job-panel { position: fixed; z-index: 190; right: 22px; bottom: 78px; display: grid; width: min(330px, calc(100vw - 44px)); gap: 9px; padding: 11px 12px; border: 1px solid color-mix(in srgb, var(--brand) 30%, var(--line)); border-radius: 11px; background: var(--panel); box-shadow: var(--shadow); }
+.job-panel-head { display: flex; min-width: 0; align-items: center; gap: 9px; }
+.job-panel-head .file-icon { width: 29px; height: 29px; }
+.job-panel-head > div { display: flex; min-width: 0; flex: 1; flex-direction: column; }
+.job-panel-head strong { overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.job-panel-head small { color: var(--ink-soft); font-size: 9px; }
+.job-panel-track { height: 6px; overflow: hidden; border-radius: 999px; background: var(--panel-strong); }
+.job-panel-track span { display: block; height: 100%; border-radius: inherit; background: var(--brand); transition: width .3s ease; }
+.job-panel-track.indeterminate span { width: 35%; animation: job-slide 1.2s ease-in-out infinite; }
+@keyframes job-slide { from { transform: translateX(-100%); } to { transform: translateX(290%); } }
 .toast-action { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 5px; margin-left: 4px; padding: 5px 9px; border: 1px solid currentColor; border-radius: 7px; background: transparent; color: inherit; cursor: pointer; font-size: 10px; font-weight: 800; }
 .toast-action:hover { background: var(--brand-soft); }
 .toast-error { border-color: color-mix(in srgb, var(--danger) 35%, var(--line)); color: var(--danger); }

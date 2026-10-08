@@ -12,6 +12,7 @@ FilesDude is a secure, self-hosted web file manager designed for a Proxmox host,
 - Create files and folders; edit text/code files up to 2 MB; rename, copy, move, soft-delete, and permanently delete, with a breadcrumb folder browser and autofill suggestions for picking a copy/move destination
 - Multi-file drag-and-drop upload with live progress, transfer speed, time remaining, and cancel (cancelled or interrupted files are discarded and can be resumed), collision-safe names, a configurable size limit, and owner/group confirmation based on the destination folder and its existing contents
 - Direct file downloads and ZIP downloads for folders
+- Compress selected items into `.zip` or `.tar.gz` and extract `.zip`, `.tar`, `.tar.gz`, and `.tgz` archives into a new folder, as background jobs with progress and cancel; extraction refuses archives with absolute or `..` paths, never creates links or devices, and stops before filling the disk
 - Inline previews for text, code, JSON, images, PDF, audio, and video; media uses byte-range streaming
 - POSIX `chmod` and numeric `chown` for one or many items
 - Bulk rename with find/replace, regular expressions, prefix, suffix, sequential numbering, live conflict detection, and two-phase application
@@ -126,6 +127,27 @@ sidebar to see each item's original location, size, and deletion time.
 Items trashed by FilesDude versions that did not record original locations are
 listed with an unknown location and restore to the root folder.
 
+## Compress and extract archives
+
+Select items and choose **Compress** (or right-click and choose **Compress…**) to save
+them as a `.zip` or `.tar.gz` in the open folder. Right-click an archive and choose
+**Extract here** to unpack it into a new folder named after it; nothing existing is
+replaced. Both run in the background with a progress panel and a cancel button, so
+large archives are not cut off by reverse-proxy timeouts. One archive job runs at a
+time, and jobs stop if the service restarts.
+
+Extraction treats any archive containing an absolute path, a `..` segment, or
+FilesDude's internal folder name as hostile and extracts nothing from it. Symlinks,
+hard links, and device entries are skipped and counted, and extraction stops (removing
+its partial folder) rather than leave less than 512 MB free or unpack more than
+100,000 entries. New files and folders take the owner of the folder they are created in.
+
+## Version
+
+The running version (from `package.json`) and the commit it was built from appear
+at the bottom of the sidebar once signed in; hover it for the build time. It is not
+shown on the sign-in page.
+
 ## Manual development setup
 
 FilesDude deliberately refuses to sign users in until a password hash and a strong session secret are configured.
@@ -209,11 +231,10 @@ The safest default set is already included. These are strong next additions when
 - OIDC or WebAuthn/passkeys for multi-user sign-in and two-factor authentication
 - Role-based roots and read-only accounts instead of one server administrator
 - Automatic retention (age-based purging) for protected trash
-- Archive creation/extraction with path-traversal scanning
 - Content search, thumbnails, checksums, duplicate detection, and media metadata
 - Antivirus scanning and upload quarantine for environments with untrusted uploaders
 - ZFS snapshot shortcuts and a version-history browser for Proxmox storage
-- Background jobs with progress for very large copies, moves, uploads, and archives
+- Background jobs with progress for very large copies and moves (archives already run this way)
 - SFTP/SMB/NFS connection profiles for managing remote roots without mounting them into the app container
 
 ## Development checks

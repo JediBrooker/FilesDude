@@ -43,6 +43,7 @@ import {
   Menu,
   Moon,
   MoreHorizontal,
+  PackageOpen,
   Pencil,
   Plus,
   RefreshCw,
@@ -65,7 +66,7 @@ import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState
 import { createPortal } from "react-dom";
 import { moveCursor, selectionRange } from "@/lib/selection";
 import { INITIAL_DIRECTION, nextSort, parseSort, sortEntries, type SortKey, type SortState } from "@/lib/sort";
-import type { BulkRenameRule, DeleteResult, DiskInfo, FileEntry, TransferResult, IdentityOption, LargestFilesProgress, LargestFilesReady, LargestFilesResult, OwnershipPair, RenamePreview, TrashItem, TrashListing, TrashRestoreResult, UploadOwnershipOptions, UploadOwnershipPreference } from "@/lib/types";
+import type { ArchiveFormat, BulkRenameRule, DeleteResult, DiskInfo, FileEntry, JobState, TransferResult, IdentityOption, LargestFilesProgress, LargestFilesReady, LargestFilesResult, OwnershipPair, RenamePreview, TrashItem, TrashListing, TrashRestoreResult, UploadOwnershipOptions, UploadOwnershipPreference } from "@/lib/types";
 
 type AuthState = {
   loading: boolean;
@@ -79,6 +80,7 @@ type DialogState =
   | { kind: "upload"; files: File[] }
   | { kind: "storage" }
   | { kind: "trash" }
+  | { kind: "compress" }
   | { kind: "new" }
   | { kind: "rename"; entry: FileEntry }
   | { kind: "delete" }
@@ -93,7 +95,7 @@ type DialogState =
   | null;
 
 type ViewMode = "list" | "grid";
-type EntryAction = "open" | "edit" | "download" | "favorite" | "rename" | "cut" | "clipboard" | "paste" | "copy" | "move" | "permissions" | "ownership" | "details" | "delete";
+type EntryAction = "open" | "edit" | "download" | "favorite" | "rename" | "cut" | "clipboard" | "paste" | "copy" | "move" | "compress" | "extract" | "permissions" | "ownership" | "details" | "delete";
 type FavoriteLocation = { path: string; name: string; createdAt: string };
 type SelectOptions = { additive?: boolean; range?: boolean };
 type MenuPosition = { top: number; left: number };
@@ -117,7 +119,13 @@ type EntryInteractions = {
 
 const DRAG_TYPE = "application/x-filesdude-paths";
 const MENU_WIDTH = 224;
-const MULTI_ITEM_ACTIONS: EntryAction[] = ["cut", "clipboard", "copy", "move", "permissions", "ownership", "delete"];
+const MULTI_ITEM_ACTIONS: EntryAction[] = ["cut", "clipboard", "copy", "move", "compress", "permissions", "ownership", "delete"];
+const ARCHIVE_NAME = /\.(zip|tar\.gz|tgz|tar)$/i;
+
+// Baked in at build time by next.config.ts.
+const APP_VERSION = process.env.NEXT_PUBLIC_FILESDUDE_VERSION || "dev";
+const APP_COMMIT = process.env.NEXT_PUBLIC_FILESDUDE_COMMIT || "";
+const APP_BUILT_AT = process.env.NEXT_PUBLIC_FILESDUDE_BUILT_AT || "";
 
 const SORT_LABELS: Record<SortKey, string> = { name: "Name", size: "Size", owner: "Owner", mode: "Permissions", modified: "Modified" };
 const SORT_STORAGE_KEY = "filesdude-sort";
@@ -199,6 +207,17 @@ function fileIcon(entry: Pick<FileEntry, "type" | "mime">, size = 20) {
   if (entry.mime.startsWith("text/") || entry.mime.includes("json")) return <FileCode2 size={size} strokeWidth={1.8} />;
   if (entry.mime === "application/pdf") return <FileText size={size} strokeWidth={1.8} />;
   return <File size={size} strokeWidth={1.8} />;
+}
+
+function isArchive(entry: Pick<FileEntry, "type" | "name">) {
+  return entry.type === "file" && ARCHIVE_NAME.test(entry.name);
+}
+
+function jobProgressText(job: JobState) {
+  const { done, total, unit } = job.progress;
+  if (!done) return "Starting…";
+  if (unit === "entries") return total ? `${done.toLocaleString()} of ${total.toLocaleString()} entries` : `${done.toLocaleString()} entries`;
+  return total ? `${formatBytes(done)} of ${formatBytes(total)}` : formatBytes(done);
 }
 
 function parentOf(pathValue: string) {
@@ -319,6 +338,7 @@ export function FileManager() {
   const [menu, setMenu] = useState<MenuState | null>(null);
   const [clipboard, setClipboard] = useState<ClipboardState | null>(null);
   const [dropTarget, setDropTarget] = useState<string | null>(null);
+  const [activeJob, setActiveJob] = useState<JobState | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [theme, setTheme] = useState<"light" | "dark">("light");
   const uploadRef = useRef<HTMLInputElement>(null);
@@ -539,6 +559,73 @@ export function FileManager() {
     await refreshListing();
   };
 
+  const startArchiveJob = async (body: Record<string, unknown>) => {
+    try {
+      const { job } = await postJson<{ job: JobState }>("/api/fs/archive", body);
+      setActiveJob(job);
+      return true;
+    } catch (error) {
+      notify((error as Error).message, "error");
+      return false;
+    }
+  };
+
+  const cancelArchiveJob = async (job: JobState) => {
+    try {
+      setActiveJob(((await postJson<{ job: JobState }>("/api/fs/archive", { action: "cancel", id: job.id })).job));
+    } catch (error) {
+      notify((error as Error).message, "error");
+    }
+  };
+
+  // Poll a running archive job, then report its outcome once it finishes.
+  useEffect(() => {
+    if (!activeJob) return;
+    const timer = window.setTimeout(async () => {
+      if (activeJob.status === "running") {
+        try {
+          setActiveJob((await requestJson<{ job: JobState }>(`/api/fs/archive?id=${encodeURIComponent(activeJob.id)}`)).job);
+        } catch (error) {
+          setActiveJob(null);
+          notify((error as Error).message, "error");
+        }
+        return;
+      }
+      setActiveJob(null);
+      const result = activeJob.result;
+      if (activeJob.status === "done" && result) {
+        const name = result.path.split("/").at(-1);
+        const compressed = activeJob.kind === "compress";
+        const skipped = result.skipped ? ` · ${result.skipped} ${result.skipped === 1 ? "link or duplicate was" : "links or duplicates were"} skipped` : "";
+        notify(compressed ? `Created ${name} (${formatBytes(result.bytes)})` : `Extracted ${itemCount(result.entries)} into ${name}${skipped}`, undefined, {
+          done: compressed ? "Moved the archive to trash" : "Moved the extracted folder to trash",
+          run: async () => { await postJson("/api/fs", { action: "delete", paths: [result.path], requireTrash: true }); },
+        });
+      } else if (activeJob.status === "failed") {
+        notify(activeJob.error || "The archive job failed", "error");
+      } else {
+        notify(activeJob.kind === "compress" ? "Compression cancelled" : "Extraction cancelled");
+      }
+      await refreshListing();
+    }, activeJob.status === "running" ? 1000 : 0);
+    return () => window.clearTimeout(timer);
+  }, [activeJob]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Pick up a job still running from before a reload.
+  useEffect(() => {
+    if (!auth.authenticated) return;
+    const timer = window.setTimeout(async () => {
+      try {
+        const { jobs } = await requestJson<{ jobs: JobState[] }>("/api/fs/archive");
+        const running = jobs.find((job) => job.status === "running");
+        if (running) setActiveJob((current) => current ?? running);
+      } catch {
+        // The listing works without job progress.
+      }
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [auth.authenticated]);
+
   const transferEntries = (mode: "copy" | "move", paths: string[], destination: string) =>
     runAction({ action: mode, paths, destination }, `${itemCount(paths.length)} ${mode === "copy" ? "copied" : "moved"} to ${folderLabel(destination)}`);
 
@@ -733,6 +820,12 @@ export function FileManager() {
       case "paste":
         void pasteInto(entry.path);
         break;
+      case "compress":
+        setDialog({ kind: "compress" });
+        break;
+      case "extract":
+        void startArchiveJob({ action: "extract", path: entry.path });
+        break;
       case "copy":
       case "move":
         setDialog({ kind: "transfer", mode: action });
@@ -917,6 +1010,7 @@ export function FileManager() {
           <button className="icon-button" aria-label="Preferences" title="Preferences" onClick={() => setDialog({ kind: "preferences" })}><Settings2 size={17} /></button>
           <button className="icon-button" aria-label="Sign out" title="Sign out" onClick={() => void logout()}><LogOut size={17} /></button>
         </div>
+        <p className="app-version" title={APP_BUILT_AT ? `Built ${new Date(APP_BUILT_AT).toLocaleString()}` : undefined}>FilesDude v{APP_VERSION}{APP_COMMIT ? ` · ${APP_COMMIT}` : ""}</p>
       </aside>
 
       <main className="main-panel">
@@ -990,6 +1084,7 @@ export function FileManager() {
                 <button onClick={() => setDialog({ kind: "transfer", mode: "move" })}><FolderInput size={16} /> Move</button>
                 <button onClick={() => setDialog({ kind: "permissions" })}><KeyRound size={16} /> Permissions</button>
                 <button onClick={() => setDialog({ kind: "ownership" })}><UserRoundCog size={16} /> Ownership</button>
+                <button onClick={() => setDialog({ kind: "compress" })}><FileArchive size={16} /> Compress</button>
                 {selected.size > 1 && <button onClick={() => setDialog({ kind: "bulk" })}><Sparkles size={16} /> Bulk rename</button>}
                 {selected.size === 1 && <button onClick={() => setDialog({ kind: "details", entry: selectedEntries[0] })}><Info size={16} /> Properties</button>}
                 <button className="danger-action" onClick={() => setDialog({ kind: "delete" })}><Trash2 size={16} /> Delete</button>
@@ -1032,6 +1127,7 @@ export function FileManager() {
           onRun={runAction}
           notify={notify}
           onRefresh={() => loadDirectory()}
+          onStartJob={startArchiveJob}
           username={auth.username || ""}
           onCredentialsUpdated={async () => { setDialog(null); await refreshAuth(); notify("Account preferences updated"); }}
           onReveal={(entry) => { setDialog(null); navigate(entry.path.split("/").slice(0, -1).join("/")); }}
@@ -1042,6 +1138,10 @@ export function FileManager() {
         ? <FileActionMenu entry={menu.entry} targets={menuTargets(menu.entry)} position={{ top: menu.top, left: menu.left }} menuRef={menuRef} favoritePaths={favoritePaths} canPaste={Boolean(clipboard) && menu.entry.type === "directory"} onAction={(action, entry) => { setMenu(null); handleEntryAction(action, entry); }} />
         : <BackgroundMenu position={{ top: menu.top, left: menu.left }} menuRef={menuRef} folder={currentPath ? currentPath.split("/").at(-1) || "" : "All files"} clipboardCount={clipboard?.paths.length ?? 0} canSelectAll={sortedEntries.length > 0} onChoose={chooseBackground} />,
       document.body)}
+      {activeJob && <div className="job-panel" role="status" aria-live="polite">
+        <div className="job-panel-head"><span className="file-icon">{activeJob.kind === "compress" ? <FileArchive size={17} /> : <PackageOpen size={17} />}</span><div><strong title={activeJob.label}>{activeJob.label}</strong><small>{activeJob.status === "running" ? jobProgressText(activeJob) : "Finishing…"}</small></div>{activeJob.status === "running" && <button className="icon-button" aria-label="Cancel job" title="Cancel" onClick={() => void cancelArchiveJob(activeJob)}><X size={16} /></button>}</div>
+        <div className={`job-panel-track ${activeJob.progress.total ? "" : "indeterminate"}`} role="progressbar" aria-label={activeJob.label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={activeJob.progress.total ? Math.round((activeJob.progress.done / activeJob.progress.total) * 100) : undefined}><span style={activeJob.progress.total ? { width: `${Math.min(100, (activeJob.progress.done / activeJob.progress.total) * 100)}%` } : undefined} /></div>
+      </div>}
       {toast && <div className={`toast ${toast.tone === "error" ? "toast-error" : ""}`} role="status">{toast.tone === "error" ? <CircleAlert size={18} /> : <Check size={18} />}<span>{toast.message}</span>{toast.undo && <button className="toast-action" onClick={() => void runUndo(toast.undo!)}><Undo2 size={14} /> Undo</button>}</div>}
     </div>
   );
@@ -1194,6 +1294,10 @@ function FileActionMenu({ entry, targets, position, menuRef, favoritePaths, canP
         {item("move", "Move to…", <FolderInput size={16} />)}
       </div>
       <div className="file-menu-section">
+        {item("compress", multiple ? `Compress ${itemCount(targets.length)}…` : "Compress…", <FileArchive size={16} />)}
+        {!multiple && isArchive(entry) && item("extract", "Extract here", <PackageOpen size={16} />)}
+      </div>
+      <div className="file-menu-section">
         {item("permissions", "Change permissions", <KeyRound size={16} />)}
         {item("ownership", "Change ownership", <UserRoundCog size={16} />)}
         {!multiple && item("details", "Properties", <Info size={16} />)}
@@ -1249,7 +1353,7 @@ function FileSkeleton() {
   return <div className="file-skeleton">{Array.from({ length: 6 }).map((_, index) => <div key={index}><span /><span /><span /><span /></div>)}</div>;
 }
 
-function DialogHost({ dialog, selected, currentPath, username, onClose, onRun, notify, onRefresh, onCredentialsUpdated, onReveal, onPreview }: {
+function DialogHost({ dialog, selected, currentPath, username, onClose, onRun, notify, onRefresh, onStartJob, onCredentialsUpdated, onReveal, onPreview }: {
   dialog: NonNullable<DialogState>;
   selected: FileEntry[];
   currentPath: string;
@@ -1258,6 +1362,7 @@ function DialogHost({ dialog, selected, currentPath, username, onClose, onRun, n
   onRun: (body: Record<string, unknown>, success: string) => Promise<boolean>;
   notify: (message: string, tone?: "error") => void;
   onRefresh: () => Promise<void>;
+  onStartJob: (body: Record<string, unknown>) => Promise<boolean>;
   onCredentialsUpdated: () => Promise<void>;
   onReveal: (entry: FileEntry) => void;
   onPreview: (entry: FileEntry) => void;
@@ -1265,6 +1370,7 @@ function DialogHost({ dialog, selected, currentPath, username, onClose, onRun, n
   if (dialog.kind === "upload") return <UploadDialog files={dialog.files} currentPath={currentPath} onClose={onClose} notify={notify} onComplete={onRefresh} />;
   if (dialog.kind === "storage") return <StorageDialog onClose={onClose} onReveal={onReveal} onPreview={onPreview} notify={notify} />;
   if (dialog.kind === "trash") return <TrashDialog onClose={onClose} notify={notify} onRefresh={onRefresh} />;
+  if (dialog.kind === "compress") return <CompressDialog entries={selected} currentPath={currentPath} onClose={onClose} onStart={onStartJob} />;
   if (dialog.kind === "new") return <NewDialog path={currentPath} onClose={onClose} onRun={onRun} />;
   if (dialog.kind === "rename") return <RenameDialog entry={dialog.entry} onClose={onClose} onRun={onRun} />;
   if (dialog.kind === "delete") return <DeleteDialog entries={selected} onClose={onClose} onRun={onRun} />;
@@ -1671,6 +1777,23 @@ function UploadDialog({ files, currentPath, onClose, notify, onComplete }: { fil
   const progressPanel = progress && currentFile && <div className="upload-progress" role="status" aria-live="polite"><div className="upload-progress-head"><strong title={currentFile.name}>{progress.loaded >= currentFile.size ? "Finishing" : "Uploading"} {currentFile.name}</strong><span>File {progress.index + 1} of {files.length}</span></div><div className="upload-progress-track" role="progressbar" aria-label="Upload progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent}><span style={{ width: `${percent}%` }} /></div><div className="upload-progress-meta"><span>{formatBytes(sentBytes)} of {formatBytes(totalBytes)} · {percent}%</span><span>{progress.bytesPerSecond > 0 ? `${formatBytes(progress.bytesPerSecond)}/s · ${formatRemaining((totalBytes - sentBytes) / progress.bytesPerSecond) || "almost done"}` : "Measuring speed…"}</span></div></div>;
 
   return <Modal title={`Upload ${files.length} ${files.length === 1 ? "file" : "files"}`} subtitle={`Choose ownership before uploading to /${currentPath}`} icon={<Upload size={19} />} onClose={onClose}><form className="upload-form" onSubmit={submit}><div className="upload-file-summary"><div><Upload size={18} /><span><strong>{files.length} {files.length === 1 ? "file" : "files"}</strong><small>{formatBytes(files.reduce((total, file) => total + file.size, 0))} total{uploadedCount ? ` · ${uploadedCount} uploaded` : ""}</small></span></div><div className="upload-file-list">{files.slice(0, 4).map((file) => <span key={`${file.name}-${file.size}`}>{file.name}</span>)}{files.length > 4 && <span>and {files.length - 4} more…</span>}</div></div>{progressPanel}<div className="ownership-heading"><div><UserRoundCog size={17} /><span><strong>Owner and group</strong><small>Detected from this folder and its contents</small></span></div>{options?.truncated && <small>Based on the first 2,000 items</small>}</div>{!options && !error ? <div className="ownership-loading"><LoaderCircle className="spin" size={18} /> Detecting ownership…</div> : options && <div className="ownership-options"><label className={`ownership-option ${selectedOwnership === "service" ? "active" : ""}`}><input type="radio" name="upload-ownership" value="service" checked={selectedOwnership === "service"} onChange={(event) => setSelectedOwnership(event.target.value)} /><span className="ownership-radio" /><span><strong>Keep FilesDude service ownership</strong><small>{options.service.owner}:{options.service.group} · {options.service.uid}:{options.service.gid}</small></span>{preferredKey === "service" && <em>Default</em>}</label>{ownershipPairs.map((pair) => { const key = ownershipKey(pair); const destination = key === ownershipKey(options.destination); return <label key={key} className={`ownership-option ${selectedOwnership === key ? "active" : ""} ${!options.canChangeOwnership ? "disabled" : ""}`}><input type="radio" name="upload-ownership" value={key} checked={selectedOwnership === key} disabled={!options.canChangeOwnership} onChange={(event) => setSelectedOwnership(event.target.value)} /><span className="ownership-radio" /><span><strong>{pair.owner}:{pair.group}</strong><small>{pair.uid}:{pair.gid}{destination ? " · destination folder" : pair.source === "default" ? " · saved default" : ` · ${pair.count || 0} existing ${pair.count === 1 ? "item" : "items"}`}</small></span>{preferredKey === key && <em>Default</em>}</label>; })}</div>}{options && !options.canChangeOwnership && <div className="warning-box"><CircleAlert size={17} /> Ownership changes require FilesDude&apos;s systemd service to run as root. This upload will keep <code>{options.service.uid}:{options.service.gid}</code>.</div>}<div className="info-box"><Info size={17} /> Uploaded files use mode <code>640</code>. Owner/group selection does not change those read and write permissions.</div>{error && <div className="form-error"><CircleAlert size={16} />{error}</div>}{busy ? <div className="modal-actions"><button type="button" className="button danger" onClick={() => controllerRef.current?.abort()}><X size={16} /> Cancel upload</button></div> : <ModalActions onClose={onClose} submitLabel={uploadedCount ? "Upload remaining files" : `Upload ${files.length === 1 ? "file" : "files"}`} busy={!options} />}</form></Modal>;
+}
+
+function CompressDialog({ entries, currentPath, onClose, onStart }: { entries: FileEntry[]; currentPath: string; onClose: () => void; onStart: (body: Record<string, unknown>) => Promise<boolean> }) {
+  const suggested = entries.length === 1
+    ? (entries[0].type === "directory" || entries[0].name.lastIndexOf(".") <= 0 ? entries[0].name : entries[0].name.slice(0, entries[0].name.lastIndexOf(".")))
+    : currentPath.split("/").at(-1) || "Archive";
+  const [name, setName] = useState(suggested);
+  const [format, setFormat] = useState<ArchiveFormat>("zip");
+  const [busy, setBusy] = useState(false);
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    setBusy(true);
+    if (await onStart({ action: "compress", paths: entries.map((entry) => entry.path), destination: currentPath, name, format })) onClose();
+    else setBusy(false);
+  };
+  const extension = format === "zip" ? ".zip" : ".tar.gz";
+  return <Modal title={`Compress ${itemCount(entries.length)}`} subtitle={`The archive is saved in ${folderLabel(currentPath)}`} icon={<FileArchive size={19} />} onClose={onClose}><form onSubmit={submit}><div className="choice-cards"><button type="button" className={format === "zip" ? "active" : ""} onClick={() => setFormat("zip")}><FileArchive size={24} /><strong>ZIP</strong><span>Opens on any computer</span></button><button type="button" className={format === "tar.gz" ? "active" : ""} onClick={() => setFormat("tar.gz")}><Server size={24} /><strong>tar.gz</strong><span>Usual on Linux servers; keeps links as links</span></button></div><FormField label="Archive name" hint={`Saved as ${name.trim() || "…"}${extension}; an existing name gets a number added`}><input autoFocus value={name} onChange={(event) => setName(event.target.value)} required maxLength={200} /></FormField><ModalActions onClose={onClose} submitLabel="Compress" busy={busy} disabled={!name.trim() || entries.length === 0} /></form></Modal>;
 }
 
 function NewDialog({ path, onClose, onRun }: { path: string; onClose: () => void; onRun: (body: Record<string, unknown>, success: string) => Promise<boolean> }) {
