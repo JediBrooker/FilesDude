@@ -10,6 +10,7 @@ STATE_DIR="/var/lib/filesdude"
 UNIT_FILE="/etc/systemd/system/filesdude.service"
 BIND_ADDRESS="127.0.0.1"
 PORT="3000"
+LISTEN_REQUESTED="false"
 MODE="install"
 ROOT_PATH=""
 INSTALL_USERNAME=""
@@ -41,8 +42,8 @@ while (($#)); do
   case "$1" in
     --root) ROOT_PATH="${2:?Missing path}"; shift 2 ;;
     --username) INSTALL_USERNAME="${2:?Missing username}"; shift 2 ;;
-    --bind) BIND_ADDRESS="${2:?Missing address}"; shift 2 ;;
-    --port) PORT="${2:?Missing port}"; shift 2 ;;
+    --bind) BIND_ADDRESS="${2:?Missing address}"; LISTEN_REQUESTED="true"; shift 2 ;;
+    --port) PORT="${2:?Missing port}"; LISTEN_REQUESTED="true"; shift 2 ;;
     --service-user) SERVICE_ACCOUNT="${2:?Missing user}"; shift 2 ;;
     --update) MODE="update"; shift ;;
     --reset-credentials) MODE="reset"; shift ;;
@@ -180,14 +181,28 @@ write_environment() {
   chmod 600 "${ENV_FILE}"
 }
 
+# Reads KEY=value from the existing environment file without executing it.
+env_value() { sed -n "s/^$1=//p" "${ENV_FILE}" | head -n 1; }
+
+# Updates and resets keep the configured listener; the server binds 0.0.0.0:3000 when unset.
+load_listen_address() {
+  if [[ ${LISTEN_REQUESTED} == "true" ]]; then
+    printf '\nNote: --bind and --port only apply to new installs. Edit HOSTNAME and PORT in %s instead.\n' "${ENV_FILE}" >&2
+  fi
+  BIND_ADDRESS="$(env_value HOSTNAME)"
+  BIND_ADDRESS="${BIND_ADDRESS:-0.0.0.0}"
+  PORT="$(env_value PORT)"
+  PORT="${PORT:-3000}"
+}
+
 if [[ ${MODE} == "update" ]]; then
   [[ -f ${ENV_FILE} ]] || fail "No existing FilesDude configuration was found. Run the normal installer first."
+  load_listen_address
 elif [[ ${MODE} == "reset" ]]; then
   [[ -f ${ENV_FILE} ]] || fail "No existing FilesDude configuration was found. Run the normal installer first."
-  ROOT_PATH="$(sed -n 's/^FILEDUDE_ROOT=//p' "${ENV_FILE}" | head -n 1)"
-  BIND_ADDRESS="$(sed -n 's/^HOSTNAME=//p' "${ENV_FILE}" | head -n 1)"
-  PORT="$(sed -n 's/^PORT=//p' "${ENV_FILE}" | head -n 1)"
-  EXISTING_USERNAME="$(sed -n 's/^FILEDUDE_USERNAME=//p' "${ENV_FILE}" | head -n 1)"
+  ROOT_PATH="$(env_value FILEDUDE_ROOT)"
+  load_listen_address
+  EXISTING_USERNAME="$(env_value FILEDUDE_USERNAME)"
   INSTALL_USERNAME="${INSTALL_USERNAME:-$(prompt_value "Replacement username" "${EXISTING_USERNAME:-admin}")}"
   INSTALL_PASSWORD="$(prompt_password)"
   write_environment "${INSTALL_USERNAME}" "${INSTALL_PASSWORD}" "${ROOT_PATH}"
@@ -202,7 +217,7 @@ else
 fi
 
 # Read the configured root without executing the environment file.
-ROOT_PATH="$(sed -n 's/^FILEDUDE_ROOT=//p' "${ENV_FILE}" | head -n 1)"
+ROOT_PATH="$(env_value FILEDUDE_ROOT)"
 [[ -n ${ROOT_PATH} && ${ROOT_PATH} != "/" ]] || fail "Invalid FILEDUDE_ROOT in ${ENV_FILE}."
 
 if [[ -z ${SERVICE_ACCOUNT} ]]; then
@@ -296,7 +311,9 @@ mapfile -t OLD_RELEASES < <(find "${APP_HOME}/releases" -mindepth 1 -maxdepth 1 
 if ((${#OLD_RELEASES[@]})); then rm -rf -- "${OLD_RELEASES[@]}"; fi
 
 say "Installation complete"
-printf 'Listening on: http://%s:%s\n' "${BIND_ADDRESS}" "${PORT}"
+LISTEN_HOST="${BIND_ADDRESS}"
+[[ ${LISTEN_HOST} == *:* ]] && LISTEN_HOST="[${LISTEN_HOST}]"
+printf 'Listening on: http://%s:%s\n' "${LISTEN_HOST}" "${PORT}"
 printf 'Status: systemctl status filesdude\n'
 printf 'Logs: journalctl -u filesdude -f\n'
 printf 'Update later: sudo filesdude-update\n'
