@@ -15,6 +15,8 @@ FilesDude is a secure, self-hosted web file manager designed for a Proxmox host,
 - Share links: let anyone with a private link download a file (or a folder as a ZIP) without signing in, for 1 hour to 30 days and optionally a limited number of downloads; links can be revoked at any time, follow renames and moves, and every download is audited
 - Compress selected items into `.zip` or `.tar.gz` and extract `.zip`, `.tar`, `.tar.gz`, and `.tgz` archives into a new folder, as background jobs with progress and cancel; extraction refuses archives with absolute or `..` paths, never creates links or devices, and stops before filling the disk
 - Inline previews for text, code, JSON, images, PDF, audio, and video; media uses byte-range streaming
+- Image thumbnails in grid view (JPEG, PNG, GIF, WebP, and AVIF up to 64 MB), generated on the server with EXIF rotation applied and all metadata stripped, and cached in the state directory
+- SHA-256 and MD5 checksums in Properties, calculated automatically for files up to 64 MB, with copy buttons and a field to compare against an expected checksum
 - POSIX `chmod` and numeric `chown` for one or many items
 - Bulk rename with find/replace, regular expressions, prefix, suffix, sequential numbering, live conflict detection, and two-phase application
 - Recursive filename search, disk usage, owner/group display, symlink escape warnings, and a cached whole-tree largest-files view from the clickable Storage card
@@ -252,7 +254,7 @@ The safest default set is already included. These are strong next additions when
 - OIDC or WebAuthn/passkeys for multi-user sign-in and two-factor authentication
 - Role-based roots and read-only accounts instead of one server administrator
 - Automatic retention (age-based purging) for protected trash
-- Content search, thumbnails, checksums, duplicate detection, and media metadata
+- Content search, duplicate detection, video thumbnails, and media metadata
 - Antivirus scanning and upload quarantine for environments with untrusted uploaders
 - ZFS snapshot shortcuts and a version-history browser for Proxmox storage
 - Background jobs with progress for very large copies and moves (archives already run this way)

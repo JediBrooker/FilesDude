@@ -63,6 +63,15 @@ export async function readJsonBody<T>(request: Request, maxBytes = 64 * 1024): P
   }
 }
 
+/**
+ * For GET endpoints that do real work (thumbnails, checksums): refuse requests another site or
+ * origin started, such as an <img> on another port of the same host, which SameSite cookies allow.
+ */
+export function assertSameOriginFetch(request: Request) {
+  const site = request.headers.get("sec-fetch-site");
+  if (site && site !== "same-origin" && site !== "none") throw new AppError("Request verification failed", 403, "CROSS_SITE_REQUEST");
+}
+
 export function assertMutationRequest(request: Request) {
   if (request.headers.get("x-filedude-request") !== "1") {
     throw new AppError("Request verification failed", 403, "CSRF_FAILED");
