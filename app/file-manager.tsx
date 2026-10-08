@@ -67,7 +67,7 @@ import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState
 import { createPortal } from "react-dom";
 import { moveCursor, selectionRange } from "@/lib/selection";
 import { INITIAL_DIRECTION, nextSort, parseSort, sortEntries, type SortKey, type SortState } from "@/lib/sort";
-import type { ShareLink } from "@/lib/types";
+import type { ContentSearchHit, ContentSearchResult, ShareLink } from "@/lib/types";
 import type { ArchiveFormat, BulkRenameRule, DeleteResult, DiskInfo, FileEntry, JobState, TransferResult, IdentityOption, LargestFilesProgress, LargestFilesReady, LargestFilesResult, OwnershipPair, RenamePreview, TrashItem, TrashListing, TrashRestoreResult, UploadOwnershipOptions, UploadOwnershipPreference } from "@/lib/types";
 
 type AuthState = {
@@ -372,6 +372,12 @@ export function FileManager() {
   const [showHidden, setShowHidden] = useState(false);
   const [search, setSearch] = useState("");
   const [activeSearch, setActiveSearch] = useState("");
+  const [searchMode, setSearchMode] = useState<"names" | "contents">("names");
+  const [matchCase, setMatchCase] = useState(false);
+  // Bumped on every search submit, so pressing Enter again re-runs the same content search.
+  const [searchRun, setSearchRun] = useState(0);
+  const [contentSearch, setContentSearch] = useState<{ status: "running" | "done" | "error"; result?: ContentSearchResult; error?: string } | null>(null);
+  const contentControllerRef = useRef<AbortController | null>(null);
   const [view, setView] = useState<ViewMode>("list");
   const [sort, setSort] = useState<SortState>(() => (typeof window !== "undefined" ? storedSort() : parseSort(null)));
   const [loading, setLoading] = useState(false);
@@ -430,7 +436,8 @@ export function FileManager() {
     setLoading(true);
     try {
       const params = new URLSearchParams({ path: pathValue, hidden: String(showHidden) });
-      if (query) params.set("search", query);
+      // A content search shows its own results; the folder listing underneath stays unfiltered.
+      if (query && searchMode === "names") params.set("search", query);
       const result = await requestJson<{ entries: FileEntry[]; path: string; disk: DiskInfo }>(`/api/fs?${params}`);
       setEntries(result.entries);
       setDisk(result.disk);
@@ -444,7 +451,30 @@ export function FileManager() {
     } finally {
       setLoading(false);
     }
-  }, [activeSearch, auth.authenticated, currentPath, notify, refreshAuth, showHidden]);
+  }, [activeSearch, auth.authenticated, currentPath, notify, refreshAuth, searchMode, showHidden]);
+
+  // Runs a content search whenever its inputs change, cancelling any search still in progress.
+  useEffect(() => {
+    contentControllerRef.current?.abort();
+    if (!auth.authenticated || searchMode !== "contents" || !activeSearch) return;
+    const controller = new AbortController();
+    contentControllerRef.current = controller;
+    const timer = window.setTimeout(async () => {
+      setContentSearch({ status: "running" });
+      try {
+        const params = new URLSearchParams({ path: currentPath, q: activeSearch, hidden: String(showHidden) });
+        if (matchCase) params.set("case", "1");
+        const result = await requestJson<ContentSearchResult>(`/api/fs/search-content?${params}`, { signal: controller.signal });
+        if (!controller.signal.aborted) setContentSearch({ status: "done", result });
+      } catch (error) {
+        if ((error as Error).name !== "AbortError") setContentSearch({ status: "error", error: (error as Error).message });
+      }
+    }, 0);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [auth.authenticated, searchMode, activeSearch, currentPath, showHidden, matchCase, searchRun]);
 
   const loadFavorites = useCallback(async () => {
     if (!auth.authenticated) return;
@@ -466,7 +496,7 @@ export function FileManager() {
       if (auth.authenticated) void loadDirectory(currentPath, activeSearch);
     }, 0);
     return () => window.clearTimeout(timer);
-  }, [auth.authenticated, activeSearch, currentPath, showHidden]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [auth.authenticated, activeSearch, currentPath, showHidden, searchMode]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -1089,7 +1119,7 @@ export function FileManager() {
             <div>
               <div className="heading-kicker"><span className="status-dot" /> LIVE FILESYSTEM</div>
               <h1>{currentPath ? currentPath.split("/").at(-1) : "All files"}</h1>
-              <p>{activeSearch ? `${entries.length} search results` : `${entries.length} ${entries.length === 1 ? "item" : "items"}`}{showHidden ? " · hidden files shown" : ""}</p>
+              <p>{activeSearch && searchMode === "contents" ? (contentSearch?.result ? `${itemCount(contentSearch.result.hits.length).replace("item", "file")} containing “${contentSearch.result.query}”` : "Searching file contents…") : activeSearch ? `${entries.length} search results` : `${entries.length} ${entries.length === 1 ? "item" : "items"}`}{showHidden ? " · hidden files shown" : ""}</p>
             </div>
             <div className="primary-actions">
               <input ref={uploadRef} className="visually-hidden" type="file" multiple onChange={(event) => event.target.files && queueUpload(event.target.files)} />
@@ -1101,12 +1131,17 @@ export function FileManager() {
           </div>
 
           <div className="file-toolbar">
-            <form className="search-field" onSubmit={(event) => { event.preventDefault(); setActiveSearch(search.trim()); }}>
+            <form className="search-field" onSubmit={(event) => { event.preventDefault(); setActiveSearch(search.trim()); setSearchRun((run) => run + 1); }}>
               <Search size={17} />
-              <input ref={searchRef} value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search this folder…" aria-label="Search files" />
+              <input ref={searchRef} value={search} onChange={(event) => setSearch(event.target.value)} placeholder={searchMode === "contents" ? "Search text inside files…" : "Search names in this folder…"} aria-label="Search files" />
               {search && <button type="button" aria-label="Clear search" onClick={() => { setSearch(""); setActiveSearch(""); }}><X size={15} /></button>}
               <kbd>⌘K</kbd>
             </form>
+            <div className="search-mode" role="group" aria-label="Search in">
+              <button type="button" className={searchMode === "names" ? "active" : ""} aria-pressed={searchMode === "names"} onClick={() => setSearchMode("names")}>Names</button>
+              <button type="button" className={searchMode === "contents" ? "active" : ""} aria-pressed={searchMode === "contents"} onClick={() => setSearchMode("contents")}>Contents</button>
+              {searchMode === "contents" && <button type="button" className={`match-case ${matchCase ? "active" : ""}`} aria-pressed={matchCase} title="Match case" aria-label="Match case" onClick={() => setMatchCase(!matchCase)}>Aa</button>}
+            </div>
             <div className="toolbar-spacer" />
             <div className={`sort-control ${view === "grid" ? "grid-mode" : ""}`}>
               <select aria-label="Sort by" value={sort.key} onChange={(event) => { const key = event.target.value as SortKey; applySort({ key, direction: INITIAL_DIRECTION[key] }); }}>
@@ -1144,7 +1179,16 @@ export function FileManager() {
           )}
 
           <div className={`files-surface ${view === "grid" ? "grid-mode" : ""}`} onContextMenu={openBackgroundMenu}>
-            {loading && !entries.length ? <FileSkeleton /> : entries.length === 0 ? (
+            {searchMode === "contents" && activeSearch ? (
+              <ContentResults
+                state={contentSearch}
+                matchCase={matchCase}
+                onCancel={() => { contentControllerRef.current?.abort(); setActiveSearch(""); setSearch(""); setContentSearch(null); }}
+                onOpen={(hit) => setDialog({ kind: "preview", entry: hitEntry(hit) })}
+                onEdit={(hit) => setDialog({ kind: "edit", entry: hitEntry(hit) })}
+                onReveal={(hit) => navigate(parentOf(hit.path))}
+              />
+            ) : loading && !entries.length ? <FileSkeleton /> : entries.length === 0 ? (
               <EmptyState searching={Boolean(activeSearch)} onUpload={() => uploadRef.current?.click()} onNew={() => setDialog({ kind: "new" })} />
             ) : view === "list" ? (
               <FileTable
@@ -1410,6 +1454,72 @@ function GridPreview({ entry, onOpen }: { entry: FileEntry; onOpen: (entry: File
 function CheckBox({ checked, onChange, label }: { checked: boolean; onChange: (event: { shiftKey: boolean }) => void; label: string }) {
   // React fires a checkbox's change from its click event, which carries the shift key.
   return <label className="checkbox"><input type="checkbox" checked={checked} onChange={(event) => onChange({ shiftKey: (event.nativeEvent as MouseEvent).shiftKey === true })} aria-label={label} /><span>{checked && <Check size={12} strokeWidth={3} />}</span></label>;
+}
+
+// Enough of a FileEntry for the preview and editor dialogs.
+function hitEntry(hit: ContentSearchHit): FileEntry {
+  return { name: hit.name, path: hit.path, type: "file", size: hit.size, modified: hit.modified, created: hit.modified, mode: "", uid: 0, gid: 0, owner: "", group: "", mime: hit.mime, hidden: hit.name.startsWith(".") };
+}
+
+// Marks each occurrence using the same literal, Unicode-aware match as the server.
+function highlight(text: string, query: string, matchCase: boolean): ReactNode[] {
+  if (!query) return [text];
+  const pattern = new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), matchCase ? "gu" : "giu");
+  const parts: ReactNode[] = [];
+  let from = 0;
+  for (const found of text.matchAll(pattern)) {
+    if (found.index > from) parts.push(text.slice(from, found.index));
+    parts.push(<mark key={found.index}>{found[0]}</mark>);
+    from = found.index + found[0].length;
+  }
+  parts.push(text.slice(from));
+  return parts;
+}
+
+const SEARCH_STOP_REASONS: Record<NonNullable<ContentSearchResult["stoppedBy"]>, string> = {
+  results: "Showing 200 of the matching files.",
+  files: "Stopped after searching 20,000 files.",
+  bytes: "Stopped after reading 256 MB.",
+  time: "Stopped after 15 seconds.",
+};
+
+function ContentResults({ state, matchCase, onCancel, onOpen, onEdit, onReveal }: {
+  state: { status: "running" | "done" | "error"; result?: ContentSearchResult; error?: string } | null;
+  matchCase: boolean;
+  onCancel: () => void;
+  onOpen: (hit: ContentSearchHit) => void;
+  onEdit: (hit: ContentSearchHit) => void;
+  onReveal: (hit: ContentSearchHit) => void;
+}) {
+  if (!state || state.status === "running") {
+    return <div className="storage-scan-state content-search-state"><LoaderCircle className="spin" size={25} /><strong>Searching inside files…</strong><span>Text files under this folder, up to 15 seconds.</span><button className="button secondary" onClick={onCancel}>Cancel</button></div>;
+  }
+  if (state.status === "error" || !state.result) {
+    return <div className="storage-scan-state error content-search-state"><CircleAlert size={25} /><strong>The search didn&apos;t finish</strong><span>{state.error}</span></div>;
+  }
+  const { result } = state;
+  const summary = `Searched ${result.scannedFiles.toLocaleString()} text ${result.scannedFiles === 1 ? "file" : "files"} (${formatBytes(result.scannedBytes)}) in ${(result.durationMs / 1000).toFixed(1)} s${result.skippedFiles ? ` · ${result.skippedFiles.toLocaleString()} skipped (binary, over 5 MB, or unreadable)` : ""}.`;
+  return (
+    <div className="content-results">
+      {result.hits.length === 0
+        ? <div className="empty-state"><div className="empty-icon"><Search size={27} /></div><h2>No files contain “{result.query}”</h2><p>{matchCase ? "Try turning off Match case, or search another folder." : "Try different words, or search another folder."}</p></div>
+        : result.hits.map((hit) => {
+          const entry = hitEntry(hit);
+          return (
+            <article key={hit.path} className="content-hit">
+              <header>
+                <span className="file-icon file">{fileIcon(entry, 17)}</span>
+                <div><button className="file-name" title={`/${hit.path}`} onClick={() => onOpen(hit)}>{hit.name}</button><small>{folderLabel(parentOf(hit.path))} · {hit.matchCount} matching {hit.matchCount === 1 ? "line" : "lines"}</small></div>
+                {isEditable(entry) && <button className="icon-button" title="Edit" aria-label={`Edit ${hit.name}`} onClick={() => onEdit(hit)}><FilePenLine size={15} /></button>}
+                <button className="icon-button" title="Open containing folder" aria-label={`Open folder containing ${hit.name}`} onClick={() => onReveal(hit)}><FolderOpen size={15} /></button>
+              </header>
+              <ol>{hit.matches.map((match) => <li key={match.line}><span>{match.line}</span><code>{highlight(match.text, result.query, matchCase)}</code></li>)}</ol>
+            </article>
+          );
+        })}
+      <p className="content-summary">{summary}{result.stoppedBy ? ` ${SEARCH_STOP_REASONS[result.stoppedBy]} Search a smaller folder to see everything.` : ""}</p>
+    </div>
+  );
 }
 
 function EmptyState({ searching, onUpload, onNew }: { searching: boolean; onUpload: () => void; onNew: () => void }) {

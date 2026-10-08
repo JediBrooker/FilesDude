@@ -19,6 +19,7 @@ FilesDude is a secure, self-hosted web file manager designed for a Proxmox host,
 - SHA-256 and MD5 checksums in Properties, calculated automatically for files up to 64 MB, with copy buttons and a field to compare against an expected checksum
 - POSIX `chmod` and numeric `chown` for one or many items
 - Bulk rename with find/replace, regular expressions, prefix, suffix, sequential numbering, live conflict detection, and two-phase application
+- Search inside files: switch the search box to **Contents** to find text in files under the current folder, with matching lines, line numbers, highlighting, and an optional match-case toggle. It reads text files up to 5 MB (skipping binary files, symlinks, and FilesDude's internal folders) and stops at 20,000 files, 256 MB, 15 seconds, or 200 matching files, saying when it did
 - Recursive filename search, disk usage, owner/group display, symlink escape warnings, and a cached whole-tree largest-files view from the clickable Storage card
 - Filter largest files by a minimum size, load 100, 250, or 500 more at a time, export the currently loaded results to CSV, and move one or many selected files to protected trash (or permanently delete them after confirmation)
 - Protected trash by default with a Trash view for restoring items to their original folders, deleting them forever, or emptying the trash; persistent favourites; and a JSON Lines audit log inside the protected state directory
@@ -254,7 +255,7 @@ The safest default set is already included. These are strong next additions when
 - OIDC or WebAuthn/passkeys for multi-user sign-in and two-factor authentication
 - Role-based roots and read-only accounts instead of one server administrator
 - Automatic retention (age-based purging) for protected trash
-- Content search, duplicate detection, video thumbnails, and media metadata
+- Duplicate detection, video thumbnails, media metadata, and an index for searching file contents on very large trees
 - Antivirus scanning and upload quarantine for environments with untrusted uploaders
 - ZFS snapshot shortcuts and a version-history browser for Proxmox storage
 - Background jobs with progress for very large copies and moves (archives already run this way)
