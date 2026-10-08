@@ -59,7 +59,7 @@ export async function reservedPathCheck() {
 type AnchoredDirectory = { handle: FileHandle; base: string; real: string; stat: Stats };
 
 async function openDirectory(location: string, expected: string, isReserved: (opened: string) => boolean): Promise<AnchoredDirectory> {
-  const handle = await fsp.open(location, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  const handle = await fsp.open(location, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const { openedPath, stat } = await verifyFileHandleWithinRoot(handle, expected);
     if (isReserved(openedPath)) throw new AppError("That folder is reserved by FilesDude", 403, "RESERVED_PATH");
@@ -116,7 +116,7 @@ export function appendFileAndWait(archive: Archiver, stream: Readable, name: str
  * verifying every opened entry is inside the root and leaving out anything `skip` matches.
  * Children are opened relative to the directory's own descriptor. Takes ownership of `handle`.
  */
-export async function appendDirectory(archive: Archiver, handle: FileHandle, openedPath: string, archivePath: string, skip: (openedPath: string) => boolean, signal?: AbortSignal) {
+export async function appendDirectory(archive: Archiver, handle: FileHandle, openedPath: string, archivePath: string, skip: (openedPath: string) => boolean, signal?: AbortSignal, storeLinks = true) {
   const directoryPath = ON_LINUX ? `/proc/self/fd/${handle.fd}` : openedPath;
   let directory;
   try {
@@ -133,6 +133,7 @@ export async function appendDirectory(archive: Archiver, handle: FileHandle, ope
       const childArchivePath = path.posix.join(archivePath, entry.name);
 
       if (entry.isSymbolicLink()) {
+        if (!storeLinks) continue;
         try {
           archive.symlink(childArchivePath, await fsp.readlink(childPath));
         } catch {
@@ -141,7 +142,8 @@ export async function appendDirectory(archive: Archiver, handle: FileHandle, ope
         continue;
       }
 
-      const flags = constants.O_RDONLY | constants.O_NOFOLLOW | (entry.isDirectory() ? constants.O_DIRECTORY : 0);
+      // O_NONBLOCK keeps a FIFO from blocking the open; anything not a file or folder is skipped below.
+      const flags = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK | (entry.isDirectory() ? constants.O_DIRECTORY : 0);
       let childHandle: FileHandle | null = null;
       try {
         childHandle = await fsp.open(childPath, flags);
@@ -156,7 +158,7 @@ export async function appendDirectory(archive: Archiver, handle: FileHandle, ope
           archive.append(Buffer.alloc(0), { name: `${childArchivePath}/`, type: "directory", stats: verified.stat });
           const nested = childHandle;
           childHandle = null;
-          await appendDirectory(archive, nested, verified.openedPath, childArchivePath, skip, signal);
+          await appendDirectory(archive, nested, verified.openedPath, childArchivePath, skip, signal, storeLinks);
         } else if (verified.stat.isFile()) {
           const stream = childHandle.createReadStream();
           childHandle = null;
@@ -214,7 +216,7 @@ export async function compressEntries(paths: string[], destinationPath: string, 
         sources.push({ name, link: await fsp.readlink(absolute) });
         continue;
       }
-      const handle = await fsp.open(absolute, constants.O_RDONLY | constants.O_NOFOLLOW | (stat.isDirectory() ? constants.O_DIRECTORY : 0));
+      const handle = await fsp.open(absolute, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK | (stat.isDirectory() ? constants.O_DIRECTORY : 0));
       sources.push({ name, handle });
       const verified = await verifyFileHandleWithinRoot(handle, absolute);
       if (isReserved(verified.openedPath)) throw new AppError("That path is reserved by FilesDude", 403, "RESERVED_PATH");

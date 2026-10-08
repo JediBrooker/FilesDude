@@ -20,7 +20,15 @@ import {
 } from "@/lib/files";
 import type { BulkRenameRule } from "@/lib/types";
 import { rewriteFavoritePaths } from "@/lib/favorites";
+import { rewriteSharePaths } from "@/lib/shares";
 import { config } from "@/lib/config";
+
+// Favourites and share links follow items that are renamed or moved, and drop deleted ones.
+async function rewriteLinkedPaths(changes: Array<{ from: string; to?: string }>, username: string) {
+  await rewriteFavoritePaths(changes);
+  const revoked = await rewriteSharePaths(changes);
+  if (revoked.length) await audit("share.revoke", { username, ids: revoked, reason: "item deleted" });
+}
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -63,6 +71,7 @@ export async function POST(request: Request) {
   try {
     assertMutationRequest(request);
     const session = await requireSession(request);
+    const rewriteLinked = (changes: Array<{ from: string; to?: string }>) => rewriteLinkedPaths(changes, session.username);
     const parsed = await readJsonBody<unknown>(request, 16 * 1024 * 1024);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new AppError("Request body is invalid", 400, "INVALID_REQUEST");
     const body = parsed as ActionBody;
@@ -83,14 +92,14 @@ export async function POST(request: Request) {
       case "rename":
         if (!body.path || !body.name) throw new AppError("Path and new name are required");
         operationResult = await renameEntry(body.path, body.name);
-        await rewriteFavoritePaths([{ from: body.path, to: (operationResult as { path: string }).path }]);
+        await rewriteLinked([{ from: body.path, to: (operationResult as { path: string }).path }]);
         break;
       case "delete":
         if (body.requireTrash && (body.permanent || !config.trashEnabled)) {
           throw new AppError("Protected trash is turned off, so nothing was deleted", 409, "TRASH_DISABLED");
         }
         operationResult = await deleteEntries(paths, Boolean(body.permanent));
-        await rewriteFavoritePaths(paths.map((favoritePath) => ({ from: favoritePath })));
+        await rewriteLinked(paths.map((favoritePath) => ({ from: favoritePath })));
         break;
       case "copy":
       case "move": {
@@ -101,11 +110,11 @@ export async function POST(request: Request) {
         } catch (error) {
           // Keep favourites pointing at items that moved before the failure.
           if (error instanceof PartialTransferError && body.action === "move") {
-            await rewriteFavoritePaths(error.completed.map((item) => ({ from: item.source, to: item.path })));
+            await rewriteLinked(error.completed.map((item) => ({ from: item.source, to: item.path })));
           }
           throw error;
         }
-        if (body.action === "move") await rewriteFavoritePaths(transferred.map((item) => ({ from: item.source, to: item.path })));
+        if (body.action === "move") await rewriteLinked(transferred.map((item) => ({ from: item.source, to: item.path })));
         operationResult = transferred;
         break;
       }
@@ -123,7 +132,7 @@ export async function POST(request: Request) {
           ? await applyBulkRename(paths, body.rule)
           : await previewBulkRename(paths, body.rule);
         if (body.apply) {
-          await rewriteFavoritePaths((operationResult as Array<{ source: string; to: string; changed: boolean }>).filter((item) => item.changed).map((item) => ({ from: item.source, to: [item.source.split("/").slice(0, -1).join("/"), item.to].filter(Boolean).join("/") })));
+          await rewriteLinked((operationResult as Array<{ source: string; to: string; changed: boolean }>).filter((item) => item.changed).map((item) => ({ from: item.source, to: [item.source.split("/").slice(0, -1).join("/"), item.to].filter(Boolean).join("/") })));
         }
         break;
       case "details":

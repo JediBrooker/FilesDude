@@ -285,6 +285,18 @@ kbd { padding: 3px 5px; border: 1px solid var(--line); border-bottom-width: 2px;
 .login-foot { display: flex; align-items: flex-start; gap: 7px; margin-top: 22px; padding-top: 17px; border-top: 1px solid var(--line); color: var(--ink-faint); font-size: 9px; line-height: 1.5; }
 .login-foot svg { flex: 0 0 auto; color: var(--brand); }
 .login-meta { position: absolute; z-index: 1; bottom: 14px; display: flex; align-items: center; gap: 7px; margin: 0; color: var(--ink-faint); font-size: 9px; }
+.share-card { display: grid; gap: 18px; }
+.share-card .login-brand { padding-bottom: 18px; }
+.share-item { display: flex; min-width: 0; align-items: center; gap: 12px; padding: 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel-soft); }
+.share-item .file-icon { width: 44px; height: 44px; border-radius: 11px; }
+.share-item > div { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
+.share-item strong { overflow: hidden; font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }
+.share-item small { color: var(--ink-soft); font-size: 11px; }
+.share-meta { display: flex; align-items: center; gap: 7px; margin: 0; color: var(--ink-faint); font-size: 10px; }
+.share-missing { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 18px 6px 8px; color: var(--ink-soft); text-align: center; }
+.share-missing svg { color: var(--ink-faint); }
+.share-missing strong { color: var(--ink); font-size: 14px; }
+.share-missing span { font-size: 11px; line-height: 1.5; }
 .configuration-warning { display: flex; gap: 10px; padding: 14px; border: 1px solid color-mix(in srgb, var(--warning) 30%, var(--line)); border-radius: 10px; background: var(--warning-soft); color: var(--warning); }
 .configuration-warning svg { flex: 0 0 auto; }
 .configuration-warning p { margin: 5px 0 0; font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; font-size: 9px; }
@@ -540,6 +552,19 @@ kbd { padding: 3px 5px; border: 1px solid var(--line); border-bottom-width: 2px;
 .audio-preview audio { width: min(440px, 80%); }
 
 .toast { position: fixed; z-index: 200; right: 22px; bottom: 22px; display: flex; max-width: min(390px, calc(100vw - 44px)); min-height: 44px; align-items: center; gap: 9px; padding: 10px 14px; border: 1px solid color-mix(in srgb, var(--brand) 30%, var(--line)); border-radius: 10px; background: var(--panel); color: var(--brand-strong); box-shadow: var(--shadow); font-size: 10px; font-weight: 700; animation: toast-in .2s ease both; }
+.shared-badge { display: inline-flex; flex: 0 0 auto; color: var(--brand); }
+.nav-count { min-width: 18px; padding: 1px 6px; border-radius: 999px; background: var(--brand-soft); color: var(--brand-strong); font-size: 9px; font-style: normal; font-weight: 800; text-align: center; }
+.share-links { display: grid; gap: 8px; margin: 14px 0 4px; }
+.share-links-title { margin: 0; color: var(--ink-soft); font-size: 10px; font-weight: 700; }
+.share-link-row { display: grid; gap: 7px; padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel-soft); }
+.share-link-info { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
+.share-link-info strong { display: flex; min-width: 0; align-items: center; gap: 6px; overflow: hidden; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.share-link-info strong small { color: var(--ink-faint); font-size: 9px; font-weight: 600; }
+.share-link-info > span { color: var(--ink-soft); font-size: 9px; }
+.share-link-actions { display: flex; min-width: 0; align-items: center; gap: 6px; }
+.share-link-actions input { min-width: 0; height: 32px; flex: 1; padding: 0 9px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--panel); color: var(--ink); font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; font-size: 9px; }
+.share-link-actions .button { min-height: 32px; padding: 0 10px; font-size: 9px; }
+.button.danger-text { color: var(--danger); }
 .job-panel { position: fixed; z-index: 190; right: 22px; bottom: 78px; display: grid; width: min(330px, calc(100vw - 44px)); gap: 9px; padding: 11px 12px; border: 1px solid color-mix(in srgb, var(--brand) 30%, var(--line)); border-radius: 11px; background: var(--panel); box-shadow: var(--shadow); }
 .job-panel-head { display: flex; min-width: 0; align-items: center; gap: 9px; }
 .job-panel-head .file-icon { width: 29px; height: 29px; }
@@ -588,6 +613,8 @@ kbd { padding: 3px 5px; border: 1px solid var(--line); border-bottom-width: 2px;
   .workspace-heading { align-items: flex-start; }
   .primary-actions .button { padding: 0 11px; }
   .favorite-location span, .clipboard-chip .button span { display: none; }
+  .share-link-actions { flex-wrap: wrap; }
+  .share-link-actions input { flex-basis: 100%; }
   .file-toolbar { flex-wrap: wrap; }
   .sort-control { display: flex; }
   .search-field { order: 2; width: 100%; }

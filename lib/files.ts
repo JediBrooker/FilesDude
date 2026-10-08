@@ -352,18 +352,22 @@ export async function renameEntry(sourcePath: string, newName: string) {
   const target = path.join(path.dirname(source), validateName(newName));
   if (target === source) return toEntry(source);
   await safeResolve(relativeFromAbsolute(target), { mustExist: false });
-  try {
-    await fs.access(target);
-    const [sourceReal, targetReal] = await Promise.all([fs.realpath(source), fs.realpath(target)]);
-    if (sourceReal !== targetReal) throw new AppError("An item with that name already exists", 409, "NAME_CONFLICT");
-    const temporary = path.join(path.dirname(source), `.filedude-case-${crypto.randomUUID()}`);
-    await fs.rename(source, temporary);
-    await fs.rename(temporary, target);
-  } catch (error) {
-    if (error instanceof AppError) throw error;
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") await fs.rename(source, target);
-    else throw error;
+  // lstat, not access/realpath: a symlink must never be mistaken for the file it points to, and a
+  // dangling symlink at the target name still occupies it.
+  const existing = await fs.lstat(target).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  if (!existing) {
+    await fs.rename(source, target);
+    return toEntry(target);
   }
+  // On a case-insensitive filesystem a case-only rename finds the item itself under the new name.
+  const current = await fs.lstat(source);
+  if (existing.ino !== current.ino || existing.dev !== current.dev) throw new AppError("An item with that name already exists", 409, "NAME_CONFLICT");
+  const temporary = path.join(path.dirname(source), `.filedude-case-${crypto.randomUUID()}`);
+  await fs.rename(source, temporary);
+  await fs.rename(temporary, target);
   return toEntry(target);
 }
 

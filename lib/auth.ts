@@ -86,8 +86,8 @@ function cookieValue(request: Request, name: string) {
 export async function getSession(request: Request): Promise<{ username: string; credentialsVersion: number } | null> {
   if (configurationIssues().length) return null;
   const token = cookieValue(request, COOKIE);
-  const [payload, suppliedSignature] = token.split(".");
-  if (!payload || !suppliedSignature) return null;
+  const [payload, suppliedSignature, extra] = token.split(".");
+  if (!payload || !suppliedSignature || extra !== undefined || !/^[A-Za-z0-9_-]+$/.test(payload)) return null;
 
   const expectedSignature = signature(payload);
   const supplied = Buffer.from(suppliedSignature);
