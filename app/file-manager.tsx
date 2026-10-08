@@ -374,6 +374,8 @@ export function FileManager() {
   const [activeSearch, setActiveSearch] = useState("");
   const [searchMode, setSearchMode] = useState<"names" | "contents">("names");
   const [matchCase, setMatchCase] = useState(false);
+  // Bumped on every search submit, so pressing Enter again re-runs the same content search.
+  const [searchRun, setSearchRun] = useState(0);
   const [contentSearch, setContentSearch] = useState<{ status: "running" | "done" | "error"; result?: ContentSearchResult; error?: string } | null>(null);
   const contentControllerRef = useRef<AbortController | null>(null);
   const [view, setView] = useState<ViewMode>("list");
@@ -472,7 +474,7 @@ export function FileManager() {
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [auth.authenticated, searchMode, activeSearch, currentPath, showHidden, matchCase]);
+  }, [auth.authenticated, searchMode, activeSearch, currentPath, showHidden, matchCase, searchRun]);
 
   const loadFavorites = useCallback(async () => {
     if (!auth.authenticated) return;
@@ -1129,7 +1131,7 @@ export function FileManager() {
           </div>
 
           <div className="file-toolbar">
-            <form className="search-field" onSubmit={(event) => { event.preventDefault(); setActiveSearch(search.trim()); }}>
+            <form className="search-field" onSubmit={(event) => { event.preventDefault(); setActiveSearch(search.trim()); setSearchRun((run) => run + 1); }}>
               <Search size={17} />
               <input ref={searchRef} value={search} onChange={(event) => setSearch(event.target.value)} placeholder={searchMode === "contents" ? "Search text inside files…" : "Search names in this folder…"} aria-label="Search files" />
               {search && <button type="button" aria-label="Clear search" onClick={() => { setSearch(""); setActiveSearch(""); }}><X size={15} /></button>}
@@ -1459,22 +1461,23 @@ function hitEntry(hit: ContentSearchHit): FileEntry {
   return { name: hit.name, path: hit.path, type: "file", size: hit.size, modified: hit.modified, created: hit.modified, mode: "", uid: 0, gid: 0, owner: "", group: "", mime: hit.mime, hidden: hit.name.startsWith(".") };
 }
 
+// Marks each occurrence using the same literal, Unicode-aware match as the server.
 function highlight(text: string, query: string, matchCase: boolean): ReactNode[] {
-  const haystack = matchCase ? text : text.toLowerCase();
-  const needle = matchCase ? query : query.toLowerCase();
+  if (!query) return [text];
+  const pattern = new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), matchCase ? "gu" : "giu");
   const parts: ReactNode[] = [];
   let from = 0;
-  for (let index = haystack.indexOf(needle); needle && index >= 0; index = haystack.indexOf(needle, from)) {
-    if (index > from) parts.push(text.slice(from, index));
-    parts.push(<mark key={index}>{text.slice(index, index + needle.length)}</mark>);
-    from = index + needle.length;
+  for (const found of text.matchAll(pattern)) {
+    if (found.index > from) parts.push(text.slice(from, found.index));
+    parts.push(<mark key={found.index}>{found[0]}</mark>);
+    from = found.index + found[0].length;
   }
   parts.push(text.slice(from));
   return parts;
 }
 
 const SEARCH_STOP_REASONS: Record<NonNullable<ContentSearchResult["stoppedBy"]>, string> = {
-  results: "Showing the first 200 matching files.",
+  results: "Showing 200 of the matching files.",
   files: "Stopped after searching 20,000 files.",
   bytes: "Stopped after reading 256 MB.",
   time: "Stopped after 15 seconds.",

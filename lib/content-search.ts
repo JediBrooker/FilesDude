@@ -35,6 +35,42 @@ function snippet(line: string, index: number) {
   return `${start > 0 ? "…" : ""}${line.slice(start, end)}${end < line.length ? "…" : ""}`;
 }
 
+export function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * The lines of `text` that contain `pattern` (a global, literal pattern), found in one pass over
+ * the text rather than by splitting it into lines. Matching the original text with a
+ * case-insensitive pattern, instead of lowercasing it, keeps positions right for characters whose
+ * lowercase form is a different length.
+ */
+export function findMatchingLines(text: string, pattern: RegExp, keep: number) {
+  const matches: ContentMatch[] = [];
+  let matchCount = 0;
+  let line = 1;
+  let lineStart = 0;
+  pattern.lastIndex = 0;
+  for (let found = pattern.exec(text); found; found = pattern.exec(text)) {
+    for (let newline = text.indexOf("\n", lineStart); newline !== -1 && newline < found.index; newline = text.indexOf("\n", lineStart)) {
+      line += 1;
+      lineStart = newline + 1;
+    }
+    const lineEnd = text.indexOf("\n", found.index) === -1 ? text.length : text.indexOf("\n", found.index);
+    matchCount += 1;
+    if (matches.length < keep) {
+      const content = text.slice(lineStart, lineEnd);
+      matches.push({ line, text: snippet(content.endsWith("\r") ? content.slice(0, -1) : content, found.index - lineStart) });
+    }
+    if (lineEnd >= text.length) break;
+    // Count each line once, however many times it matches.
+    line += 1;
+    lineStart = lineEnd + 1;
+    pattern.lastIndex = lineStart;
+  }
+  return { matches, matchCount };
+}
+
 // Reads no more than the size measured at open, so a file growing meanwhile can't stretch the read.
 async function readMeasured(handle: FileHandle, size: number) {
   const buffer = Buffer.alloc(size);
@@ -54,8 +90,10 @@ export async function searchContents(
 ): Promise<ContentSearchResult> {
   const trimmed = query.trim();
   if (trimmed.length < 2 || trimmed.length > 200) throw new AppError("Search for 2 to 200 characters", 400, "INVALID_QUERY");
+  if (/[\r\n]/.test(trimmed)) throw new AppError("Search for text on a single line", 400, "INVALID_QUERY");
   const caseSensitive = Boolean(options.caseSensitive);
-  const needle = caseSensitive ? trimmed : trimmed.toLowerCase();
+  // A literal (escaped) pattern: no user-written regular expression ever runs.
+  const pattern = new RegExp(escapeRegExp(trimmed), caseSensitive ? "gu" : "giu");
   const limits = { ...CONTENT_SEARCH_LIMITS, ...options.limits };
   const isReserved = await reservedPathCheck();
   const started = Date.now();
@@ -80,6 +118,8 @@ export async function searchContents(
       skippedFiles += 1;
       return;
     }
+    // Any problem with one file (deleted mid-search, an unreadable or over-long path) skips that
+    // file rather than failing the whole search.
     try {
       const { openedPath, stat } = await verifyFileHandleWithinRoot(handle, expected);
       if (!stat.isFile() || isReserved(openedPath)) return;
@@ -99,20 +139,13 @@ export async function searchContents(
         skippedFiles += 1;
         return;
       }
-      const text = data.toString("utf8");
-      if (!(caseSensitive ? text : text.toLowerCase()).includes(needle)) return;
-      const matches: ContentMatch[] = [];
-      let matchCount = 0;
-      const lines = text.split("\n");
-      for (let index = 0; index < lines.length; index += 1) {
-        const line = lines[index].endsWith("\r") ? lines[index].slice(0, -1) : lines[index];
-        const position = (caseSensitive ? line : line.toLowerCase()).indexOf(needle);
-        if (position < 0) continue;
-        matchCount += 1;
-        if (matches.length < limits.matchesPerFile) matches.push({ line: index + 1, text: snippet(line, position) });
-      }
+      const { matches, matchCount } = findMatchingLines(data.toString("utf8"), pattern, limits.matchesPerFile);
+      if (!matchCount) return;
       hits.push({ path: relativeFromAbsolute(openedPath), name, size: stat.size, modified: stat.mtime.toISOString(), mime: getMime(name), matches, matchCount });
       if (hits.length >= limits.maxHits) stoppedBy = "results";
+    } catch (error) {
+      if (options.signal?.aborted) throw error;
+      skippedFiles += 1;
     } finally {
       await handle.close().catch(() => undefined);
     }
@@ -155,8 +188,17 @@ export async function searchContents(
           await walk(child, verified.openedPath, depth + 1);
         } else if (entry.isFile()) {
           await searchFile(location, expected, entry.name);
+          // Let other requests run between files, and enforce the time limit after each one.
+          await new Promise((resolve) => setImmediate(resolve));
+          if (Date.now() - started > limits.maxMs) {
+            stoppedBy = "time";
+            return;
+          }
         }
       }
+    } catch (error) {
+      if (options.signal?.aborted) throw error;
+      skippedFiles += 1;
     } finally {
       await directory.close().catch(() => undefined);
       await handle.close().catch(() => undefined);
