@@ -1,8 +1,6 @@
-import fs from "node:fs/promises";
 import type { Metadata } from "next";
 import { Clock, Download, File, Folder, FolderOpen, Link2Off } from "lucide-react";
-import { safeResolve } from "@/lib/files";
-import { resolveShareToken } from "@/lib/shares";
+import { openSharedItem, resolveShareToken } from "@/lib/shares";
 
 export const dynamic = "force-dynamic";
 export const metadata: Metadata = {
@@ -32,12 +30,11 @@ export default async function SharePage({ params }: { params: Promise<{ token: s
   let size: number | null = null;
   let available = false;
   if (share) {
-    try {
-      const stat = await fs.stat(await safeResolve(share.path));
-      available = share.type === "directory" ? stat.isDirectory() : stat.isFile();
-      size = stat.isFile() ? stat.size : null;
-    } catch {
-      available = false;
+    const opened = await openSharedItem(share);
+    if (opened) {
+      available = true;
+      size = opened.stat.isFile() ? opened.stat.size : null;
+      await opened.handle.close().catch(() => undefined);
     }
   }
 
