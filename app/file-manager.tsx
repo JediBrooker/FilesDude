@@ -126,6 +126,11 @@ const DRAG_TYPE = "application/x-filesdude-paths";
 const MENU_WIDTH = 224;
 const MULTI_ITEM_ACTIONS: EntryAction[] = ["cut", "clipboard", "copy", "move", "compress", "permissions", "ownership", "delete"];
 const ARCHIVE_NAME = /\.(zip|tar\.gz|tgz|tar)$/i;
+// Mirrors lib/thumbnails.ts: which images the server makes thumbnails for.
+const THUMBNAIL_MIME = new Set(["image/jpeg", "image/png", "image/gif", "image/webp", "image/avif"]);
+const MAX_THUMBNAIL_SOURCE_BYTES = 64 * 1024 * 1024;
+// Properties hashes files up to this size straight away; larger ones wait for a click.
+const AUTO_CHECKSUM_BYTES = 64 * 1024 * 1024;
 
 // Baked in at build time by next.config.ts.
 const APP_VERSION = process.env.NEXT_PUBLIC_FILESDUDE_VERSION || "dev";
@@ -1384,7 +1389,22 @@ function BackgroundMenu({ position, menuRef, folder, clipboardCount, canSelectAl
 }
 
 function FileGrid({ entries, selected, cursor, interactions, onToggle, onOpen }: { entries: FileEntry[]; selected: Set<string>; cursor: string | null; interactions: EntryInteractions; onToggle: (entry: FileEntry, options?: SelectOptions) => void; onOpen: (entry: FileEntry) => void }) {
-  return <div className="file-grid">{entries.map((entry) => <article key={entry.path} data-path={entry.path} className={`file-card ${selected.has(entry.path) ? "selected" : ""} ${cursor === entry.path ? "cursor" : ""} ${entryStateClasses(entry, interactions)}`} {...entryItemProps(entry, interactions)} onMouseDown={(event) => { if (event.shiftKey) event.preventDefault(); }} onClick={(event) => { if ((event.target as HTMLElement).closest("button,input,label")) return; onToggle(entry, { additive: event.metaKey || event.ctrlKey, range: event.shiftKey }); }} onDoubleClick={() => onOpen(entry)}><CheckBox checked={selected.has(entry.path)} onChange={(event) => onToggle(entry, { additive: true, range: event.shiftKey })} label={`Select ${entry.name}`} /><button className={`grid-icon ${entry.type}`} onClick={() => onOpen(entry)}>{fileIcon(entry, 34)}</button><button className="grid-name" onClick={() => onOpen(entry)}>{entry.name}</button><span>{entry.type === "directory" ? "Folder" : `${extension(entry.name)} · ${formatBytes(entry.size)}`}</span></article>)}</div>;
+  return <div className="file-grid">{entries.map((entry) => <article key={entry.path} data-path={entry.path} className={`file-card ${selected.has(entry.path) ? "selected" : ""} ${cursor === entry.path ? "cursor" : ""} ${entryStateClasses(entry, interactions)}`} {...entryItemProps(entry, interactions)} onMouseDown={(event) => { if (event.shiftKey) event.preventDefault(); }} onClick={(event) => { if ((event.target as HTMLElement).closest("button,input,label")) return; onToggle(entry, { additive: event.metaKey || event.ctrlKey, range: event.shiftKey }); }} onDoubleClick={() => onOpen(entry)}><CheckBox checked={selected.has(entry.path)} onChange={(event) => onToggle(entry, { additive: true, range: event.shiftKey })} label={`Select ${entry.name}`} /><GridPreview entry={entry} onOpen={onOpen} /><button className="grid-name" onClick={() => onOpen(entry)}>{entry.name}</button><span>{entry.type === "directory" ? "Folder" : `${extension(entry.name)} · ${formatBytes(entry.size)}`}</span></article>)}</div>;
+}
+
+// A thumbnail for images the server can preview, falling back to the type icon if it can't.
+function GridPreview({ entry, onOpen }: { entry: FileEntry; onOpen: (entry: FileEntry) => void }) {
+  const [failed, setFailed] = useState(false);
+  const thumbnail = !failed && entry.type === "file" && THUMBNAIL_MIME.has(entry.mime) && entry.size <= MAX_THUMBNAIL_SOURCE_BYTES;
+  return (
+    <button className={`grid-icon ${entry.type} ${thumbnail ? "has-thumbnail" : ""}`} onClick={() => onOpen(entry)} aria-label={`Open ${entry.name}`}>
+      {thumbnail
+        // The server already makes a small WebP thumbnail, so next/image would only optimize it twice.
+        // eslint-disable-next-line @next/next/no-img-element
+        ? <img src={`/api/fs/thumbnail?path=${encodePath(entry.path)}&v=${encodeURIComponent(`${entry.modified}-${entry.size}`)}`} alt="" loading="lazy" decoding="async" draggable={false} onError={() => setFailed(true)} />
+        : fileIcon(entry, 34)}
+    </button>
+  );
 }
 
 function CheckBox({ checked, onChange, label }: { checked: boolean; onChange: (event: { shiftKey: boolean }) => void; label: string }) {
@@ -2233,9 +2253,62 @@ function PreviewDialog({ entry, onClose }: { entry: FileEntry; onClose: () => vo
   return <div className="preview-overlay"><section className="preview-modal" role="dialog" aria-modal="true" aria-label={`Preview ${entry.name}`}><header><div><span className={`file-icon ${entry.type}`}>{fileIcon(entry)}</span><div><strong>{entry.name}</strong><span>{extension(entry.name)} · {formatBytes(entry.size)}</span></div></div><div><a className="button secondary" href={`/api/fs/download?path=${encodePath(entry.path)}`}><ArrowDownToLine size={16} /> Download</a><button className="icon-button" aria-label="Close preview" onClick={onClose}><X size={19} /></button></div></header><div className="preview-body">{preview}</div></section></div>;
 }
 
+type Checksums = { sha256: string; md5: string };
+
+function ChecksumPanel({ entry }: { entry: FileEntry }) {
+  const [state, setState] = useState<{ status: "idle" | "running" | "done" | "error"; sums?: Checksums; error?: string }>({ status: "idle" });
+  const [expected, setExpected] = useState("");
+  const [copied, setCopied] = useState("");
+  const controllerRef = useRef<AbortController | null>(null);
+
+  const calculate = useCallback(async () => {
+    controllerRef.current?.abort();
+    const controller = new AbortController();
+    controllerRef.current = controller;
+    setState({ status: "running" });
+    try {
+      const sums = await requestJson<Checksums>(`/api/fs/checksum?path=${encodePath(entry.path)}`, { signal: controller.signal });
+      setState({ status: "done", sums });
+    } catch (error) {
+      if ((error as Error).name !== "AbortError") setState({ status: "error", error: (error as Error).message });
+    }
+  }, [entry.path]);
+
+  // Small files are hashed straight away; closing the dialog stops any hashing in progress.
+  useEffect(() => {
+    const timer = window.setTimeout(() => { if (entry.size <= AUTO_CHECKSUM_BYTES) void calculate(); }, 0);
+    return () => {
+      window.clearTimeout(timer);
+      controllerRef.current?.abort();
+    };
+  }, [calculate, entry.size]);
+
+  const copy = async (label: string, value: string) => {
+    if (await copyText(value)) setCopied(label);
+  };
+  const wanted = expected.trim().toLowerCase();
+  const match = state.sums && wanted ? (wanted === state.sums.sha256 ? "SHA-256" : wanted === state.sums.md5 ? "MD5" : null) : undefined;
+
+  return (
+    <section className="checksum-panel" aria-label="Checksums">
+      <div className="checksum-heading"><strong>Checksums</strong>{state.status === "running" && <button type="button" className="text-button" onClick={() => { controllerRef.current?.abort(); setState({ status: "idle" }); }}>Cancel</button>}</div>
+      {state.status === "idle" && <button type="button" className="button secondary" onClick={() => void calculate()}>Calculate SHA-256 and MD5 ({formatBytes(entry.size)})</button>}
+      {state.status === "running" && <p className="checksum-note"><LoaderCircle className="spin" size={14} /> Reading {formatBytes(entry.size)}…</p>}
+      {state.status === "error" && <p className="checksum-note error"><CircleAlert size={14} /> {state.error} <button type="button" className="text-button" onClick={() => void calculate()}>Try again</button></p>}
+      {state.status === "done" && state.sums && <>
+        {([["SHA-256", state.sums.sha256], ["MD5", state.sums.md5]] as const).map(([label, value]) => (
+          <div key={label} className="checksum-row"><span>{label}</span><code title={value}>{value}</code><button type="button" className="icon-button" aria-label={`Copy ${label}`} title={copied === label ? "Copied" : `Copy ${label}`} onClick={() => void copy(label, value)}>{copied === label ? <Check size={14} /> : <Copy size={14} />}</button></div>
+        ))}
+        <label className="checksum-compare"><span>Compare with</span><input value={expected} onChange={(event) => setExpected(event.target.value)} placeholder="Paste an expected SHA-256 or MD5" spellCheck={false} /></label>
+        {match !== undefined && <p className={`checksum-note ${match ? "match" : "error"}`}>{match ? <><Check size={14} /> Matches the {match} checksum</> : <><CircleAlert size={14} /> Doesn&apos;t match either checksum</>}</p>}
+      </>}
+    </section>
+  );
+}
+
 function DetailsDialog({ entry, onClose }: { entry: FileEntry; onClose: () => void }) {
   const rows = [["Type", entry.type === "directory" ? "Folder" : entry.mime], ["Size", entry.type === "directory" ? "—" : `${formatBytes(entry.size)} (${entry.size.toLocaleString()} bytes)`], ["Location", `/${entry.path}`], ["Owner", `${entry.owner}:${entry.group} (${entry.uid}:${entry.gid})`], ["Permissions", entry.mode], ["Modified", new Date(entry.modified).toLocaleString()], ["Created", new Date(entry.created).toLocaleString()]];
-  return <Modal title="Item details" subtitle={entry.name} icon={<Info size={19} />} onClose={onClose}><div className="details-hero"><span className={`file-icon ${entry.type}`}>{fileIcon(entry, 32)}</span><div><strong>{entry.name}</strong><span>{entry.type === "directory" ? "Folder" : extension(entry.name)}</span></div></div><dl className="details-list">{rows.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{label === "Permissions" ? <code className="mode-chip">{value}</code> : value}</dd></div>)}</dl><div className="modal-actions"><button className="button primary" onClick={onClose}>Done</button></div></Modal>;
+  return <Modal title="Item details" subtitle={entry.name} icon={<Info size={19} />} onClose={onClose}><div className="details-hero"><span className={`file-icon ${entry.type}`}>{fileIcon(entry, 32)}</span><div><strong>{entry.name}</strong><span>{entry.type === "directory" ? "Folder" : extension(entry.name)}</span></div></div><dl className="details-list">{rows.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{label === "Permissions" ? <code className="mode-chip">{value}</code> : value}</dd></div>)}</dl>{entry.type === "file" && <ChecksumPanel entry={entry} />}<div className="modal-actions"><button className="button primary" onClick={onClose}>Done</button></div></Modal>;
 }
 
 function FormField({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {

@@ -14,7 +14,7 @@ const mimeTypes: Record<string, string> = {
   ".css": "text/css", ".html": "text/html", ".log": "text/plain",
   ".xml": "text/xml", ".yml": "text/yaml", ".yaml": "text/yaml", ".sh": "text/x-shellscript",
   ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
-  ".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml",
+  ".gif": "image/gif", ".webp": "image/webp", ".avif": "image/avif", ".svg": "image/svg+xml",
   ".pdf": "application/pdf", ".mp4": "video/mp4", ".webm": "video/webm",
   ".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg",
   ".zip": "application/zip", ".gz": "application/gzip", ".tar": "application/x-tar",
