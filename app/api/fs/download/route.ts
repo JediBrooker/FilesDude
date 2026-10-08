@@ -1,11 +1,9 @@
-import fsp from "node:fs/promises";
 import path from "node:path";
 import { PassThrough, Readable } from "node:stream";
 import { ZipArchive } from "archiver";
-import { appendDirectory } from "@/lib/archives";
+import { appendDirectory, reservedPathCheck } from "@/lib/archives";
 import { requireSession } from "@/lib/auth";
 import { audit } from "@/lib/audit";
-import { config } from "@/lib/config";
 import { acquireFilesystemLock, getMime, openVerifiedFile } from "@/lib/files";
 import { AppError, jsonError } from "@/lib/http";
 
@@ -44,9 +42,8 @@ export async function GET(request: Request) {
           releaseFilesystem();
           void (async () => {
             try {
-              const stateDirectory = await fsp.realpath(config.stateDir).catch(() => path.resolve(config.stateDir));
               archive.append(Buffer.alloc(0), { name: `${name}/`, type: "directory", stats: stat });
-              await appendDirectory(archive, handle, openedPath, name, (opened) => opened === stateDirectory || opened.startsWith(`${stateDirectory}${path.sep}`));
+              await appendDirectory(archive, handle, openedPath, name, await reservedPathCheck());
               await archive.finalize();
             } catch (error) {
               output.destroy(error as Error);

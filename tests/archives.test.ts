@@ -163,6 +163,55 @@ test("a tar symlink entry is skipped and an internal folder name is refused", as
   });
 });
 
+test("extracted content gets normal permissions only after extraction completes", async () => {
+  await withTempRoot(async (root) => {
+    await tarFile(path.join(root, "perm.tar"), [{ name: "a/b/c.txt", body: "c" }]);
+    await extractArchive("perm.tar", noProgress, live());
+    const mode = async (relative: string) => (await fs.stat(path.join(root, relative))).mode & 0o777;
+    assert.equal(await mode("perm"), 0o750);
+    assert.equal(await mode("perm/a"), 0o750);
+    assert.equal(await mode("perm/a/b"), 0o750);
+    assert.equal(await mode("perm/a/b/c.txt"), 0o640);
+  });
+});
+
+const runningAsRoot = typeof process.getuid === "function" && process.getuid() === 0;
+
+test("output takes the owner of the folder it is created in when running as root", { skip: !runningAsRoot && "needs root" }, async () => {
+  await withTempRoot(async (root) => {
+    await fs.mkdir(path.join(root, "shared"));
+    await fs.chown(path.join(root, "shared"), 4242, 4343);
+    await tarFile(path.join(root, "shared", "bundle.tar"), [{ name: "docs/a.txt", body: "a" }]);
+    await extractArchive("shared/bundle.tar", noProgress, live());
+    for (const relative of ["shared/bundle", "shared/bundle/docs", "shared/bundle/docs/a.txt"]) {
+      const stat = await fs.stat(path.join(root, relative));
+      assert.deepEqual([stat.uid, stat.gid], [4242, 4343], relative);
+    }
+    const archive = await compressEntries(["shared/bundle"], "shared", "again", "zip", noProgress, live());
+    const stat = await fs.stat(path.join(root, archive.path));
+    assert.deepEqual([stat.uid, stat.gid], [4242, 4343]);
+  });
+});
+
+test("archives nested more deeply than the limit are refused", async () => {
+  await withTempRoot(async (root) => {
+    await tarFile(path.join(root, "deep.tar"), [{ name: `${"d/".repeat(70)}file.txt`, body: "x" }]);
+    await assert.rejects(extractArchive("deep.tar", noProgress, live()), /more deeply than FilesDude will extract/);
+    assert.deepEqual(await fs.readdir(root), ["deep.tar"]);
+  });
+});
+
+test("compression leaves out FilesDude's internal folders anywhere in the tree", async () => {
+  await withTempRoot(async (root) => {
+    await fs.mkdir(path.join(root, "project", "sub", ".filedude"), { recursive: true });
+    await fs.writeFile(path.join(root, "project", "sub", ".filedude", "secret.json"), "{}");
+    await fs.writeFile(path.join(root, "project", "sub", "keep.txt"), "keep");
+    const archive = await compressEntries(["project"], "", "project", "tar.gz", noProgress, live());
+    await extractArchive(archive.path, noProgress, live());
+    assert.deepEqual(await tree(path.join(root, "project (2)")), ["project/", "project/sub/", "project/sub/keep.txt=keep"]);
+  });
+});
+
 test("extraction stops at the entry and disk-space limits and cleans up", async () => {
   await withTempRoot(async (root) => {
     await tarFile(path.join(root, "many.tar"), [{ name: "a", body: "1" }, { name: "b", body: "2" }, { name: "c", body: "3" }]);
