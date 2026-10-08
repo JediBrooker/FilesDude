@@ -1,5 +1,5 @@
 import fs from "node:fs/promises";
-import type { Dirent } from "node:fs";
+import { constants, type Dirent } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
@@ -131,9 +131,11 @@ export async function verifyFileHandleWithinRoot(handle: FileHandle, absolute: s
   return { openedPath, stat: await handle.stat() };
 }
 
-export async function openVerifiedFile(relativePath: string, flags: string | number = "r") {
+// O_NONBLOCK keeps a FIFO or device from blocking the open (which may run under the global lock);
+// callers then refuse anything that is not a regular file or folder.
+export async function openVerifiedFile(relativePath: string, access: "read" | "write" = "read") {
   const absolute = await safeResolve(relativePath);
-  const handle = await fs.open(absolute, flags);
+  const handle = await fs.open(absolute, (access === "write" ? constants.O_RDWR : constants.O_RDONLY) | constants.O_NONBLOCK | constants.O_NOCTTY);
   try {
     const { openedPath, stat } = await verifyFileHandleWithinRoot(handle, absolute);
     return { absolute, handle, openedPath, stat };
@@ -725,7 +727,7 @@ export async function writeTextFile(relativePath: string, content: string) {
   if (Buffer.byteLength(content, "utf8") > maxBytes) {
     throw new AppError("Text editing is limited to 2 MB per file", 413, "EDIT_TOO_LARGE");
   }
-  const { absolute, handle, stat } = await openVerifiedFile(relativePath, "r+");
+  const { absolute, handle, stat } = await openVerifiedFile(relativePath, "write");
   try {
     if (!stat.isFile()) throw new AppError("Only files can be edited", 400, "NOT_A_FILE");
     const mime = getMime(absolute);

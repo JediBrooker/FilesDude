@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -8,7 +9,8 @@ import sharp from "sharp";
 import { createSession } from "../lib/auth";
 import { config } from "../lib/config";
 import { getCredentials } from "../lib/credentials";
-import { thumbnailFor } from "../lib/thumbnails";
+import { withFilesystemLock } from "../lib/files";
+import { looksLikeRasterImage, thumbnailFor } from "../lib/thumbnails";
 import { GET as checksum } from "../app/api/fs/checksum/route";
 
 function scrypt(password: string, salt: Buffer) {
@@ -38,22 +40,26 @@ async function withRoot<T>(run: (root: string, cookie: string) => Promise<T>) {
   }
 }
 
+const thumbnail = async (target: string) => (await thumbnailFor(target)).data!;
+const withinTime = <T,>(promise: Promise<T>, ms = 3_000) => Promise.race([promise, new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error(`did not finish within ${ms}ms`)), ms))]);
 const image = (width: number, height: number) => sharp({ create: { width, height, channels: 3, background: { r: 30, g: 120, b: 90 } } });
 
 test("thumbnails are small WebP previews, cached until the image changes", async () => {
   await withRoot(async (root) => {
     await image(2000, 1000).png().toFile(path.join(root, "wide.png"));
-    const first = await thumbnailFor("wide.png");
+    const first = await thumbnail("wide.png");
     const meta = await sharp(first).metadata();
     assert.equal(meta.format, "webp");
     assert.deepEqual([meta.width, meta.height], [320, 160]);
     const cacheFiles = await fs.readdir(path.join(config.stateDir, "thumbnails"));
     assert.equal(cacheFiles.length, 1);
-    assert.ok((await thumbnailFor("wide.png")).equals(first));
+    const again = await thumbnailFor("wide.png");
+    assert.ok(again.data?.equals(first));
+    assert.deepEqual(await thumbnailFor("wide.png", again.etag), { data: null, etag: again.etag });
 
     await new Promise((resolve) => setTimeout(resolve, 20));
     await image(100, 400).png().toFile(path.join(root, "wide.png"));
-    const changed = await sharp(await thumbnailFor("wide.png")).metadata();
+    const changed = await sharp(await thumbnail("wide.png")).metadata();
     assert.deepEqual([changed.width, changed.height], [80, 320]);
   });
 });
@@ -61,7 +67,7 @@ test("thumbnails are small WebP previews, cached until the image changes", async
 test("thumbnails follow EXIF orientation and drop all metadata", async () => {
   await withRoot(async (root) => {
     await image(600, 300).jpeg().withExif({ IFD0: { Make: "Camera", Model: "Secret Model" } }).withMetadata({ orientation: 6 }).toFile(path.join(root, "photo.jpg"));
-    const meta = await sharp(await thumbnailFor("photo.jpg")).metadata();
+    const meta = await sharp(await thumbnail("photo.jpg")).metadata();
     assert.deepEqual([meta.width, meta.height], [160, 320]);
     assert.equal(meta.exif, undefined);
     assert.equal(meta.orientation, undefined);
@@ -86,6 +92,29 @@ test("unsupported, oversized, corrupt, and reserved images get no thumbnail", as
   });
 });
 
+test("files disguised as images never reach other decoders", async () => {
+  await withRoot(async (root) => {
+    await fs.writeFile(path.join(root, "vector.png"), "<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10'><rect width='10' height='10'/></svg>");
+    await image(20, 20).tiff().toFile(path.join(root, "scan.png"));
+    await image(20, 20).avif().toFile(path.join(root, "real.avif"));
+    await assert.rejects(thumbnailFor("vector.png"), /couldn't be read/);
+    await assert.rejects(thumbnailFor("scan.png"), /couldn't be read/);
+    assert.equal((await sharp(await thumbnail("real.avif")).metadata()).format, "webp");
+    assert.equal(looksLikeRasterImage(Buffer.from("<svg")), false);
+    assert.equal(looksLikeRasterImage(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])), true);
+  });
+});
+
+test("a named pipe dressed as an image neither blocks nor holds the lock", { skip: process.platform === "win32" }, async () => {
+  await withRoot(async (root, cookie) => {
+    execFileSync("mkfifo", [path.join(root, "trap.jpg")]);
+    await assert.rejects(withinTime(thumbnailFor("trap.jpg")), /Only images have thumbnails/);
+    const response = await withinTime(checksum(new Request("http://localhost/api/fs/checksum?path=trap.jpg", { headers: { cookie } })));
+    assert.equal(response.status, 400);
+    assert.equal(await withinTime(withFilesystemLock(async () => "free")), "free");
+  });
+});
+
 test("checksums report SHA-256 and MD5 for files only", async () => {
   await withRoot(async (root, cookie) => {
     await fs.writeFile(path.join(root, "abc.txt"), "abc");
@@ -101,5 +130,8 @@ test("checksums report SHA-256 and MD5 for files only", async () => {
     assert.equal((await request("folder")).status, 400);
     assert.equal((await request(".filedude/x")).status, 403);
     assert.equal((await checksum(new Request("http://localhost/api/fs/checksum?path=abc.txt"))).status, 401);
+    assert.equal((await checksum(new Request("http://localhost/api/fs/checksum?path=abc.txt", { headers: { cookie, "sec-fetch-site": "same-site" } }))).status, 403);
+    await fs.writeFile(path.join(root, "empty.txt"), "");
+    assert.equal((await (await request("empty.txt")).json()).sha256, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
   });
 });
