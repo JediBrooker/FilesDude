@@ -134,10 +134,10 @@ export async function POST(request: Request) {
               else callback(null, chunk);
             },
           });
-          stream.resume();
           try {
-            await pipeline(stream, meter, handle.createWriteStream({ autoClose: false }));
-            if (truncated) throw new AppError("Upload is larger than the configured limit", 413, "UPLOAD_TOO_LARGE");
+            // Ownership is applied before writing because the write stream closes the handle when
+            // it finishes. A stream created with autoClose: false keeps a reference that makes
+            // FileHandle.close() wait forever, which hung every upload on current Node releases.
             if (requestedOwnership) {
               try {
                 await handle.chown(requestedOwnership.uid, requestedOwnership.gid);
@@ -149,9 +149,12 @@ export async function POST(request: Request) {
                 throw error;
               }
             }
-            await handle.close();
+            stream.resume();
+            await pipeline(stream, meter, handle.createWriteStream());
+            if (truncated) throw new AppError("Upload is larger than the configured limit", 413, "UPLOAD_TOO_LARGE");
             uploaded.push(relative);
           } catch (error) {
+            stream.resume();
             await handle.close().catch(() => undefined);
             await fsp.rm(target, { force: true }).catch(() => undefined);
             throw error;
@@ -165,7 +168,15 @@ export async function POST(request: Request) {
       parser.once("filesLimit", () => reject(new AppError("Too many uploaded files", 413, "UPLOAD_LIMIT")));
     });
 
-    Readable.fromWeb(request.body as never).pipe(parser);
+    // A cancelled or dropped upload must tear the parser down: otherwise it waits forever for
+    // the rest of the body while this request holds the filesystem lock. pipeline() destroys
+    // the parser when the body errors, and the abort signal covers bodies that simply stall.
+    // Destroying the parser also fails the in-progress file stream, so its partial file is removed.
+    const abortUpload = () => parser.destroy(new AppError("The upload was cancelled", 400, "UPLOAD_ABORTED"));
+    request.signal.addEventListener("abort", abortUpload, { once: true });
+    // The client may have given up while this request waited for the lock.
+    if (request.signal.aborted) abortUpload();
+    pipeline(Readable.fromWeb(request.body as never), parser).catch(() => undefined);
     try {
       await parsed;
       await Promise.all(tasks);
@@ -173,6 +184,8 @@ export async function POST(request: Request) {
       await Promise.allSettled(tasks);
       await Promise.allSettled(createdTargets.map((target) => fsp.rm(target, { force: true })));
       throw error;
+    } finally {
+      request.signal.removeEventListener("abort", abortUpload);
     }
     if (!fileCount) throw new AppError("Choose at least one file to upload");
 
