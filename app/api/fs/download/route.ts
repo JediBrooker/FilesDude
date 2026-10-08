@@ -1,13 +1,12 @@
-import { constants, type Stats } from "node:fs";
-import fsp, { type FileHandle } from "node:fs/promises";
+import fsp from "node:fs/promises";
 import path from "node:path";
 import { PassThrough, Readable } from "node:stream";
-import type { Readable as NodeReadable } from "node:stream";
 import { ZipArchive } from "archiver";
+import { appendDirectory } from "@/lib/archives";
 import { requireSession } from "@/lib/auth";
 import { audit } from "@/lib/audit";
 import { config } from "@/lib/config";
-import { acquireFilesystemLock, getMime, openVerifiedFile, verifyFileHandleWithinRoot } from "@/lib/files";
+import { acquireFilesystemLock, getMime, openVerifiedFile } from "@/lib/files";
 import { AppError, jsonError } from "@/lib/http";
 
 export const runtime = "nodejs";
@@ -16,81 +15,6 @@ export const dynamic = "force-dynamic";
 function dispositionName(name: string) {
   const ascii = name.replace(/[^\x20-\x7E]/g, "_").replace(/["\\]/g, "_");
   return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`;
-}
-
-function appendFileAndWait(archive: ZipArchive, stream: NodeReadable, name: string, stats: Stats) {
-  return new Promise<void>((resolve, reject) => {
-    const cleanup = () => {
-      archive.off("error", onError);
-      stream.off("error", onError);
-      stream.off("close", onClose);
-    };
-    const onError = (error: Error) => { cleanup(); reject(error); };
-    const onClose = () => { cleanup(); resolve(); };
-    archive.once("error", onError);
-    stream.once("error", onError);
-    stream.once("close", onClose);
-    try {
-      archive.append(stream, { name, stats });
-    } catch (error) {
-      cleanup();
-      reject(error);
-    }
-  });
-}
-
-async function appendDirectory(archive: ZipArchive, handle: FileHandle, openedPath: string, archivePath: string, stateDirectory: string) {
-  const directoryPath = process.platform === "linux" ? `/proc/self/fd/${handle.fd}` : openedPath;
-  let directory;
-  try {
-    directory = await fsp.opendir(directoryPath);
-  } catch (error) {
-    await handle.close().catch(() => undefined);
-    throw error;
-  }
-  try {
-    for await (const entry of directory) {
-      if (entry.name === ".filedude") continue;
-      const childPath = path.join(directoryPath, entry.name);
-      const childArchivePath = path.posix.join(archivePath, entry.name);
-
-      if (entry.isSymbolicLink()) {
-        try {
-          archive.symlink(childArchivePath, await fsp.readlink(childPath));
-        } catch {
-          // The entry changed while the archive was being created; omit it.
-        }
-        continue;
-      }
-
-      const flags = constants.O_RDONLY | constants.O_NOFOLLOW | (entry.isDirectory() ? constants.O_DIRECTORY : 0);
-      let childHandle: FileHandle | null = null;
-      try {
-        childHandle = await fsp.open(childPath, flags);
-      } catch {
-        continue;
-      }
-
-      try {
-        const verified = await verifyFileHandleWithinRoot(childHandle, path.join(openedPath, entry.name));
-        if (verified.openedPath === stateDirectory || verified.openedPath.startsWith(`${stateDirectory}${path.sep}`)) continue;
-        if (verified.stat.isDirectory()) {
-          archive.append(Buffer.alloc(0), { name: `${childArchivePath}/`, type: "directory", stats: verified.stat });
-          await appendDirectory(archive, childHandle, verified.openedPath, childArchivePath, stateDirectory);
-          childHandle = null;
-        } else if (verified.stat.isFile()) {
-          const stream = childHandle.createReadStream();
-          await appendFileAndWait(archive, stream, childArchivePath, verified.stat);
-          childHandle = null;
-        }
-      } finally {
-        await childHandle?.close().catch(() => undefined);
-      }
-    }
-  } finally {
-    await directory.close().catch(() => undefined);
-    await handle.close().catch(() => undefined);
-  }
 }
 
 export async function GET(request: Request) {
@@ -122,7 +46,7 @@ export async function GET(request: Request) {
             try {
               const stateDirectory = await fsp.realpath(config.stateDir).catch(() => path.resolve(config.stateDir));
               archive.append(Buffer.alloc(0), { name: `${name}/`, type: "directory", stats: stat });
-              await appendDirectory(archive, handle, openedPath, name, stateDirectory);
+              await appendDirectory(archive, handle, openedPath, name, (opened) => opened === stateDirectory || opened.startsWith(`${stateDirectory}${path.sep}`));
               await archive.finalize();
             } catch (error) {
               output.destroy(error as Error);

@@ -115,6 +115,36 @@ export interface DeleteResult {
   trashed: Array<{ path: string; id: string }>;
 }
 
+export type ArchiveFormat = "zip" | "tar.gz";
+
+export interface JobProgress {
+  done: number;
+  /** Absent when the total cannot be known in advance. */
+  total?: number;
+  unit: "bytes" | "entries";
+}
+
+export interface ArchiveResult {
+  /** The archive created, or the folder extracted into. */
+  path: string;
+  entries: number;
+  bytes: number;
+  /** Archive entries left out for safety, such as links and devices. */
+  skipped: number;
+}
+
+export interface JobState {
+  id: string;
+  kind: "compress" | "extract";
+  label: string;
+  status: "running" | "done" | "failed" | "cancelled";
+  startedAt: string;
+  finishedAt?: string;
+  progress: JobProgress;
+  result?: ArchiveResult;
+  error?: string;
+}
+
 export interface TrashRestoreResult {
   id: string;
   path: string;
