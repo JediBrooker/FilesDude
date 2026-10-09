@@ -1,0 +1,56 @@
+import { NextResponse } from "next/server";
+import { withAccess } from "@/lib/access";
+import { audit } from "@/lib/audit";
+import { assertMutationRequest, AppError, jsonError, readJsonBody } from "@/lib/http";
+import { cancelAccountJobs } from "@/lib/jobs";
+import { createUser, deleteUser, listUsers, updateUser } from "@/lib/users";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+export async function GET(request: Request) {
+  try {
+    return await withAccess(request, "owner", async () => NextResponse.json({ users: await listUsers() }, { headers: { "Cache-Control": "no-store" } }));
+  } catch (error) {
+    return jsonError(error);
+  }
+}
+
+type UsersBody = { action?: unknown; id?: unknown; username?: unknown; password?: unknown; role?: unknown; root?: unknown };
+
+export async function POST(request: Request) {
+  try {
+    assertMutationRequest(request);
+    return await withAccess(request, "owner", async (session) => {
+      const parsed = await readJsonBody<unknown>(request, 16 * 1024);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new AppError("Request body is invalid", 400, "INVALID_REQUEST");
+      const body = parsed as UsersBody;
+      const id = typeof body.id === "string" && body.id.length <= 64 ? body.id : "";
+      let user;
+      switch (body.action) {
+        case "create":
+          user = await createUser({ username: body.username, password: body.password, role: body.role, root: body.root });
+          await audit("users.create", { username: session.username, account: user.username, role: user.role, root: user.root });
+          break;
+        case "update":
+          if (!id) throw new AppError("Choose an account", 400, "INVALID_REQUEST");
+          user = await updateUser(id, { role: body.role, root: body.root, password: body.password });
+          // Jobs keep the role and folder they started with, so they stop along with the old sessions.
+          cancelAccountJobs(id);
+          await audit("users.update", { username: session.username, account: user.username, role: user.role, root: user.root, passwordReset: body.password !== undefined });
+          break;
+        case "delete":
+          if (!id) throw new AppError("Choose an account", 400, "INVALID_REQUEST");
+          user = await deleteUser(id);
+          cancelAccountJobs(id);
+          await audit("users.delete", { username: session.username, account: user.username });
+          break;
+        default:
+          throw new AppError("Unknown account operation", 400, "UNKNOWN_ACTION");
+      }
+      return NextResponse.json({ ok: true, user, users: await listUsers() }, { headers: { "Cache-Control": "no-store" } });
+    });
+  } catch (error) {
+    return jsonError(error);
+  }
+}

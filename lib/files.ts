@@ -1,10 +1,25 @@
 import fs from "node:fs/promises";
-import { constants, type Dirent } from "node:fs";
+import { constants, type Dirent, type Stats } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
 import { config } from "./config";
 import { AppError } from "./http";
+import { currentScope, scopeRoot, withinScope } from "./scope";
+
+// An account confined to a folder can't rename, move, or delete that folder itself.
+function assertNotHome(relativePath: string) {
+  const home = scopeRoot();
+  if (home && relativePath.replace(/\/+$/, "") === home) throw new AppError("You can't rename, move, or delete your home folder", 403, "HOME_FOLDER");
+}
+
+// Confined accounts only see trash items deleted from inside their folder; the owner sees all,
+// including items trashed before origins were recorded.
+function trashItemVisible(originalPath: string | null) {
+  const scope = currentScope();
+  if (!scope || scope.role === "owner") return true;
+  return originalPath !== null && withinScope(originalPath, scope.root);
+}
 import type { BulkRenameRule, DeleteResult, DiskInfo, EntryType, FileEntry, IdentityOption, LargestFilesResult, LargestFilesScanning, OwnershipPair, RenamePreview, TransferResult, TrashItem, TrashListing, TrashRestoreResult } from "./types";
 
 export const INTERNAL_NAMES = new Set([".filedude"]);
@@ -64,9 +79,14 @@ export function normalizeRelative(input = "") {
   return normalized;
 }
 
+// Inside the configured root and, for a signed-in account confined to a folder, inside that folder.
+// Everything that resolves or verifies a path goes through here, so confinement can't be bypassed
+// by a symlink inside the account's folder pointing elsewhere in the root.
 function insideRoot(candidate: string) {
   const root = canonicalRoot || config.root;
-  return candidate === root || candidate.startsWith(`${root}${path.sep}`);
+  const scoped = scopeRoot();
+  const base = scoped ? path.join(root, ...scoped.split("/")) : root;
+  return candidate === base || candidate.startsWith(`${base}${path.sep}`);
 }
 
 export async function ensureRoot() {
@@ -77,6 +97,7 @@ export async function ensureRoot() {
 
 export async function safeResolve(input = "", options: { mustExist?: boolean; allowInternal?: boolean; followSymlink?: boolean } = {}) {
   const relative = normalizeRelative(input);
+  if (!withinScope(relative.replace(/\/+$/, ""))) throw new AppError("That location is outside your folder", 403, "OUTSIDE_SCOPE");
   if (!options.allowInternal && relative.split("/").some((part) => INTERNAL_NAMES.has(part))) {
     throw new AppError("That path is reserved by FilesDude", 403, "RESERVED_PATH");
   }
@@ -142,6 +163,203 @@ export async function openVerifiedFile(relativePath: string, access: "read" | "w
   } catch (error) {
     await handle.close().catch(() => undefined);
     throw error;
+  }
+}
+
+// Quick operations work through open folder handles, as archives do (see lib/archives.ts): a path
+// is checked once, its folder is opened and verified, and every later step names entries relative
+// to that open folder (/proc/self/fd/N on Linux). Swapping a path component for a symlink part-way
+// through then can't redirect the work outside the root or the account's folder. Walks below an
+// open folder never follow symlinks. Elsewhere `base` is the folder's real path (development only).
+export type AnchoredDirectory = { handle: FileHandle; base: string; real: string; stat: Stats };
+
+const ON_LINUX = process.platform === "linux";
+// Deeper trees are refused by delete and copy, which hold one handle per level.
+const MAX_TREE_DEPTH = 256;
+const runningAsRoot = () => typeof process.getuid === "function" && process.getuid() === 0;
+
+function openFailure(error: unknown): never {
+  const code = (error as NodeJS.ErrnoException).code;
+  if (code === "ENOENT") throw new AppError("File or folder not found", 404, "NOT_FOUND");
+  if (code === "ENOTDIR") throw new AppError("Path is not a folder", 400, "NOT_A_DIRECTORY");
+  if (code === "ELOOP") throw new AppError("That location changed while it was being opened", 409, "PATH_CHANGED");
+  throw error;
+}
+
+async function isReservedLocation(real: string) {
+  if (path.relative(canonicalRoot || config.root, real).split(path.sep).some((part) => INTERNAL_NAMES.has(part))) return true;
+  const state = await fs.realpath(config.stateDir).catch(() => path.resolve(config.stateDir));
+  return real === state || real.startsWith(`${state}${path.sep}`);
+}
+
+async function openAnchored(location: string, { follow, checkReserved }: { follow: boolean; checkReserved: boolean }): Promise<AnchoredDirectory> {
+  const flags = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NONBLOCK | (follow ? 0 : constants.O_NOFOLLOW);
+  const handle = await fs.open(location, flags).catch(openFailure);
+  try {
+    const { openedPath, stat } = await verifyFileHandleWithinRoot(handle, location);
+    if (checkReserved && (await isReservedLocation(openedPath))) throw new AppError("That path is reserved by FilesDude", 403, "RESERVED_PATH");
+    return { handle, base: ON_LINUX ? `/proc/self/fd/${handle.fd}` : openedPath, real: openedPath, stat };
+  } catch (error) {
+    await handle.close().catch(() => undefined);
+    throw error;
+  }
+}
+
+export function inside(directory: AnchoredDirectory, name: string) {
+  return path.join(directory.base, name);
+}
+
+/** Opens a folder the account can reach; symlinks on the way are followed, then the result verified. */
+export async function openDirectory(relativePath: string) {
+  const absolute = await safeResolve(relativePath);
+  return openAnchored(absolute, { follow: true, checkReserved: true });
+}
+
+function openChild(directory: AnchoredDirectory, name: string, checkReserved = false) {
+  return openAnchored(inside(directory, name), { follow: false, checkReserved });
+}
+
+// A folder this service just made: owned by it, with nothing in it yet, and with `mode` if given.
+async function isFreshFolder(folder: AnchoredDirectory, mode?: number) {
+  if (typeof process.getuid === "function" && folder.stat.uid !== process.getuid()) return false;
+  if (mode !== undefined && (folder.stat.mode & 0o7777) !== mode) return false;
+  return (await fs.readdir(folder.base)).length === 0;
+}
+
+function tooDeep(depth: number) {
+  if (depth > MAX_TREE_DEPTH) throw new AppError(`Folders nested more than ${MAX_TREE_DEPTH} levels deep can't be copied or deleted here`, 400, "TREE_TOO_DEEP");
+}
+
+// FilesDude's own trash folders, already checked by trashDirectories() and writable only by root.
+async function openTrashFolder(location: string): Promise<AnchoredDirectory> {
+  const handle = await fs.open(location, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    return { handle, base: ON_LINUX ? `/proc/self/fd/${handle.fd}` : location, real: location, stat: await handle.stat() };
+  } catch (error) {
+    await handle.close().catch(() => undefined);
+    throw error;
+  }
+}
+
+export async function withOpen<T>(opening: Promise<AnchoredDirectory>, run: (directory: AnchoredDirectory) => Promise<T>) {
+  const directory = await opening;
+  try {
+    return await run(directory);
+  } finally {
+    await directory.handle.close().catch(() => undefined);
+  }
+}
+
+const cleanRelative = (input: string) => normalizeRelative(input).replace(/\/+$/, "");
+const parentOf = (relative: string) => (path.posix.dirname(relative) === "." ? "" : path.posix.dirname(relative));
+const childOf = (parent: string, name: string) => (parent ? `${parent}/${name}` : name);
+
+function missingAsNull(error: unknown): null {
+  if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+  throw error;
+}
+
+/** Runs `run` with the item's open, verified parent folder and the item's name in it. */
+async function withParent<T>(relativePath: string, run: (parent: AnchoredDirectory, name: string, relative: string) => Promise<T>) {
+  const relative = cleanRelative(relativePath);
+  if (!relative) throw new AppError("The configured root can't be changed this way", 403, "ROOT_PATH");
+  await safeResolve(relative, { followSymlink: false });
+  return withOpen(openDirectory(parentOf(relative)), (parent) => run(parent, path.posix.basename(relative), relative));
+}
+
+/** Removes `name` only if it is still the file that was created there. */
+export async function removeIfSame(directory: AnchoredDirectory, name: string, created: Stats) {
+  const current = await fs.lstat(inside(directory, name)).catch(() => null);
+  if (current && current.ino === created.ino && current.dev === created.dev) await fs.unlink(inside(directory, name)).catch(() => undefined);
+}
+
+/**
+ * Removes `name` from `directory`; folders are emptied through their own handles, never by path.
+ * Entries that disappear meanwhile count as removed.
+ */
+async function removeEntry(directory: AnchoredDirectory, name: string, depth = 0) {
+  tooDeep(depth);
+  const location = inside(directory, name);
+  const stat = await fs.lstat(location).catch(missingAsNull);
+  if (!stat) return;
+  if (!stat.isDirectory()) return fs.unlink(location);
+  await withOpen(openChild(directory, name), async (folder) => {
+    for (const entry of await fs.readdir(folder.base)) await removeEntry(folder, entry, depth + 1);
+  });
+  await fs.rmdir(location);
+}
+
+async function copyContents(input: FileHandle, output: FileHandle) {
+  const buffer = Buffer.allocUnsafe(1024 * 1024);
+  for (let position = 0; ;) {
+    const { bytesRead } = await input.read(buffer, 0, buffer.length, position);
+    if (!bytesRead) return;
+    for (let written = 0; written < bytesRead;) {
+      written += (await output.write(buffer, written, bytesRead - written, position + written)).bytesWritten;
+    }
+    position += bytesRead;
+  }
+}
+
+// Copies keep each item's permissions (without setuid/setgid) and, when the service runs as root,
+// its owner, like `cp -a`. Attributes are applied through the new item's own handle, and a folder
+// is only used once it is confirmed to be the one this copy just made. Special files are refused.
+async function applyCopiedAttributes(handle: FileHandle, source: Stats) {
+  if (runningAsRoot()) await handle.chown(source.uid, source.gid);
+  await handle.chmod(source.mode & 0o1777);
+}
+
+async function copyEntry(from: AnchoredDirectory, name: string, to: AnchoredDirectory, targetName: string, made: Set<string>, depth = 0) {
+  tooDeep(depth);
+  const source = inside(from, name);
+  const target = inside(to, targetName);
+  const stat = await fs.lstat(source);
+  if (stat.isSymbolicLink()) {
+    await fs.symlink(await fs.readlink(source), target);
+    return;
+  }
+  if (stat.isDirectory()) {
+    // A folder this copy made that was moved into the source meanwhile; copying it would never end.
+    if (made.has(`${stat.dev}:${stat.ino}`)) return;
+    await fs.mkdir(target, 0o700);
+    await withOpen(openChild(to, targetName), async (created) => {
+      if (!(await isFreshFolder(created, 0o700))) {
+        throw new AppError("The destination changed while it was being copied to", 409, "PATH_CHANGED");
+      }
+      made.add(`${created.stat.dev}:${created.stat.ino}`);
+      const original = await withOpen(openChild(from, name), async (folder) => {
+        for (const entry of await fs.readdir(folder.base)) await copyEntry(folder, entry, created, entry, made, depth + 1);
+        return folder.stat;
+      });
+      await applyCopiedAttributes(created.handle, original);
+    });
+    return;
+  }
+  const special = new AppError(`${name} is a special file and can't be copied`, 400, "SPECIAL_FILE");
+  if (!stat.isFile()) throw special;
+  const input = await fs.open(source, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK | constants.O_NOCTTY);
+  try {
+    const opened = await input.stat();
+    if (!opened.isFile()) throw special;
+    const output = await fs.open(target, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    try {
+      await copyContents(input, output);
+      await applyCopiedAttributes(output, opened);
+    } finally {
+      await output.close();
+    }
+  } finally {
+    await input.close();
+  }
+}
+
+async function moveEntry(from: AnchoredDirectory, name: string, to: AnchoredDirectory, targetName: string) {
+  try {
+    await fs.rename(inside(from, name), inside(to, targetName));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EXDEV") throw error;
+    await copyEntry(from, name, to, targetName, new Set());
+    await removeEntry(from, name);
   }
 }
 
@@ -251,17 +469,18 @@ export async function isAvailableUploadOwnership(relativePath: string, uid: numb
   return options.detected.some((pair) => pair.uid === uid && pair.gid === gid);
 }
 
-async function toEntry(absolute: string, name = path.basename(absolute)): Promise<FileEntry> {
-  const stat = await fs.lstat(absolute);
+// `location` is where to look (usually inside an open folder); `relative` is the path shown to the user.
+async function toEntry(location: string, relative: string, name = path.posix.basename(relative), known?: Stats): Promise<FileEntry> {
+  const stat = known ?? await fs.lstat(location);
   const ids = await identities();
   const type: FileEntry["type"] = stat.isDirectory() ? "directory" : stat.isSymbolicLink() ? "symlink" : "file";
   let symlinkTarget: string | undefined;
   let symlinkBlocked = false;
 
   if (type === "symlink") {
-    symlinkTarget = await fs.readlink(absolute);
+    symlinkTarget = await fs.readlink(location);
     try {
-      const real = await fs.realpath(absolute);
+      const real = await fs.realpath(location);
       symlinkBlocked = !insideRoot(real);
     } catch {
       symlinkBlocked = true;
@@ -270,7 +489,7 @@ async function toEntry(absolute: string, name = path.basename(absolute)): Promis
 
   return {
     name,
-    path: relativeFromAbsolute(absolute),
+    path: relative,
     type,
     size: stat.size,
     modified: stat.mtime.toISOString(),
@@ -295,13 +514,12 @@ export async function diskInfo(): Promise<DiskInfo> {
 }
 
 export async function listDirectory(relativePath = "", showHidden = false) {
-  const absolute = await safeResolve(relativePath);
-  const stat = await fs.stat(absolute);
-  if (!stat.isDirectory()) throw new AppError("Path is not a folder", 400, "NOT_A_DIRECTORY");
-
-  const names = await fs.readdir(absolute);
-  const visible = names.filter((name) => !INTERNAL_NAMES.has(name) && (showHidden || !name.startsWith(".")));
-  const entries = await Promise.all(visible.map((name) => toEntry(path.join(absolute, name), name)));
+  const relative = cleanRelative(relativePath);
+  const entries = await withOpen(openDirectory(relative), async (directory) => {
+    const names = await fs.readdir(directory.base);
+    const visible = names.filter((name) => !INTERNAL_NAMES.has(name) && (showHidden || !name.startsWith(".")));
+    return Promise.all(visible.map((name) => toEntry(inside(directory, name), childOf(relative, name), name)));
+  });
   entries.sort((a, b) => {
     if (a.type === "directory" && b.type !== "directory") return -1;
     if (a.type !== "directory" && b.type === "directory") return 1;
@@ -311,23 +529,26 @@ export async function listDirectory(relativePath = "", showHidden = false) {
 }
 
 export async function searchFiles(relativePath: string, query: string, showHidden = false) {
-  const base = await safeResolve(relativePath);
+  const relative = cleanRelative(relativePath);
   const needle = query.toLocaleLowerCase();
   const results: FileEntry[] = [];
 
-  async function walk(directory: string, depth: number) {
+  async function walk(directory: AnchoredDirectory, directoryRelative: string, depth: number) {
     if (depth > 20 || results.length >= 500) return;
-    const entries = await fs.readdir(directory, { withFileTypes: true });
+    const entries = await fs.readdir(directory.base, { withFileTypes: true });
     for (const entry of entries) {
       if (results.length >= 500) return;
       if (INTERNAL_NAMES.has(entry.name) || (!showHidden && entry.name.startsWith("."))) continue;
-      const absolute = path.join(directory, entry.name);
-      if (entry.name.toLocaleLowerCase().includes(needle)) results.push(await toEntry(absolute, entry.name));
-      if (entry.isDirectory()) await walk(absolute, depth + 1);
+      const entryRelative = childOf(directoryRelative, entry.name);
+      if (entry.name.toLocaleLowerCase().includes(needle)) results.push(await toEntry(inside(directory, entry.name), entryRelative, entry.name));
+      if (!entry.isDirectory()) continue;
+      // A folder swapped for a symlink since it was listed is skipped rather than followed.
+      const child = await openChild(directory, entry.name, true).catch(() => null);
+      if (child) await withOpen(Promise.resolve(child), (opened) => walk(opened, entryRelative, depth + 1));
     }
   }
 
-  await walk(base, 0);
+  await withOpen(openDirectory(relative), (directory) => walk(directory, relative, 0));
   return { path: normalizeRelative(relativePath), entries: results, disk: await diskInfo(), truncated: results.length >= 500 };
 }
 
@@ -341,59 +562,75 @@ export function validateName(name: string) {
 }
 
 export async function createEntry(parentPath: string, name: string, type: "file" | "directory") {
-  const parent = await safeResolve(parentPath);
-  const target = path.join(parent, validateName(name));
-  await safeResolve(relativeFromAbsolute(target), { mustExist: false });
-  if (type === "directory") await fs.mkdir(target);
-  else await fs.writeFile(target, "", { flag: "wx" });
-  return toEntry(target);
+  const parentRelative = cleanRelative(parentPath);
+  const entryName = validateName(name);
+  const relative = childOf(parentRelative, entryName);
+  await safeResolve(relative, { mustExist: false });
+  return withOpen(openDirectory(parentRelative), async (directory) => {
+    const location = inside(directory, entryName);
+    // Confined accounts' new items take the folder's owner, as their uploads do.
+    const scope = currentScope();
+    const owner = scope && scope.role !== "owner" && runningAsRoot() ? directory.stat : null;
+    if (type === "directory") {
+      await fs.mkdir(location);
+      if (owner) {
+        await withOpen(openChild(directory, entryName), async (created) => {
+          if (await isFreshFolder(created)) await created.handle.chown(owner.uid, owner.gid);
+        });
+      }
+    } else {
+      const handle = await fs.open(location, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o666);
+      try {
+        if (owner) await handle.chown(owner.uid, owner.gid);
+      } finally {
+        await handle.close();
+      }
+    }
+    return toEntry(location, relative, entryName);
+  });
 }
 
 export async function renameEntry(sourcePath: string, newName: string) {
-  const source = await safeResolve(sourcePath, { followSymlink: false });
-  const target = path.join(path.dirname(source), validateName(newName));
-  if (target === source) return toEntry(source);
-  await safeResolve(relativeFromAbsolute(target), { mustExist: false });
-  // lstat, not access/realpath: a symlink must never be mistaken for the file it points to, and a
-  // dangling symlink at the target name still occupies it.
-  const existing = await fs.lstat(target).catch((error: NodeJS.ErrnoException) => {
-    if (error.code === "ENOENT") return null;
-    throw error;
+  assertNotHome(cleanRelative(sourcePath));
+  const newEntryName = validateName(newName);
+  return withParent(sourcePath, async (parent, name, relative) => {
+    const source = inside(parent, name);
+    const target = inside(parent, newEntryName);
+    const targetRelative = childOf(parentOf(relative), newEntryName);
+    if (newEntryName === name) return toEntry(source, relative, name);
+    await safeResolve(targetRelative, { mustExist: false });
+    // lstat, not access/realpath: a symlink must never be mistaken for the file it points to, and a
+    // dangling symlink at the target name still occupies it.
+    const existing = await fs.lstat(target).catch(missingAsNull);
+    if (!existing) {
+      await fs.rename(source, target);
+      return toEntry(target, targetRelative, newEntryName);
+    }
+    // On a case-insensitive filesystem a case-only rename finds the item itself under the new name.
+    // A hardlink also shares the inode, so the names must differ only in case.
+    const current = await fs.lstat(source);
+    const caseOnly = newEntryName.toLowerCase() === name.toLowerCase() && existing.ino === current.ino && existing.dev === current.dev;
+    if (!caseOnly) throw new AppError("An item with that name already exists", 409, "NAME_CONFLICT");
+    const temporary = inside(parent, `.filedude-case-${crypto.randomUUID()}`);
+    await fs.rename(source, temporary);
+    await fs.rename(temporary, target);
+    return toEntry(target, targetRelative, newEntryName);
   });
-  if (!existing) {
-    await fs.rename(source, target);
-    return toEntry(target);
-  }
-  // On a case-insensitive filesystem a case-only rename finds the item itself under the new name.
-  const current = await fs.lstat(source);
-  if (existing.ino !== current.ino || existing.dev !== current.dev) throw new AppError("An item with that name already exists", 409, "NAME_CONFLICT");
-  const temporary = path.join(path.dirname(source), `.filedude-case-${crypto.randomUUID()}`);
-  await fs.rename(source, temporary);
-  await fs.rename(temporary, target);
-  return toEntry(target);
-}
-
-async function renameAcrossDevices(source: string, target: string) {
-  try {
-    await fs.rename(source, target);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EXDEV") throw error;
-    await fs.cp(source, target, { recursive: true, errorOnExist: true, force: false });
-    await fs.rm(source, { recursive: true, force: false });
-  }
 }
 
 export async function deleteEntries(paths: string[], permanent = false): Promise<DeleteResult> {
   if (!paths.length) throw new AppError("Choose at least one item", 400);
-  const root = await ensureRoot();
   const trash = !permanent && config.trashEnabled ? await trashDirectories(true) : null;
   const trashed: DeleteResult["trashed"] = [];
 
   for (const relativePath of paths) {
-    const source = await safeResolve(relativePath, { followSymlink: false });
-    if (source === root) throw new AppError("The configured root cannot be deleted", 403);
-    if (trash) trashed.push({ path: relativeFromAbsolute(source), id: await moveToTrash(source, trash) });
-    else await fs.rm(source, { recursive: true, force: false });
+    const relative = cleanRelative(relativePath);
+    if (!relative) throw new AppError("The configured root cannot be deleted", 403);
+    assertNotHome(relative);
+    await withParent(relative, async (parent, name) => {
+      if (trash) trashed.push({ path: relative, id: await moveToTrash(parent, name, relative, trash) });
+      else await removeEntry(parent, name);
+    });
   }
   return { trashed };
 }
@@ -432,50 +669,67 @@ async function trashDirectories(create = false) {
   return directories;
 }
 
+/** Totals file sizes below `absolute`, walking through open folder handles without following symlinks. */
 export async function measureTree(absolute: string) {
   let bytes = 0;
   let visited = 0;
   let complete = true;
-  const stack = [absolute];
-  while (stack.length) {
-    if (visited >= TRASH_MEASURE_LIMIT) return { bytes, complete: false };
-    const current = stack.pop()!;
+  async function walk(location: string, depth: number) {
+    if (visited >= TRASH_MEASURE_LIMIT || depth > MAX_TREE_DEPTH) {
+      complete = false;
+      return;
+    }
     visited += 1;
-    const stat = await fs.lstat(current).catch(() => null);
+    const stat = await fs.lstat(location).catch(() => null);
     if (!stat) {
       complete = false;
     } else if (stat.isFile()) {
       bytes += stat.size;
     } else if (stat.isDirectory()) {
-      const names = await fs.readdir(current).catch(() => null);
-      if (names) stack.push(...names.map((name) => path.join(current, name)));
-      else complete = false;
+      const handle = await fs.open(location, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW | constants.O_NONBLOCK).catch(() => null);
+      if (!handle) {
+        complete = false;
+        return;
+      }
+      try {
+        const base = ON_LINUX ? `/proc/self/fd/${handle.fd}` : location;
+        const names = await fs.readdir(base).catch(() => null);
+        if (!names) complete = false;
+        for (const name of names ?? []) await walk(path.join(base, name), depth + 1);
+      } finally {
+        await handle.close().catch(() => undefined);
+      }
     }
   }
+  await walk(absolute, 0);
   return { bytes, complete };
 }
 
-async function moveToTrash(source: string, trash: TrashDirectories) {
+async function moveToTrash(parent: AnchoredDirectory, name: string, relative: string, trash: TrashDirectories) {
   const id = `${Date.now()}-${crypto.randomBytes(6).toString("hex")}`;
-  const stat = await fs.lstat(source);
+  const stat = await fs.lstat(inside(parent, name));
   const type = entryType(stat);
-  const measured = type === "directory" ? await measureTree(source) : { bytes: stat.size, complete: true };
   const info: TrashInfo = {
-    name: path.basename(source),
-    originalPath: relativeFromAbsolute(source),
+    name,
+    originalPath: relative,
     type,
-    size: measured.bytes,
-    sizeComplete: measured.complete,
+    size: type === "directory" ? 0 : stat.size,
+    sizeComplete: type !== "directory",
     deletedAt: new Date().toISOString(),
   };
   // Write the record first so a trashed item is never left without its original location.
   const infoPath = path.join(trash.info, `${id}.json`);
   await fs.writeFile(infoPath, JSON.stringify(info), { flag: "wx", mode: 0o600 });
   try {
-    await renameAcrossDevices(source, path.join(trash.items, id));
+    await withOpen(openTrashFolder(trash.items), (items) => moveEntry(parent, name, items, id));
   } catch (error) {
     await fs.rm(infoPath, { force: true });
     throw error;
+  }
+  if (type === "directory") {
+    // Measured once in the trash; measureTree walks through handles, as the folder may still change.
+    const measured = await measureTree(path.join(trash.items, id));
+    await fs.writeFile(infoPath, JSON.stringify({ ...info, size: measured.bytes, sizeComplete: measured.complete }), { mode: 0o600 }).catch(() => undefined);
   }
   return id;
 }
@@ -561,14 +815,15 @@ export async function listTrash(): Promise<TrashListing> {
   // Read records in batches so a very large trash cannot exhaust file descriptors.
   for (let offset = 0; offset < ids.length; offset += 64) {
     const described = await Promise.all(ids.slice(offset, offset + 64).map((id) => describeTrashItem(trash, id)));
-    items.push(...described.filter((item): item is TrashItem => item !== null));
+    items.push(...described.filter((item): item is TrashItem => item !== null && trashItemVisible(item.originalPath)));
   }
   items.sort((a, b) => b.deletedAt.localeCompare(a.deletedAt) || a.name.localeCompare(b.name));
   return { enabled: config.trashEnabled, items, totalBytes: items.reduce((total, item) => total + item.size, 0) };
 }
 
-// Recreates any missing folders on the way to relativePath and returns it.
-async function ensureDirectoryPath(relativePath: string) {
+// Opens relativePath as a folder, recreating any missing folders on the way, each made and opened
+// through the one above it.
+async function openDirectoryPath(relativePath: string) {
   const parts = relativePath ? relativePath.split("/") : [];
   let existing = parts.length;
   while (existing > 0) {
@@ -582,34 +837,41 @@ async function ensureDirectoryPath(relativePath: string) {
     }
   }
   const base = parts.slice(0, existing).join("/");
-  if (!(await fs.stat(await safeResolve(base))).isDirectory()) {
-    throw new AppError(`/${base} is no longer a folder, so the item cannot be restored there`, 409, "RESTORE_CONFLICT");
-  }
-  for (let index = existing + 1; index <= parts.length; index += 1) {
-    const folder = parts.slice(0, index).join("/");
-    try {
-      await fs.mkdir(await safeResolve(folder, { mustExist: false }));
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      throw new AppError(`/${folder} is in the way of the original location, so the item cannot be restored there`, 409, "RESTORE_CONFLICT");
+  let directory = await openDirectory(base).catch((error: unknown) => {
+    if (error instanceof AppError && error.code === "NOT_A_DIRECTORY") {
+      throw new AppError(`/${base} is no longer a folder, so the item cannot be restored there`, 409, "RESTORE_CONFLICT");
     }
+    throw error;
+  });
+  try {
+    for (let index = existing; index < parts.length; index += 1) {
+      const folder = parts.slice(0, index + 1).join("/");
+      await safeResolve(folder, { mustExist: false });
+      try {
+        await fs.mkdir(inside(directory, parts[index]));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        throw new AppError(`/${folder} is in the way of the original location, so the item cannot be restored there`, 409, "RESTORE_CONFLICT");
+      }
+      const child = await openChild(directory, parts[index]);
+      await directory.handle.close().catch(() => undefined);
+      directory = child;
+    }
+    return directory;
+  } catch (error) {
+    await directory.handle.close().catch(() => undefined);
+    throw error;
   }
-  return relativePath;
 }
 
-// Picks name, then "name (label).ext", "name (label 2).ext", ... in parentRelative, whichever is free.
-async function availableTarget(parentRelative: string, name: string, type: EntryType, label: string) {
+// Picks name, then "name (label).ext", "name (label 2).ext", ... in the folder, whichever is free.
+async function availableName(directory: AnchoredDirectory, name: string, type: EntryType, label: string) {
+  if (INTERNAL_NAMES.has(name)) throw new AppError("That name is reserved", 400, "RESERVED_NAME");
   const extension = type === "directory" ? "" : path.extname(name);
   const stem = extension ? name.slice(0, -extension.length) : name;
   for (let index = 0; index < 1_000; index += 1) {
     const candidateName = index === 0 ? name : `${stem} (${label}${index > 1 ? ` ${index}` : ""})${extension}`;
-    const target = await safeResolve([parentRelative, candidateName].filter(Boolean).join("/"), { mustExist: false, followSymlink: false });
-    try {
-      await fs.lstat(target);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return { target, renamed: index > 0 };
-      throw error;
-    }
+    if (!(await fs.lstat(inside(directory, candidateName)).catch(missingAsNull))) return { name: candidateName, renamed: index > 0 };
   }
   throw new AppError(`Unable to choose an available name for ${name}`, 409, "NAME_CONFLICT");
 }
@@ -621,14 +883,17 @@ export async function restoreTrashItems(ids: string[]): Promise<TrashRestoreResu
   for (const id of ids) {
     const source = await existingTrashItem(trash, id);
     const info = await readTrashInfo(trash!, id);
+    if (!trashItemVisible(info?.originalPath ?? null)) throw new AppError("That item is no longer in the trash", 404, "NOT_FOUND");
     const originalPath = info?.originalPath ?? validateName(LEGACY_TRASH_ID.exec(id)?.[1] ?? id);
-    const parentRelative = path.posix.dirname(originalPath) === "." ? "" : path.posix.dirname(originalPath);
+    const parentRelative = parentOf(originalPath);
     const type = info?.type ?? entryType(await fs.lstat(source));
-    await ensureDirectoryPath(parentRelative);
-    const { target, renamed } = await availableTarget(parentRelative, path.posix.basename(originalPath), type, "restored");
-    await renameAcrossDevices(source, target);
+    const result = await withOpen(openDirectoryPath(parentRelative), async (directory) => {
+      const { name, renamed } = await availableName(directory, path.posix.basename(originalPath), type, "restored");
+      await withOpen(openTrashFolder(trash!.items), (items) => moveEntry(items, id, directory, name));
+      return { path: childOf(parentRelative, name), renamed };
+    });
     await fs.rm(path.join(trash!.info, `${id}.json`), { force: true });
-    restored.push({ id, path: relativeFromAbsolute(target), renamed });
+    restored.push({ id, ...result });
   }
   return restored;
 }
@@ -637,7 +902,10 @@ export async function deleteTrashItems(ids: string[]) {
   if (!ids.length) throw new AppError("Choose at least one item", 400);
   const trash = await trashDirectories();
   for (const id of ids) {
-    await fs.rm(await existingTrashItem(trash, id), { recursive: true, force: false });
+    await existingTrashItem(trash, id);
+    if (!trashItemVisible((await readTrashInfo(trash!, id))?.originalPath ?? null)) throw new AppError("That item is no longer in the trash", 404, "NOT_FOUND");
+    // A process already inside a trashed folder can still change it, so it is removed through handles.
+    await withOpen(openTrashFolder(trash!.items), (items) => removeEntry(items, id));
     await fs.rm(path.join(trash!.info, `${id}.json`), { force: true });
   }
   return { removed: ids.length };
@@ -647,7 +915,9 @@ export async function emptyTrash() {
   const trash = await trashDirectories();
   if (!trash) return { removed: 0 };
   const ids = await fs.readdir(trash.items);
-  for (const id of ids) await fs.rm(path.join(trash.items, id), { recursive: true, force: true });
+  await withOpen(openTrashFolder(trash.items), async (items) => {
+    for (const id of ids) await removeEntry(items, id);
+  });
   legacyTrashSizes.clear();
   // Also clears records whose items were removed outside FilesDude.
   for (const name of await fs.readdir(trash.info)) await fs.rm(path.join(trash.info, name), { force: true });
@@ -669,45 +939,45 @@ export class PartialTransferError extends AppError {
 
 // Copies that would collide get a free "name (copy).ext" name; moves never rename and fail on a conflict.
 export async function copyOrMove(paths: string[], destinationPath: string, move: boolean): Promise<TransferResult[]> {
-  const destination = await safeResolve(destinationPath);
-  if (!(await fs.stat(destination)).isDirectory()) throw new AppError("Destination is not a folder", 400);
-  const destinationRelative = relativeFromAbsolute(destination);
-  const results: TransferResult[] = [];
-
-  for (const sourcePath of paths) {
-    try {
-      results.push(await transferOne(sourcePath, destination, destinationRelative, move));
-    } catch (error) {
-      if (results.length) throw new PartialTransferError(error, results, move);
-      throw error;
+  const destinationRelative = cleanRelative(destinationPath);
+  const opening = openDirectory(destinationRelative).catch((error: unknown) => {
+    if (error instanceof AppError && error.code === "NOT_A_DIRECTORY") throw new AppError("Destination is not a folder", 400);
+    throw error;
+  });
+  return withOpen(opening, async (destination) => {
+    const results: TransferResult[] = [];
+    for (const sourcePath of paths) {
+      try {
+        results.push(await transferOne(sourcePath, destination, destinationRelative, move));
+      } catch (error) {
+        if (results.length) throw new PartialTransferError(error, results, move);
+        throw error;
+      }
     }
-  }
-  return results;
+    return results;
+  });
 }
 
-async function transferOne(sourcePath: string, destination: string, destinationRelative: string, move: boolean): Promise<TransferResult> {
-  {
-    const source = await safeResolve(sourcePath, { followSymlink: false });
-    if (destination === source || destination.startsWith(`${source}${path.sep}`)) {
-      throw new AppError(`You can't ${move ? "move" : "copy"} a folder into itself or one of its own subfolders`, 400, "INVALID_DESTINATION");
-    }
-    const name = path.basename(source);
-    let target = path.join(destination, name);
-    if (move && target === source) throw new AppError("The item is already in that folder", 409, "SAME_DESTINATION");
-    await safeResolve(relativeFromAbsolute(target), { mustExist: false });
+async function transferOne(sourcePath: string, destination: AnchoredDirectory, destinationRelative: string, move: boolean): Promise<TransferResult> {
+  const sourceRelative = cleanRelative(sourcePath);
+  if (move) assertNotHome(sourceRelative);
+  const invalid = new AppError(`You can't ${move ? "move" : "copy"} a folder into itself or one of its own subfolders`, 400, "INVALID_DESTINATION");
+  if (!sourceRelative) throw invalid;
+  return withParent(sourceRelative, async (parent, name, relative) => {
+    // Compared by real location, since either path may run through symlinks.
+    const sourceReal = path.join(parent.real, name);
+    if (destination.real === sourceReal || destination.real.startsWith(`${sourceReal}${path.sep}`)) throw invalid;
+    if (move && parent.real === destination.real) throw new AppError("The item is already in that folder", 409, "SAME_DESTINATION");
+    let targetName = name;
     let renamed = false;
-    try {
-      await fs.lstat(target);
+    if (await fs.lstat(inside(destination, name)).catch(missingAsNull)) {
       if (move) throw new AppError("An item with that name already exists in the destination", 409, "NAME_CONFLICT");
-      ({ target, renamed } = await availableTarget(destinationRelative, name, entryType(await fs.lstat(source)), "copy"));
-    } catch (error) {
-      if (error instanceof AppError) throw error;
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      ({ name: targetName, renamed } = await availableName(destination, name, entryType(await fs.lstat(inside(parent, name))), "copy"));
     }
-    if (move) await renameAcrossDevices(source, target);
-    else await fs.cp(source, target, { recursive: true, errorOnExist: true, force: false });
-    return { source: relativeFromAbsolute(source), path: relativeFromAbsolute(target), renamed };
-  }
+    if (move) await moveEntry(parent, name, destination, targetName);
+    else await copyEntry(parent, name, destination, targetName, new Set());
+    return { source: relative, path: childOf(destinationRelative, targetName), renamed };
+  });
 }
 
 export async function changeMode(paths: string[], mode: string) {
@@ -738,7 +1008,7 @@ export async function writeTextFile(relativePath: string, content: string) {
   } finally {
     await handle.close();
   }
-  return toEntry(absolute);
+  return details(relativePath);
 }
 
 function renamedName(original: string, index: number, rule: BulkRenameRule) {
@@ -769,20 +1039,16 @@ export async function previewBulkRename(paths: string[], rule: BulkRenameRule): 
   const previews: RenamePreview[] = [];
   const destinations = new Set<string>();
   for (let index = 0; index < paths.length; index += 1) {
-    const source = await safeResolve(paths[index]);
-    const from = path.basename(source);
+    const relative = cleanRelative(paths[index]);
+    await safeResolve(relative);
+    const from = path.posix.basename(relative);
     const to = renamedName(from, index, rule);
-    const destination = path.join(path.dirname(source), to);
+    const destination = childOf(parentOf(relative), to);
     let error: string | undefined;
     if (destinations.has(destination)) error = "Duplicate destination";
     destinations.add(destination);
-    if (destination !== source) {
-      try {
-        await fs.access(destination);
-        error = "Name already exists";
-      } catch {
-        // Available.
-      }
+    if (destination !== relative && (await withParent(relative, (parent) => fs.lstat(inside(parent, to)).catch(missingAsNull)))) {
+      error = "Name already exists";
     }
     previews.push({ source: paths[index], from, to, changed: from !== to, error });
   }
@@ -790,26 +1056,37 @@ export async function previewBulkRename(paths: string[], rule: BulkRenameRule): 
 }
 
 export async function applyBulkRename(paths: string[], rule: BulkRenameRule) {
+  for (const item of paths) assertNotHome(normalizeRelative(item));
   const previews = await previewBulkRename(paths, rule);
   if (previews.some((item) => item.error)) throw new AppError("Resolve bulk rename conflicts before applying", 409, "RENAME_CONFLICT");
 
+  // One open handle per parent folder, kept until every rename has finished or been rolled back.
+  const parents = new Map<string, AnchoredDirectory>();
   const staged: Array<{ original: string; temporary: string; destination: string }> = [];
   try {
     for (const preview of previews.filter((item) => item.changed)) {
-      const source = await safeResolve(preview.source);
-      const temporary = path.join(path.dirname(source), `.filedude-rename-${crypto.randomUUID()}`);
-      await fs.rename(source, temporary);
-      staged.push({ original: source, temporary, destination: path.join(path.dirname(source), preview.to) });
+      const relative = cleanRelative(preview.source);
+      await safeResolve(relative, { followSymlink: false });
+      const parentRelative = parentOf(relative);
+      let parent = parents.get(parentRelative);
+      if (!parent) {
+        parent = await openDirectory(parentRelative);
+        parents.set(parentRelative, parent);
+      }
+      const name = path.posix.basename(relative);
+      const temporary = inside(parent, `.filedude-rename-${crypto.randomUUID()}`);
+      await fs.rename(inside(parent, name), temporary);
+      staged.push({ original: inside(parent, name), temporary, destination: inside(parent, preview.to) });
     }
     for (const item of staged) await fs.rename(item.temporary, item.destination);
   } catch (error) {
     for (const item of [...staged].reverse()) {
       try {
-        await fs.access(item.temporary);
+        await fs.lstat(item.temporary);
         await fs.rename(item.temporary, item.original);
       } catch {
         try {
-          await fs.access(item.destination);
+          await fs.lstat(item.destination);
           await fs.rename(item.destination, item.original);
         } catch {
           // Best-effort recovery; the audit log records the original operation.
@@ -817,12 +1094,19 @@ export async function applyBulkRename(paths: string[], rule: BulkRenameRule) {
       }
     }
     throw error;
+  } finally {
+    for (const parent of parents.values()) await parent.handle.close().catch(() => undefined);
   }
   return previews;
 }
 
 export async function details(relativePath: string) {
-  return toEntry(await safeResolve(relativePath));
+  const relative = cleanRelative(relativePath);
+  // The root and an account's home folder have no parent the account may open; read them directly.
+  if (!relative || relative === scopeRoot()) {
+    return withOpen(openDirectory(relative), (directory) => toEntry(directory.base, relative, path.basename(directory.real), directory.stat));
+  }
+  return withParent(relative, (parent, name) => toEntry(inside(parent, name), relative, name));
 }
 
 type LargestCandidate = { absolute: string; size: number };
@@ -921,7 +1205,7 @@ async function pageLargestFilesIndex(index: LargestFilesIndex, { minBytes, offse
   const entries: FileEntry[] = [];
   let pageSkipped = 0;
   for (let start = 0; start < page.length; start += 64) {
-    const converted = await Promise.allSettled(page.slice(start, start + 64).map((candidate) => toEntry(candidate.absolute)));
+    const converted = await Promise.allSettled(page.slice(start, start + 64).map((candidate) => toEntry(candidate.absolute, relativeFromAbsolute(candidate.absolute), path.basename(candidate.absolute))));
     entries.push(...converted.flatMap((item) => item.status === "fulfilled" ? [item.value] : []));
     pageSkipped += converted.filter((item) => item.status === "rejected").length;
   }

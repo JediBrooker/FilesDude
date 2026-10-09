@@ -1,5 +1,5 @@
 import { Readable } from "node:stream";
-import { requireSession } from "@/lib/auth";
+import { withAccess } from "@/lib/access";
 import { acquireFilesystemLock, getMime, openVerifiedFile } from "@/lib/files";
 import { AppError, jsonError } from "@/lib/http";
 
@@ -8,7 +8,7 @@ export const dynamic = "force-dynamic";
 
 export async function GET(request: Request) {
   try {
-    await requireSession(request);
+    return await withAccess(request, "read", async () => {
     const relativePath = new URL(request.url).searchParams.get("path") || "";
     const releaseFilesystem = await acquireFilesystemLock();
     try {
@@ -52,6 +52,7 @@ export async function GET(request: Request) {
       releaseFilesystem();
       throw error;
     }
+    });
   } catch (error) {
     return jsonError(error);
   }

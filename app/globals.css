@@ -600,6 +600,18 @@ kbd { padding: 3px 5px; border: 1px solid var(--line); border-bottom-width: 2px;
 .content-hit li code { overflow: hidden; color: var(--ink-soft); font-size: 9px; text-overflow: ellipsis; white-space: pre; }
 .content-hit mark { border-radius: 3px; background: color-mix(in srgb, var(--accent) 45%, transparent); color: var(--ink); }
 .content-summary { margin: 2px 2px 0; color: var(--ink-faint); font-size: 9px; }
+.storage-card.static { cursor: default; }
+.storage-card.static:hover { transform: none; box-shadow: none; }
+.users-dialog { display: grid; gap: 8px; padding-top: 14px; }
+.user-row { display: flex; min-width: 0; align-items: center; gap: 10px; padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel-soft); }
+.user-row > div { display: flex; min-width: 0; flex: 1; flex-direction: column; }
+.user-row strong { font-size: 11px; }
+.user-row small { overflow: hidden; color: var(--ink-faint); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.user-row .button { min-height: 30px; padding: 0 10px; font-size: 9px; }
+.owner-row .avatar { color: var(--brand-strong); }
+.user-form { display: grid; gap: 12px; margin: 6px 0 0 !important; padding: 14px !important; border: 1px solid var(--line); border-radius: 10px; }
+.user-form > strong { font-size: 11px; }
+.user-form .modal-actions { margin-top: 0; padding-bottom: 0; }
 .job-panel { position: fixed; z-index: 190; right: 22px; bottom: 78px; display: grid; width: min(330px, calc(100vw - 44px)); gap: 9px; padding: 11px 12px; border: 1px solid color-mix(in srgb, var(--brand) 30%, var(--line)); border-radius: 11px; background: var(--panel); box-shadow: var(--shadow); }
 .job-panel-head { display: flex; min-width: 0; align-items: center; gap: 9px; }
 .job-panel-head .file-icon { width: 29px; height: 29px; }

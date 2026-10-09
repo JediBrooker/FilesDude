@@ -25,6 +25,7 @@ FilesDude is a secure, self-hosted web file manager designed for a Proxmox host,
 - Protected trash by default with a Trash view for restoring items to their original folders, deleting them forever, or emptying the trash; persistent favourites; and a JSON Lines audit log inside the protected state directory
 - Signed, expiring, HTTP-only, SameSite login sessions; scrypt password hashes; login throttling; same-origin mutation checks; and hardened response headers
 - Account preferences for changing the username and password; credential changes invalidate other sessions
+- User accounts: the owner (the installer's login) can add editors (view and change files) and viewers (view and download only), each confined to one folder, from **Users** in the sidebar
 - Multi-selection toolbar actions, responsive UI, dark mode, keyboard shortcuts, and no external analytics or storage services
 
 ## Install on Proxmox with systemd
@@ -146,6 +147,34 @@ hard links, and device entries are skipped and counted, and extraction stops (re
 its partial folder) rather than leave less than 512 MB free or unpack more than
 100,000 entries. New files and folders take the owner of the folder they are created in.
 
+## User accounts
+
+The login created by the installer is the **owner**: it has full access and is the only
+account that can manage users, create share links, change permissions or ownership,
+choose upload ownership, run the largest-files scan, and empty the trash.
+
+From **Users** in the sidebar, the owner can add other accounts, each confined to one
+folder:
+
+- **Editors** can browse, preview, download, search, upload, create, rename, move, copy,
+  edit, delete (to trash), compress, and extract inside their folder.
+- **Viewers** can browse, preview, download, search, and see checksums inside their
+  folder, and nothing else.
+
+Accounts start in their folder and can't open anything above it, including through
+symlinks; they can't rename, move, or delete their home folder itself. The trash shows
+each account only items deleted from inside its folder, favourites are per account, and
+uploads and new files or folders made by editors take the destination folder's owner.
+Archive jobs, content searches, and checksums are limited per account, so one account
+can't hold up another, and an account's running jobs stop when it is changed or deleted.
+
+File operations act through open folder handles rather than re-resolving paths, so a user
+who can also change the folder from inside the container can't redirect them elsewhere by
+swapping in a symlink. Copies keep each item's permissions (minus setuid/setgid) and, when
+running as root, its owner; FIFOs, sockets, and devices aren't copied. Changing an account's role,
+folder, or password signs it out everywhere; accounts can change their own password from
+the account menu. Accounts are stored in `users.json` in the state directory.
+
 ## Share links
 
 Right-click a file or folder and choose **Share link…** to create a link that anyone can
@@ -253,7 +282,6 @@ Shortcuts are ignored while you are typing in a field such as search.
 The safest default set is already included. These are strong next additions when you need them:
 
 - OIDC or WebAuthn/passkeys for multi-user sign-in and two-factor authentication
-- Role-based roots and read-only accounts instead of one server administrator
 - Automatic retention (age-based purging) for protected trash
 - Duplicate detection, video thumbnails, media metadata, and an index for searching file contents on very large trees
 - Antivirus scanning and upload quarantine for environments with untrusted uploaders

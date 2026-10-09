@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { audit } from "@/lib/audit";
-import { requireSession } from "@/lib/auth";
+import { withAccess } from "@/lib/access";
 import { config } from "@/lib/config";
 import { assertMutationRequest, AppError, jsonError, readJsonBody } from "@/lib/http";
 import { createShare, listShares, revokeShare } from "@/lib/shares";
@@ -10,8 +10,8 @@ export const dynamic = "force-dynamic";
 
 export async function GET(request: Request) {
   try {
-    await requireSession(request);
-    return NextResponse.json({ enabled: config.sharingEnabled, shares: config.sharingEnabled ? await listShares() : [] }, { headers: { "Cache-Control": "no-store" } });
+    // Share links publish files to anyone, so creating and managing them is for the owner only.
+    return await withAccess(request, "owner", async () => NextResponse.json({ enabled: config.sharingEnabled, shares: config.sharingEnabled ? await listShares() : [] }, { headers: { "Cache-Control": "no-store" } }));
   } catch (error) {
     return jsonError(error);
   }
@@ -22,7 +22,7 @@ type ShareBody = { action?: unknown; path?: unknown; hours?: unknown; maxDownloa
 export async function POST(request: Request) {
   try {
     assertMutationRequest(request);
-    const session = await requireSession(request);
+    return await withAccess(request, "owner", async (session) => {
     const parsed = await readJsonBody<unknown>(request);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new AppError("Request body is invalid", 400, "INVALID_REQUEST");
     const body = parsed as ShareBody;
@@ -39,6 +39,7 @@ export async function POST(request: Request) {
       return NextResponse.json({ ok: true }, { headers: { "Cache-Control": "no-store" } });
     }
     throw new AppError("Unknown share operation", 400, "UNKNOWN_ACTION");
+    });
   } catch (error) {
     return jsonError(error);
   }

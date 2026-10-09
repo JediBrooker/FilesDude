@@ -10,6 +10,8 @@ export async function GET(request: Request) {
   return NextResponse.json({
     authenticated: Boolean(session),
     username: session?.username || null,
+    role: session?.role ?? null,
+    root: session?.root ?? null,
     configured: issues.length === 0,
     configurationIssues: issues,
   }, { headers: { "Cache-Control": "no-store" } });
