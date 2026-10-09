@@ -174,6 +174,8 @@ export async function openVerifiedFile(relativePath: string, access: "read" | "w
 export type AnchoredDirectory = { handle: FileHandle; base: string; real: string; stat: Stats };
 
 const ON_LINUX = process.platform === "linux";
+// Deeper trees are refused by delete and copy, which hold one handle per level.
+const MAX_TREE_DEPTH = 256;
 const runningAsRoot = () => typeof process.getuid === "function" && process.getuid() === 0;
 
 function openFailure(error: unknown): never {
@@ -213,8 +215,19 @@ export async function openDirectory(relativePath: string) {
   return openAnchored(absolute, { follow: true, checkReserved: true });
 }
 
-function openChild(directory: AnchoredDirectory, name: string) {
-  return openAnchored(inside(directory, name), { follow: false, checkReserved: false });
+function openChild(directory: AnchoredDirectory, name: string, checkReserved = false) {
+  return openAnchored(inside(directory, name), { follow: false, checkReserved });
+}
+
+// A folder this service just made: owned by it, with nothing in it yet, and with `mode` if given.
+async function isFreshFolder(folder: AnchoredDirectory, mode?: number) {
+  if (typeof process.getuid === "function" && folder.stat.uid !== process.getuid()) return false;
+  if (mode !== undefined && (folder.stat.mode & 0o7777) !== mode) return false;
+  return (await fs.readdir(folder.base)).length === 0;
+}
+
+function tooDeep(depth: number) {
+  if (depth > MAX_TREE_DEPTH) throw new AppError(`Folders nested more than ${MAX_TREE_DEPTH} levels deep can't be copied or deleted here`, 400, "TREE_TOO_DEEP");
 }
 
 // FilesDude's own trash folders, already checked by trashDirectories() and writable only by root.
@@ -260,12 +273,18 @@ export async function removeIfSame(directory: AnchoredDirectory, name: string, c
   if (current && current.ino === created.ino && current.dev === created.dev) await fs.unlink(inside(directory, name)).catch(() => undefined);
 }
 
-/** Removes `name` from `directory`; folders are emptied through their own handles, never by path. */
-async function removeEntry(directory: AnchoredDirectory, name: string) {
+/**
+ * Removes `name` from `directory`; folders are emptied through their own handles, never by path.
+ * Entries that disappear meanwhile count as removed.
+ */
+async function removeEntry(directory: AnchoredDirectory, name: string, depth = 0) {
+  tooDeep(depth);
   const location = inside(directory, name);
-  if (!(await fs.lstat(location)).isDirectory()) return fs.unlink(location);
+  const stat = await fs.lstat(location).catch(missingAsNull);
+  if (!stat) return;
+  if (!stat.isDirectory()) return fs.unlink(location);
   await withOpen(openChild(directory, name), async (folder) => {
-    for (const entry of await fs.readdir(folder.base)) await removeEntry(folder, entry);
+    for (const entry of await fs.readdir(folder.base)) await removeEntry(folder, entry, depth + 1);
   });
   await fs.rmdir(location);
 }
@@ -290,7 +309,8 @@ async function applyCopiedAttributes(handle: FileHandle, source: Stats) {
   await handle.chmod(source.mode & 0o1777);
 }
 
-async function copyEntry(from: AnchoredDirectory, name: string, to: AnchoredDirectory, targetName: string, made: Set<string>) {
+async function copyEntry(from: AnchoredDirectory, name: string, to: AnchoredDirectory, targetName: string, made: Set<string>, depth = 0) {
+  tooDeep(depth);
   const source = inside(from, name);
   const target = inside(to, targetName);
   const stat = await fs.lstat(source);
@@ -303,12 +323,12 @@ async function copyEntry(from: AnchoredDirectory, name: string, to: AnchoredDire
     if (made.has(`${stat.dev}:${stat.ino}`)) return;
     await fs.mkdir(target, 0o700);
     await withOpen(openChild(to, targetName), async (created) => {
-      if (typeof process.getuid === "function" && created.stat.uid !== process.getuid()) {
+      if (!(await isFreshFolder(created, 0o700))) {
         throw new AppError("The destination changed while it was being copied to", 409, "PATH_CHANGED");
       }
       made.add(`${created.stat.dev}:${created.stat.ino}`);
       const original = await withOpen(openChild(from, name), async (folder) => {
-        for (const entry of await fs.readdir(folder.base)) await copyEntry(folder, entry, created, entry, made);
+        for (const entry of await fs.readdir(folder.base)) await copyEntry(folder, entry, created, entry, made, depth + 1);
         return folder.stat;
       });
       await applyCopiedAttributes(created.handle, original);
@@ -523,7 +543,7 @@ export async function searchFiles(relativePath: string, query: string, showHidde
       if (entry.name.toLocaleLowerCase().includes(needle)) results.push(await toEntry(inside(directory, entry.name), entryRelative, entry.name));
       if (!entry.isDirectory()) continue;
       // A folder swapped for a symlink since it was listed is skipped rather than followed.
-      const child = await openChild(directory, entry.name).catch(() => null);
+      const child = await openChild(directory, entry.name, true).catch(() => null);
       if (child) await withOpen(Promise.resolve(child), (opened) => walk(opened, entryRelative, depth + 1));
     }
   }
@@ -555,7 +575,7 @@ export async function createEntry(parentPath: string, name: string, type: "file"
       await fs.mkdir(location);
       if (owner) {
         await withOpen(openChild(directory, entryName), async (created) => {
-          if (created.stat.uid === 0) await created.handle.chown(owner.uid, owner.gid);
+          if (await isFreshFolder(created)) await created.handle.chown(owner.uid, owner.gid);
         });
       }
     } else {
@@ -587,8 +607,10 @@ export async function renameEntry(sourcePath: string, newName: string) {
       return toEntry(target, targetRelative, newEntryName);
     }
     // On a case-insensitive filesystem a case-only rename finds the item itself under the new name.
+    // A hardlink also shares the inode, so the names must differ only in case.
     const current = await fs.lstat(source);
-    if (existing.ino !== current.ino || existing.dev !== current.dev) throw new AppError("An item with that name already exists", 409, "NAME_CONFLICT");
+    const caseOnly = newEntryName.toLowerCase() === name.toLowerCase() && existing.ino === current.ino && existing.dev === current.dev;
+    if (!caseOnly) throw new AppError("An item with that name already exists", 409, "NAME_CONFLICT");
     const temporary = inside(parent, `.filedude-case-${crypto.randomUUID()}`);
     await fs.rename(source, temporary);
     await fs.rename(temporary, target);
@@ -647,26 +669,39 @@ async function trashDirectories(create = false) {
   return directories;
 }
 
+/** Totals file sizes below `absolute`, walking through open folder handles without following symlinks. */
 export async function measureTree(absolute: string) {
   let bytes = 0;
   let visited = 0;
   let complete = true;
-  const stack = [absolute];
-  while (stack.length) {
-    if (visited >= TRASH_MEASURE_LIMIT) return { bytes, complete: false };
-    const current = stack.pop()!;
+  async function walk(location: string, depth: number) {
+    if (visited >= TRASH_MEASURE_LIMIT || depth > MAX_TREE_DEPTH) {
+      complete = false;
+      return;
+    }
     visited += 1;
-    const stat = await fs.lstat(current).catch(() => null);
+    const stat = await fs.lstat(location).catch(() => null);
     if (!stat) {
       complete = false;
     } else if (stat.isFile()) {
       bytes += stat.size;
     } else if (stat.isDirectory()) {
-      const names = await fs.readdir(current).catch(() => null);
-      if (names) stack.push(...names.map((name) => path.join(current, name)));
-      else complete = false;
+      const handle = await fs.open(location, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW | constants.O_NONBLOCK).catch(() => null);
+      if (!handle) {
+        complete = false;
+        return;
+      }
+      try {
+        const base = ON_LINUX ? `/proc/self/fd/${handle.fd}` : location;
+        const names = await fs.readdir(base).catch(() => null);
+        if (!names) complete = false;
+        for (const name of names ?? []) await walk(path.join(base, name), depth + 1);
+      } finally {
+        await handle.close().catch(() => undefined);
+      }
     }
   }
+  await walk(absolute, 0);
   return { bytes, complete };
 }
 
@@ -692,7 +727,7 @@ async function moveToTrash(parent: AnchoredDirectory, name: string, relative: st
     throw error;
   }
   if (type === "directory") {
-    // Measured once in the trash, where other users can no longer change the folder.
+    // Measured once in the trash; measureTree walks through handles, as the folder may still change.
     const measured = await measureTree(path.join(trash.items, id));
     await fs.writeFile(infoPath, JSON.stringify({ ...info, size: measured.bytes, sizeComplete: measured.complete }), { mode: 0o600 }).catch(() => undefined);
   }
@@ -867,9 +902,10 @@ export async function deleteTrashItems(ids: string[]) {
   if (!ids.length) throw new AppError("Choose at least one item", 400);
   const trash = await trashDirectories();
   for (const id of ids) {
-    const item = await existingTrashItem(trash, id);
+    await existingTrashItem(trash, id);
     if (!trashItemVisible((await readTrashInfo(trash!, id))?.originalPath ?? null)) throw new AppError("That item is no longer in the trash", 404, "NOT_FOUND");
-    await fs.rm(item, { recursive: true, force: false });
+    // A process already inside a trashed folder can still change it, so it is removed through handles.
+    await withOpen(openTrashFolder(trash!.items), (items) => removeEntry(items, id));
     await fs.rm(path.join(trash!.info, `${id}.json`), { force: true });
   }
   return { removed: ids.length };
@@ -879,7 +915,9 @@ export async function emptyTrash() {
   const trash = await trashDirectories();
   if (!trash) return { removed: 0 };
   const ids = await fs.readdir(trash.items);
-  for (const id of ids) await fs.rm(path.join(trash.items, id), { recursive: true, force: true });
+  await withOpen(openTrashFolder(trash.items), async (items) => {
+    for (const id of ids) await removeEntry(items, id);
+  });
   legacyTrashSizes.clear();
   // Also clears records whose items were removed outside FilesDude.
   for (const name of await fs.readdir(trash.info)) await fs.rm(path.join(trash.info, name), { force: true });

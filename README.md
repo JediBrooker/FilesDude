@@ -164,7 +164,14 @@ folder:
 Accounts start in their folder and can't open anything above it, including through
 symlinks; they can't rename, move, or delete their home folder itself. The trash shows
 each account only items deleted from inside its folder, favourites are per account, and
-uploads by editors take the destination folder's owner. Changing an account's role,
+uploads and new files or folders made by editors take the destination folder's owner.
+Archive jobs, content searches, and checksums are limited per account, so one account
+can't hold up another, and an account's running jobs stop when it is changed or deleted.
+
+File operations act through open folder handles rather than re-resolving paths, so a user
+who can also change the folder from inside the container can't redirect them elsewhere by
+swapping in a symlink. Copies keep each item's permissions (minus setuid/setgid) and, when
+running as root, its owner; FIFOs, sockets, and devices aren't copied. Changing an account's role,
 folder, or password signs it out everywhere; accounts can change their own password from
 the account menu. Accounts are stored in `users.json` in the state directory.
 

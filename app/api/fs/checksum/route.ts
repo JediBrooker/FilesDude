@@ -20,24 +20,25 @@ export async function GET(request: Request) {
     return await withAccess(request, "read", async (session) => {
     const account = session.accountKey;
     if ((activeChecksums.get(account) ?? 0) >= MAX_ACTIVE_CHECKSUMS) throw new AppError("Other checksums are still being calculated; try again shortly", 503, "CHECKSUMS_BUSY");
-    const isReserved = await reservedPathCheck();
-    const unlock = await acquireFilesystemLock();
-    let opened: Awaited<ReturnType<typeof openVerifiedFile>>;
-    try {
-      opened = await openVerifiedFile(new URL(request.url).searchParams.get("path") || "");
-    } finally {
-      unlock();
-    }
-    const { handle, openedPath, stat } = opened;
-    if (!stat.isFile() || isReserved(openedPath)) {
-      await handle.close().catch(() => undefined);
-      throw new AppError("Checksums can only be calculated for files", 400, "NOT_A_FILE");
-    }
-    const sha256 = crypto.createHash("sha256");
-    const md5 = crypto.createHash("md5");
-    let bytes = 0;
+    // Counted before the first await, so requests arriving together can't all pass the check.
     activeChecksums.set(account, (activeChecksums.get(account) ?? 0) + 1);
     try {
+      const isReserved = await reservedPathCheck();
+      const unlock = await acquireFilesystemLock();
+      let opened: Awaited<ReturnType<typeof openVerifiedFile>>;
+      try {
+        opened = await openVerifiedFile(new URL(request.url).searchParams.get("path") || "");
+      } finally {
+        unlock();
+      }
+      const { handle, openedPath, stat } = opened;
+      if (!stat.isFile() || isReserved(openedPath)) {
+        await handle.close().catch(() => undefined);
+        throw new AppError("Checksums can only be calculated for files", 400, "NOT_A_FILE");
+      }
+      const sha256 = crypto.createHash("sha256");
+      const md5 = crypto.createHash("md5");
+      let bytes = 0;
       if (stat.size > 0 && !request.signal.aborted) {
         // Only the size measured at open is read, so a file growing meanwhile can't keep this going.
         // The read stream owns the handle; closing the dialog aborts the request and stops reading.
@@ -56,12 +57,12 @@ export async function GET(request: Request) {
       } else {
         await handle.close().catch(() => undefined);
       }
+      return NextResponse.json({ sha256: sha256.digest("hex"), md5: md5.digest("hex"), bytes }, { headers: { "Cache-Control": "no-store" } });
     } finally {
       const remaining = (activeChecksums.get(account) ?? 1) - 1;
       if (remaining > 0) activeChecksums.set(account, remaining);
       else activeChecksums.delete(account);
     }
-    return NextResponse.json({ sha256: sha256.digest("hex"), md5: md5.digest("hex"), bytes }, { headers: { "Cache-Control": "no-store" } });
     });
   } catch (error) {
     return jsonError(error);

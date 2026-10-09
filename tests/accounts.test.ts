@@ -265,6 +265,15 @@ test("copies and deletes never follow symlinks or open special files", async () 
   });
 });
 
+test("renaming onto a hardlink of the same file is a conflict, not a case-only rename", async () => {
+  await withAccounts(async ({ root, bob }) => {
+    const docs = path.join(root, "home", "bob", "docs");
+    await fs.link(path.join(docs, "plan.txt"), path.join(docs, "other.txt"));
+    assert.equal(await status(call(fsAction, "/api/fs", bob, { action: "rename", path: "home/bob/docs/plan.txt", name: "other.txt" })), 409);
+    assert.deepEqual((await fs.readdir(docs)).sort(), ["other.txt", "plan.txt"]);
+  });
+});
+
 test("work continues in the folder that was checked even if its path is swapped for a symlink", { skip: process.platform !== "linux" && "needs /proc/self/fd" }, async () => {
   await withAccounts(async ({ root }) => {
     const docs = path.join(root, "home", "bob", "docs");
