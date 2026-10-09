@@ -1,4 +1,4 @@
-import { INPUT_LIMITS, sandboxRunner } from "./media-sandbox";
+import { VIDEO_FORMATS, inputLimits, sandboxRunner } from "./media-sandbox";
 
 // Takes one frame from a video for its thumbnail, with ffmpeg in a throwaway sandbox (see
 // media-sandbox.ts).
@@ -19,7 +19,7 @@ async function sandboxedRunner(): Promise<FrameRunner | null> {
   const run = await sandboxRunner(process.env.FILEDUDE_FFMPEG_PATH || "/usr/bin/ffmpeg");
   if (!run) return null;
   return (fd, seconds) => run([
-    "-nostdin", "-hide_banner", "-loglevel", "error", ...INPUT_LIMITS,
+    "-nostdin", "-hide_banner", "-loglevel", "error", ...inputLimits(VIDEO_FORMATS),
     // ffmpeg would otherwise start a thread per CPU core, beyond the sandbox's task limit.
     "-threads", "2", "-ss", String(seconds), "-fd", "0", "-i", "fd:",
     "-map", "0:v:0", "-frames:v", "1", "-an", "-sn", "-dn",

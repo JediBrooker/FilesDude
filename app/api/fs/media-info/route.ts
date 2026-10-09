@@ -10,8 +10,8 @@ export const dynamic = "force-dynamic";
 export async function GET(request: Request) {
   try {
     assertSameOriginFetch(request);
-    return await withAccess(request, "read", async () => {
-      const info = await mediaInfoFor(new URL(request.url).searchParams.get("path") || "");
+    return await withAccess(request, "read", async (session) => {
+      const info = await mediaInfoFor(new URL(request.url).searchParams.get("path") || "", session.accountKey);
       return NextResponse.json(info, { headers: { "Cache-Control": "no-store" } });
     });
   } catch (error) {

@@ -19,8 +19,12 @@ export type SandboxRun = (args: string[], fd: number, maxBytes: number) => Promi
 const KILL_AFTER_MS = 25_000;
 const SYSTEMD_RUN = "/usr/bin/systemd-run";
 
+/** Container formats each use may read: video thumbnails only need the video ones. */
+export const VIDEO_FORMATS = "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi";
+export const MEDIA_FORMATS = `${VIDEO_FORMATS},mp3,flac,ogg,wav,aac`;
+
 /** Arguments every run starts with: only the passed-in file, and only these formats, are read. */
-export const INPUT_LIMITS = ["-protocol_whitelist", "fd", "-format_whitelist", "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi,mp3,flac,ogg,wav,aac"];
+export const inputLimits = (formats: string) => ["-protocol_whitelist", "fd", "-format_whitelist", formats];
 
 const SANDBOX = [
   "DynamicUser=yes", "PrivateNetwork=yes", "PrivateTmp=yes", "PrivateDevices=yes", "PrivateIPC=yes",

@@ -4,8 +4,8 @@ import { reservedPathCheck } from "./archives";
 import { config } from "./config";
 import { acquireFilesystemLock, getMime, openVerifiedFile } from "./files";
 import { AppError } from "./http";
-import { INPUT_LIMITS, sandboxRunner } from "./media-sandbox";
-import { DECODED_FORMATS, MAX_THUMBNAIL_SOURCE_BYTES, THUMBNAIL_TYPES, VIDEO_THUMBNAIL_TYPES, limiter, looksLikeRasterImage, readExactly } from "./thumbnails";
+import { MEDIA_FORMATS, inputLimits, sandboxRunner } from "./media-sandbox";
+import { DECODED_FORMATS, MAX_THUMBNAIL_SOURCE_BYTES, THUMBNAIL_TYPES, VIDEO_THUMBNAIL_TYPES, imageSlots, limiter, looksLikeRasterImage, readExactly } from "./thumbnails";
 
 /**
  * Media details for Properties: an image's dimensions, format, frames, and (from EXIF) camera and
@@ -43,11 +43,16 @@ export const AUDIO_TYPES = new Set(["audio/mpeg", "audio/wav", "audio/ogg", "aud
 const MAX_PROBE_BYTES = 1024 * 1024;
 const MAX_SOURCE_PIXELS = 100_000_000;
 const CACHE_MAX = 2_000;
+// A file that couldn't be read is tried again after this, in case the failure was passing.
+const FAILURE_RETRY_MS = 60 * 60 * 1000;
+const MAX_ACTIVE_PER_ACCOUNT = 2;
 
 // Cached by the file's identity, so an edited file is read again; null means it couldn't be read.
-const cache = new Map<string, MediaInfo | null>();
-const imageSlots = limiter(2, 100);
-const probeSlots = limiter(2, 50);
+const cache = new Map<string, { info: MediaInfo | null; at: number }>();
+// Requests for a file already being read share that read.
+const reading = new Map<string, Promise<MediaInfo | null>>();
+const activePerAccount = new Map<string, number>();
+const probeSlots = limiter(2, 50, "Too many media files are being read; try again shortly", "MEDIA_BUSY");
 let runner: ProbeRunner | null | undefined;
 
 /** Replaces how audio and video are read (tests use a fake); null means ffprobe isn't available. */
@@ -60,7 +65,7 @@ async function probeRunner() {
   if (runner === undefined) {
     const run = process.env.FILEDUDE_MEDIA_INFO === "false" ? null : await sandboxRunner(process.env.FILEDUDE_FFPROBE_PATH || "/usr/bin/ffprobe");
     runner = run && ((fd) => run([
-      "-v", "error", ...INPUT_LIMITS, "-fd", "0", "-i", "fd:",
+      "-v", "error", ...inputLimits(MEDIA_FORMATS), "-fd", "0", "-i", "fd:",
       "-show_entries", "format=format_long_name,duration,bit_rate:format_tags=title,artist,album:stream=codec_type,codec_name,profile,width,height,avg_frame_rate,sample_rate,channels,channel_layout:stream_side_data=rotation",
       "-of", "json",
     ], fd, MAX_PROBE_BYTES));
@@ -73,16 +78,22 @@ export async function mediaProbeAvailable() {
   return (await probeRunner()) !== null;
 }
 
+function cached(key: string) {
+  const entry = cache.get(key);
+  if (!entry || (entry.info === null && Date.now() - entry.at >= FAILURE_RETRY_MS)) return undefined;
+  return entry.info;
+}
+
 function remember(key: string, info: MediaInfo | null) {
   cache.delete(key);
-  cache.set(key, info);
+  cache.set(key, { info, at: Date.now() });
   if (cache.size > CACHE_MAX) cache.delete(cache.keys().next().value!);
 }
 
 // Text from a file (tags, EXIF): printable characters only, trimmed, and short.
 function cleanText(value: unknown, max = 120) {
   if (typeof value !== "string") return undefined;
-  const text = value.replace(/[\u0000-\u001f\u007f-\u009f​-‏‪-‮⁦-⁩]/g, "").trim().slice(0, max);
+  const text = value.replace(/[\u0000-\u001f\u007f-\u009f\u00ad\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff\ufff9-\ufffb]/g, "").trim().slice(0, max);
   return text || undefined;
 }
 
@@ -169,8 +180,8 @@ export function parseExif(exif: Buffer | undefined): { camera?: string; taken?: 
   const order = tiff.toString("latin1", 0, 2);
   if (order !== "II" && order !== "MM") return {};
   const little = order === "II";
-  const u16 = (offset: number) => (offset + 2 <= tiff.length ? (little ? tiff.readUInt16LE(offset) : tiff.readUInt16BE(offset)) : -1);
-  const u32 = (offset: number) => (offset + 4 <= tiff.length ? (little ? tiff.readUInt32LE(offset) : tiff.readUInt32BE(offset)) : -1);
+  const u16 = (offset: number) => (offset >= 0 && offset + 2 <= tiff.length ? (little ? tiff.readUInt16LE(offset) : tiff.readUInt16BE(offset)) : -1);
+  const u32 = (offset: number) => (offset >= 0 && offset + 4 <= tiff.length ? (little ? tiff.readUInt32LE(offset) : tiff.readUInt32BE(offset)) : -1);
   if (u16(2) !== 42) return {};
   const readIfd = (offset: number) => {
     const values = new Map<number, { type: number; count: number; at: number }>();
@@ -205,6 +216,15 @@ export function parseExif(exif: Buffer | undefined): { camera?: string; taken?: 
   return result;
 }
 
+// EXIF problems never cost an image its other details.
+function exifDetails(exif: Buffer | undefined) {
+  try {
+    return parseExif(exif);
+  } catch {
+    return {};
+  }
+}
+
 async function imageInfo(handle: Awaited<ReturnType<typeof openVerifiedFile>>["handle"], size: number): Promise<MediaInfo | null> {
   const header = Buffer.alloc(64);
   const { bytesRead } = await handle.read(header, 0, header.length, 0);
@@ -226,7 +246,7 @@ async function imageInfo(handle: Awaited<ReturnType<typeof openVerifiedFile>>["h
       bitDepth: typeof meta.depth === "string" ? meta.depth.replace(/^u?char$/, "8-bit").replace(/^u?short$/, "16-bit") : undefined,
       colorSpace: meta.space ? meta.space.toUpperCase().replace(/^B-W$/, "Greyscale") : undefined,
       hasAlpha: meta.hasAlpha || undefined,
-      ...parseExif(meta.exif),
+      ...exifDetails(meta.exif),
     });
   } catch (error) {
     if (error instanceof AppError) throw error;
@@ -248,8 +268,21 @@ async function avInfo(fd: number, kind: "video" | "audio") {
   }
 }
 
-/** Media details of an image, video, or audio file. */
-export async function mediaInfoFor(relativePath: string): Promise<MediaInfo> {
+/** Media details of an image, video, or audio file, read for this account (a few at a time each). */
+export async function mediaInfoFor(relativePath: string, account = "local"): Promise<MediaInfo> {
+  if ((activePerAccount.get(account) ?? 0) >= MAX_ACTIVE_PER_ACCOUNT) throw new AppError("Other media details are still being read; try again shortly", 503, "MEDIA_BUSY");
+  // Counted before the first await, so requests arriving together can't all pass the check.
+  activePerAccount.set(account, (activePerAccount.get(account) ?? 0) + 1);
+  try {
+    return await readMediaInfo(relativePath);
+  } finally {
+    const remaining = (activePerAccount.get(account) ?? 1) - 1;
+    if (remaining > 0) activePerAccount.set(account, remaining);
+    else activePerAccount.delete(account);
+  }
+}
+
+async function readMediaInfo(relativePath: string): Promise<MediaInfo> {
   const kindOf = (mime: string) => (THUMBNAIL_TYPES.has(mime) ? "image" : VIDEO_THUMBNAIL_TYPES.has(mime) ? "video" : AUDIO_TYPES.has(mime) ? "audio" : null);
   // Refuse other names before opening anything.
   const kind = kindOf(getMime(relativePath));
@@ -266,13 +299,26 @@ export async function mediaInfoFor(relativePath: string): Promise<MediaInfo> {
   const { handle, openedPath, stat } = opened;
   try {
     if (!stat.isFile() || isReserved(openedPath) || kindOf(getMime(openedPath)) !== kind) throw new AppError("This file type has no media details", 415, "NO_MEDIA_INFO");
-    if (kind === "image" && stat.size > MAX_THUMBNAIL_SOURCE_BYTES) throw new AppError("This image is too large to read its details", 413, "IMAGE_TOO_LARGE");
+    // The size that is read (and keys the cache), not the one from opening the file.
     const identity = await handle.stat({ bigint: true });
-    const key = crypto.createHash("sha256").update(`${config.root}:${identity.dev}:${identity.ino}:${identity.size}:${identity.mtimeNs}:${identity.ctimeNs}`).digest("hex");
-    let info = cache.get(key);
+    if (kind === "image" && identity.size > BigInt(MAX_THUMBNAIL_SOURCE_BYTES)) throw new AppError("This image is too large to read its details", 413, "IMAGE_TOO_LARGE");
+    const key = crypto.createHash("sha256").update(`${kind}:${config.root}:${identity.dev}:${identity.ino}:${identity.size}:${identity.mtimeNs}:${identity.ctimeNs}`).digest("hex");
+    let info = cached(key);
     if (info === undefined) {
-      info = kind === "image" ? await imageInfo(handle, Number(identity.size)) : await avInfo(handle.fd, kind);
-      remember(key, info);
+      let read = reading.get(key);
+      if (!read) {
+        read = (async () => {
+          try {
+            const result = kind === "image" ? await imageInfo(handle, Number(identity.size)) : await avInfo(handle.fd, kind);
+            remember(key, result);
+            return result;
+          } finally {
+            reading.delete(key);
+          }
+        })();
+        reading.set(key, read);
+      }
+      info = await read;
     }
     if (!info) throw new AppError("This file's media details couldn't be read", 422, "INVALID_MEDIA");
     return info;

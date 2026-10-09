@@ -93,6 +93,17 @@ test("malformed EXIF gives no details rather than an error", () => {
   tiff.writeUInt32LE(1, 26);
   tiff.writeUInt32LE(8, 30);
   assert.deepEqual(parseExif(tiff), {});
+  // An Exif pointer whose value lies past the end.
+  const pointer = Buffer.alloc(26);
+  pointer.write("II", 0, "latin1");
+  pointer.writeUInt16LE(42, 2);
+  pointer.writeUInt32LE(8, 4);
+  pointer.writeUInt16LE(1, 8);
+  pointer.writeUInt16LE(0x8769, 10);
+  pointer.writeUInt16LE(4, 12);
+  pointer.writeUInt32LE(2, 14);
+  pointer.writeUInt32LE(0xfffffff0, 18);
+  assert.deepEqual(parseExif(pointer), {});
   for (let round = 0; round < 500; round += 1) {
     const noise = Buffer.from(Array.from({ length: 64 }, () => Math.floor(Math.random() * 256)));
     noise.write(round % 2 ? "MM\0*" : "II*\0", 0, "latin1");
@@ -124,6 +135,46 @@ test("videos and audio are read once by the probe, and failures aren't retried",
     // An edited file is read again.
     await fs.writeFile(path.join(root, "broken.mp3"), "audio");
     assert.equal((await mediaInfoFor("broken.mp3")).audioCodec, "FLAC");
+  });
+});
+
+test("requests for a file being read share one read, and each account reads a few at a time", async () => {
+  await withRoot(async (root) => {
+    for (const name of ["a.mp4", "b.mp4", "c.mp4"]) await fs.writeFile(path.join(root, name), name);
+    let calls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    setProbeRunner(async () => {
+      calls += 1;
+      await gate;
+      return Buffer.from(JSON.stringify(SAMPLE));
+    });
+    const shared = ["alice", "bob", "carol", "dave"].map((account) => mediaInfoFor("a.mp4", account));
+    const second = mediaInfoFor("b.mp4", "alice");
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    await assert.rejects(mediaInfoFor("c.mp4", "alice"), /still being read/);
+    release();
+    for (const info of await Promise.all([...shared, second])) assert.equal(info.videoCodec, "H.264 (High)");
+    assert.equal(calls, 2, "four requests for a.mp4 made one read");
+    assert.ok(await mediaInfoFor("c.mp4", "alice"), "once alice's reads finish she can read more");
+  });
+});
+
+test("a failed read is tried again after an hour", async () => {
+  await withRoot(async (root) => {
+    await fs.writeFile(path.join(root, "flaky.mp4"), "x");
+    let fail = true;
+    setProbeRunner(async () => (fail ? null : Buffer.from(JSON.stringify(SAMPLE))));
+    await assert.rejects(mediaInfoFor("flaky.mp4"), /couldn't be read/);
+    fail = false;
+    await assert.rejects(mediaInfoFor("flaky.mp4"), /couldn't be read/);
+    const now = Date.now;
+    Date.now = () => now() + 61 * 60 * 1000;
+    try {
+      assert.ok((await mediaInfoFor("flaky.mp4")).videoCodec);
+    } finally {
+      Date.now = now;
+    }
   });
 });
 
