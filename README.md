@@ -23,7 +23,7 @@ FilesDude is a secure, self-hosted web file manager designed for a Proxmox host,
 - Search inside files: switch the search box to **Contents** to find text in files under the current folder, with matching lines, line numbers, highlighting, and an optional match-case toggle. It reads text files up to 5 MB (skipping binary files, symlinks, and FilesDude's internal folders) and stops at 20,000 files, 256 MB, 15 seconds, or 200 matching files, saying when it did
 - Recursive filename search, disk usage, owner/group display, symlink escape warnings, and a cached whole-tree largest-files view from the clickable Storage card
 - Filter largest files by a minimum size, load 100, 250, or 500 more at a time, export the currently loaded results to CSV, and move one or many selected files to protected trash (or permanently delete them after confirmation)
-- Protected trash by default with a Trash view for restoring items to their original folders, deleting them forever, or emptying the trash; persistent favourites; and a JSON Lines audit log inside the protected state directory
+- Protected trash by default with a Trash view for restoring items to their original folders, deleting them forever, or emptying the trash, plus optional automatic removal of items after 7, 30, or 90 days or a year; persistent favourites; and a JSON Lines audit log inside the protected state directory
 - Signed, expiring, HTTP-only, SameSite login sessions; scrypt password hashes; login throttling; same-origin mutation checks; and hardened response headers
 - Account preferences for changing the username and password; credential changes invalidate other sessions
 - User accounts: the owner (the installer's login) can add editors (view and change files) and viewers (view and download only), each confined to one folder, from **Users** in the sidebar
@@ -129,6 +129,12 @@ sidebar to see each item's original location, size, and deletion time.
   renamed (for example `notes (restored).md`) rather than overwriting it.
 - **Delete forever** removes the selected items permanently.
 - **Empty trash** permanently removes everything in the trash and frees its space.
+
+By default items stay in the trash until someone removes them. The owner can instead
+choose, under **Preferences → Trash**, to remove items automatically 7, 30, or 90 days
+or a year after they were deleted. FilesDude checks hourly (and as soon as the setting
+is saved), the Trash shows how long each item has left, and every automatic removal is
+recorded in the audit log as `trash.purge`.
 
 Items trashed by FilesDude versions that did not record original locations are
 listed with an unknown location and restore to the root folder.
@@ -283,7 +289,6 @@ Shortcuts are ignored while you are typing in a field such as search.
 The safest default set is already included. These are strong next additions when you need them:
 
 - OIDC or WebAuthn/passkeys for multi-user sign-in and two-factor authentication
-- Automatic retention (age-based purging) for protected trash
 - Duplicate detection, video thumbnails, media metadata, and an index for searching file contents on very large trees
 - Antivirus scanning and upload quarantine for environments with untrusted uploaders
 - ZFS snapshot shortcuts and a version-history browser for Proxmox storage

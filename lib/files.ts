@@ -1069,6 +1069,39 @@ export async function deleteTrashItems(ids: string[]) {
   return { removed: ids.length };
 }
 
+// When an item went to the trash: from its record, the timestamp in a legacy name, or its change time.
+async function trashDeletedAt(trash: TrashDirectories, id: string) {
+  const info = await readTrashInfo(trash, id).catch(() => null);
+  if (info) return Date.parse(info.deletedAt);
+  const legacy = LEGACY_TRASH_ID.exec(id);
+  if (legacy) return Number(legacy[2]);
+  const stat = await fs.lstat(path.join(trash.items, id)).catch(() => null);
+  return stat ? stat.ctimeMs : Number.NaN;
+}
+
+/**
+ * Permanently removes trash items deleted more than `days` days ago, taking the filesystem lock one
+ * item at a time so other work isn't held up. Items with no readable deletion time are kept.
+ * Returns how many were removed.
+ */
+export async function purgeExpiredTrash(days: number, now = Date.now()) {
+  const trash = await trashDirectories();
+  if (!trash) return 0;
+  const cutoff = now - days * 86_400_000;
+  let removed = 0;
+  for (const id of await fs.readdir(trash.items)) {
+    const deletedAt = await trashDeletedAt(trash, id);
+    if (!Number.isFinite(deletedAt) || deletedAt >= cutoff) continue;
+    await withFilesystemLock(async () => {
+      await withOpen(openTrashFolder(trash.items), (items) => removeEntry(items, id));
+      await fs.rm(path.join(trash.info, `${id}.json`), { force: true });
+      legacyTrashSizes.delete(id);
+    });
+    removed += 1;
+  }
+  return removed;
+}
+
 export async function emptyTrash() {
   const trash = await trashDirectories();
   if (!trash) return { removed: 0 };

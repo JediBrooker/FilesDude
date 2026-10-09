@@ -5,9 +5,11 @@ import path from "node:path";
 import test from "node:test";
 import { config } from "../lib/config";
 import { execFileSync } from "node:child_process";
-import { acquireFilesystemLock, copyOrMove, deleteEntries, listTrash, recoverInterruptedCopies, PartialTransferError, renameEntry, restoreTrashItems, withFilesystemLock } from "../lib/files";
+import { acquireFilesystemLock, copyOrMove, deleteEntries, listTrash, purgeExpiredTrash, recoverInterruptedCopies, PartialTransferError, renameEntry, restoreTrashItems, withFilesystemLock } from "../lib/files";
 import { listJobs, startJob } from "../lib/jobs";
 import { currentScope, runInScope, runUnscoped } from "../lib/scope";
+import { getPreferences, savePreferences } from "../lib/preferences";
+import { runTrashRetention } from "../lib/trash-retention";
 import { readCopyJournal, recordCopy } from "../lib/copy-journal";
 import { createShare, openSharedItem, resolveShareToken, rewriteSharePaths } from "../lib/shares";
 import type { JobProgress } from "../lib/types";
@@ -282,6 +284,48 @@ test("copies are journaled while they run, and placeholders left by a restart ar
     assert.deepEqual((await fs.readdir(path.join(root, "dest"))).sort(), ["done (copying)", "file.bin", "reused (copying).bin", "theirs (copying).txt"]);
     assert.deepEqual(await fs.readdir(path.join(root, "elsewhere-real")), ["keep (copying)"]);
     assert.deepEqual(await readCopyJournal(), []);
+  });
+});
+
+test("trash retention removes only items deleted longer ago than the setting", async () => {
+  await withTempRoot(async (root) => {
+    for (const name of ["old.txt", "recent.txt"]) await fs.writeFile(path.join(root, name), name);
+    await fs.mkdir(path.join(root, "old-folder"));
+    await fs.writeFile(path.join(root, "old-folder", "inside.txt"), "x");
+    const { trashed } = await deleteEntries(["old.txt", "recent.txt", "old-folder"]);
+    const infoDir = path.join(root, ".filedude", "trash-info");
+    // Backdate two of them by 40 days.
+    for (const item of trashed.filter((entry) => entry.path !== "recent.txt")) {
+      const infoPath = path.join(infoDir, `${item.id}.json`);
+      const info = JSON.parse(await fs.readFile(infoPath, "utf8"));
+      await fs.writeFile(infoPath, JSON.stringify({ ...info, deletedAt: new Date(Date.now() - 40 * 86_400_000).toISOString() }));
+    }
+    // A legacy item (no record) named with an old timestamp, and an item with a damaged record.
+    const itemsDir = path.join(root, ".filedude", "trash");
+    await fs.writeFile(path.join(itemsDir, `legacy.txt.${Date.now() - 50 * 86_400_000}-abcdef`), "legacy");
+    await fs.writeFile(path.join(itemsDir, "undated"), "x");
+    await fs.writeFile(path.join(infoDir, "undated.json"), "not json");
+
+    assert.equal(await purgeExpiredTrash(30), 3);
+    const left = (await listTrash()).items.map((item) => item.name).sort();
+    assert.deepEqual(left, ["recent.txt", "undated"]);
+    assert.ok(!(await fs.readdir(infoDir)).some((name) => trashed.some((item) => item.path !== "recent.txt" && name === `${item.id}.json`)));
+    assert.equal(await purgeExpiredTrash(30), 0);
+  });
+});
+
+test("the retention run does nothing until the owner chooses a period", async () => {
+  await withTempRoot(async (root) => {
+    await fs.writeFile(path.join(root, "a.txt"), "a");
+    const { trashed } = await deleteEntries(["a.txt"]);
+    const infoPath = path.join(root, ".filedude", "trash-info", `${trashed[0].id}.json`);
+    const info = JSON.parse(await fs.readFile(infoPath, "utf8"));
+    await fs.writeFile(infoPath, JSON.stringify({ ...info, deletedAt: new Date(Date.now() - 10 * 86_400_000).toISOString() }));
+    assert.equal((await getPreferences()).trashRetentionDays, null);
+    assert.equal(await runTrashRetention(), 0);
+    await savePreferences({ ...(await getPreferences()), trashRetentionDays: 7 });
+    assert.equal(await runTrashRetention(), 1);
+    assert.deepEqual((await listTrash()).items, []);
   });
 });
 
