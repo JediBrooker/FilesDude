@@ -85,6 +85,8 @@ type AuthState = {
   /** The folder the account is confined to; "" for the whole root. */
   root: string | null;
   configurationIssues: string[];
+  /** What this server can do (sent once signed in). */
+  features?: { videoThumbnails: boolean };
 };
 type ManagedUser = { id: string; username: string; role: "editor" | "viewer"; root: string; createdAt: string; updatedAt: string; twoFactor: boolean };
 type TwoFactorStatus = { enabled: boolean; enabledAt: string | null; recoveryCodesLeft: number };
@@ -155,6 +157,8 @@ const ARCHIVE_NAME = /\.(zip|tar\.gz|tgz|tar)$/i;
 // Mirrors lib/thumbnails.ts: which images the server makes thumbnails for.
 const THUMBNAIL_MIME = new Set(["image/jpeg", "image/png", "image/gif", "image/webp", "image/avif"]);
 const MAX_THUMBNAIL_SOURCE_BYTES = 64 * 1024 * 1024;
+// Mirrors VIDEO_THUMBNAIL_TYPES: videos get a thumbnail when the server can make them (any size).
+const VIDEO_THUMBNAIL_MIME = new Set(["video/mp4", "video/webm", "video/x-matroska", "video/quicktime", "video/x-msvideo"]);
 // Properties hashes files up to this size straight away; larger ones wait for a click.
 const AUTO_CHECKSUM_BYTES = 64 * 1024 * 1024;
 
@@ -1339,7 +1343,7 @@ export function FileManager() {
                 onOpen={openEntry}
               />
             ) : (
-              <FileGrid entries={sortedEntries} selected={selected} cursor={cursor} interactions={interactions} onToggle={selectEntry} onOpen={openEntry} />
+              <FileGrid entries={sortedEntries} selected={selected} cursor={cursor} interactions={interactions} onToggle={selectEntry} onOpen={openEntry} videoThumbnails={auth.features?.videoThumbnails ?? false} />
             )}
           </div>
           <div className="drop-hint"><Upload size={15} /> Drop files anywhere to upload to this folder</div>
@@ -1600,14 +1604,16 @@ function BackgroundMenu({ canWrite, position, menuRef, folder, clipboardCount, c
   );
 }
 
-function FileGrid({ entries, selected, cursor, interactions, onToggle, onOpen }: { entries: FileEntry[]; selected: Set<string>; cursor: string | null; interactions: EntryInteractions; onToggle: (entry: FileEntry, options?: SelectOptions) => void; onOpen: (entry: FileEntry) => void }) {
-  return <div className="file-grid">{entries.map((entry) => <article key={entry.path} data-path={entry.path} className={`file-card ${selected.has(entry.path) ? "selected" : ""} ${cursor === entry.path ? "cursor" : ""} ${entryStateClasses(entry, interactions)}`} {...entryItemProps(entry, interactions)} onMouseDown={(event) => { if (event.shiftKey) event.preventDefault(); }} onClick={(event) => { if ((event.target as HTMLElement).closest("button,input,label")) return; onToggle(entry, { additive: event.metaKey || event.ctrlKey, range: event.shiftKey }); }} onDoubleClick={() => onOpen(entry)}><CheckBox checked={selected.has(entry.path)} onChange={(event) => onToggle(entry, { additive: true, range: event.shiftKey })} label={`Select ${entry.name}`} /><GridPreview entry={entry} onOpen={onOpen} /><button className="grid-name" onClick={() => onOpen(entry)}>{entry.name}</button><span>{entry.type === "directory" ? "Folder" : `${extension(entry.name)} · ${formatBytes(entry.size)}`}</span></article>)}</div>;
+function FileGrid({ entries, selected, cursor, interactions, onToggle, onOpen, videoThumbnails }: { entries: FileEntry[]; selected: Set<string>; cursor: string | null; interactions: EntryInteractions; onToggle: (entry: FileEntry, options?: SelectOptions) => void; onOpen: (entry: FileEntry) => void; videoThumbnails: boolean }) {
+  return <div className="file-grid">{entries.map((entry) => <article key={entry.path} data-path={entry.path} className={`file-card ${selected.has(entry.path) ? "selected" : ""} ${cursor === entry.path ? "cursor" : ""} ${entryStateClasses(entry, interactions)}`} {...entryItemProps(entry, interactions)} onMouseDown={(event) => { if (event.shiftKey) event.preventDefault(); }} onClick={(event) => { if ((event.target as HTMLElement).closest("button,input,label")) return; onToggle(entry, { additive: event.metaKey || event.ctrlKey, range: event.shiftKey }); }} onDoubleClick={() => onOpen(entry)}><CheckBox checked={selected.has(entry.path)} onChange={(event) => onToggle(entry, { additive: true, range: event.shiftKey })} label={`Select ${entry.name}`} /><GridPreview entry={entry} onOpen={onOpen} videoThumbnails={videoThumbnails} /><button className="grid-name" onClick={() => onOpen(entry)}>{entry.name}</button><span>{entry.type === "directory" ? "Folder" : `${extension(entry.name)} · ${formatBytes(entry.size)}`}</span></article>)}</div>;
 }
 
-// A thumbnail for images the server can preview, falling back to the type icon if it can't.
-function GridPreview({ entry, onOpen }: { entry: FileEntry; onOpen: (entry: FileEntry) => void }) {
+// A thumbnail for images (and videos, when the server can) it can preview, falling back to the type
+// icon if it can't.
+function GridPreview({ entry, onOpen, videoThumbnails }: { entry: FileEntry; onOpen: (entry: FileEntry) => void; videoThumbnails: boolean }) {
   const [failed, setFailed] = useState(false);
-  const thumbnail = !failed && entry.type === "file" && THUMBNAIL_MIME.has(entry.mime) && entry.size <= MAX_THUMBNAIL_SOURCE_BYTES;
+  const video = videoThumbnails && VIDEO_THUMBNAIL_MIME.has(entry.mime);
+  const thumbnail = !failed && entry.type === "file" && ((THUMBNAIL_MIME.has(entry.mime) && entry.size <= MAX_THUMBNAIL_SOURCE_BYTES) || video);
   return (
     <button className={`grid-icon ${entry.type} ${thumbnail ? "has-thumbnail" : ""}`} onClick={() => onOpen(entry)} aria-label={`Open ${entry.name}`}>
       {thumbnail
@@ -1615,6 +1621,7 @@ function GridPreview({ entry, onOpen }: { entry: FileEntry; onOpen: (entry: File
         // eslint-disable-next-line @next/next/no-img-element
         ? <img src={`/api/fs/thumbnail?path=${encodePath(entry.path)}&v=${encodeURIComponent(`${entry.modified}-${entry.size}`)}`} alt="" loading="lazy" decoding="async" draggable={false} onError={() => setFailed(true)} />
         : fileIcon(entry, 34)}
+      {thumbnail && video && <span className="video-badge" aria-hidden="true"><FileVideo size={12} /></span>}
     </button>
   );
 }
