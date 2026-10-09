@@ -93,7 +93,8 @@ function mutate<T>(operation: (shares: StoredShare[]) => Promise<{ shares: Store
   const run = async () => {
     const current = await readShares();
     const { shares, result } = await operation(current.filter((share) => isActive(share)));
-    await writeShares(shares);
+    // Most rewrites (one per moved item) change nothing, so they skip the fsynced write.
+    if (JSON.stringify(shares) !== JSON.stringify(current)) await writeShares(shares);
     return result;
   };
   const result = mutationQueue.then(run, run);

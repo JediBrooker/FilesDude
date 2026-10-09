@@ -24,7 +24,7 @@ const FAMILY_LIMITS = { archive: 1, transfer: 4, request: 4 };
 
 const jobs = new Map<string, Job>();
 const KEEP_FINISHED_MS = 15 * 60_000;
-const KEEP_FINISHED_PER_ACCOUNT = 20;
+const KEEP_FINISHED_PER_ACCOUNT = 10;
 
 function snapshot(job: Job): JobState {
   const { id, kind, label, status, startedAt, finishedAt, result, error } = job;
@@ -34,15 +34,15 @@ function snapshot(job: Job): JobState {
 }
 
 // Finished jobs are kept for a while so the browser can collect their outcome, but each account
-// keeps only its most recent ones (Map order is the order jobs started).
+// keeps only the ones that finished most recently.
 function prune() {
   const cutoff = Date.now() - KEEP_FINISHED_MS;
   const kept = new Map<string, number>();
-  for (const [id, job] of [...jobs].reverse()) {
-    if (!job.finishedAt) continue;
+  const finished = [...jobs].filter(([, job]) => job.finishedAt).sort(([, a], [, b]) => b.finishedAt!.localeCompare(a.finishedAt!));
+  for (const [id, job] of finished) {
     const count = (kept.get(job.accountKey) ?? 0) + 1;
     kept.set(job.accountKey, count);
-    if (Date.parse(job.finishedAt) < cutoff || count > KEEP_FINISHED_PER_ACCOUNT) jobs.delete(id);
+    if (Date.parse(job.finishedAt!) < cutoff || count > KEEP_FINISHED_PER_ACCOUNT) jobs.delete(id);
   }
 }
 

@@ -4,7 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { config } from "../lib/config";
-import { acquireFilesystemLock, copyOrMove, createEntry, deleteEntries, listDirectory, listTrash, PartialTransferError, renameEntry, restoreTrashItems, withFilesystemLock } from "../lib/files";
+import { execFileSync } from "node:child_process";
+import { acquireFilesystemLock, copyOrMove, deleteEntries, listTrash, PartialTransferError, renameEntry, restoreTrashItems, withFilesystemLock } from "../lib/files";
 import { listJobs, startJob } from "../lib/jobs";
 import type { JobProgress } from "../lib/types";
 
@@ -148,7 +149,7 @@ test("copies report byte progress and don't hold the filesystem lock while copyi
   });
 });
 
-test("a move between filesystems removes only what it copied and puts anything new back", async () => {
+test("a move between filesystems removes only what it copied and leaves anything new in place", async () => {
   await withTempRoot(async (root) => {
     await fs.mkdir(path.join(root, "src"));
     await fs.writeFile(path.join(root, "src", "a.txt"), "a");
@@ -164,14 +165,13 @@ test("a move between filesystems removes only what it copied and puts anything n
       return null;
     };
     Object.assign(fs, {
-      rename: (from: string, to: string) => (String(from).endsWith(`${path.sep}src`) || String(from).endsWith("/src")) && !String(to).includes(".filedude-move-") ? crossDevice(to) ?? original.rename(from, to) : original.rename(from, to),
+      rename: (from: string, to: string) => (String(from).endsWith("/src") ? crossDevice(to) ?? original.rename(from, to) : original.rename(from, to)),
       link: (from: string, to: string) => crossDevice(to) ?? original.link(from, to),
       readdir: async (...args: Parameters<typeof fs.readdir>) => {
         const result = await (original.readdir as (...a: unknown[]) => Promise<unknown>)(...args);
-        const staged = (await original.readdir(root)).find((name) => name.startsWith(".filedude-move-"));
-        if (staged && !injected && Array.isArray(result) && result.includes("a.txt")) {
+        if (!injected && Array.isArray(result) && result.includes("a.txt")) {
           injected = true;
-          await fs.writeFile(path.join(root, staged, "late.txt"), "late");
+          await fs.writeFile(path.join(root, "src", "late.txt"), "late");
         }
         return result;
       },
@@ -185,7 +185,7 @@ test("a move between filesystems removes only what it copied and puts anything n
     assert.ok(injected);
     assert.deepEqual(await fs.readdir(path.join(root, "dest", "src")), ["a.txt"]);
     assert.deepEqual(await fs.readdir(path.join(root, "src")), ["late.txt"]);
-    assert.deepEqual((await fs.readdir(root)).sort(), ["dest", "src"]);
+    assert.deepEqual(await fs.readdir(path.join(root, "dest")), ["src"]);
   });
 });
 
@@ -212,13 +212,22 @@ test("a copy cancelled while waiting to be put in place is removed", async () =>
   });
 });
 
-test("FilesDude's temporary names are hidden and can't be created", async () => {
+test("a failed copy never removes an item that took over its placeholder name", async () => {
   await withTempRoot(async (root) => {
-    await fs.writeFile(path.join(root, ".filedude-copy-leftover"), "x");
-    await fs.writeFile(path.join(root, ".visible"), "x");
-    assert.deepEqual((await listDirectory("", true)).entries.map((entry) => entry.name), [".visible"]);
-    await assert.rejects(createEntry("", ".filedude-move-x", "file"), /reserved/);
-    await assert.rejects(listDirectory(".filedude-copy-leftover"), /reserved/);
+    await fs.mkdir(path.join(root, "dest"));
+    await fs.writeFile(path.join(root, "file.bin"), Buffer.alloc(3 * MB));
+    let swapped = false;
+    await assert.rejects(copyOrMove(["file.bin"], "dest", false, {
+      report: (progress) => {
+        if (progress.done > 0 && !swapped) {
+          swapped = true;
+          // Someone renames the placeholder away and puts their own file at its name.
+          execFileSync("sh", ["-c", `mv "${path.join(root, "dest", "file (copying).bin")}" "${path.join(root, "dest", "moved.bin")}" && echo mine > "${path.join(root, "dest", "file (copying).bin")}"`]);
+        }
+      },
+    }), /changed while it was being written/);
+    assert.equal(await fs.readFile(path.join(root, "dest", "file (copying).bin"), "utf8"), "mine\n");
+    assert.ok(!(await fs.readdir(path.join(root, "dest"))).includes("file.bin"));
   });
 });
 
@@ -230,7 +239,8 @@ test("each account keeps only its most recent finished jobs", async () => {
   startJob("move", "last", { done: 0, unit: "entries" }, async () => []);
   await new Promise((resolve) => setTimeout(resolve, 20));
   const finished = listJobs().filter((job) => job.status === "done");
-  assert.ok(finished.length <= 21, `${finished.length} finished jobs kept`);
+  assert.ok(finished.length <= 11, `${finished.length} finished jobs kept`);
+  assert.ok(finished.some((job) => job.label === "last"));
   assert.ok(finished.every((job) => job.transferred === undefined));
 });
 
