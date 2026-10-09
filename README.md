@@ -319,6 +319,10 @@ The running version (from `package.json`) and the commit it was built from appea
 at the bottom of the sidebar once signed in; hover it for the build time. It is not
 shown on the sign-in page.
 
+An open page checks whether the server has been updated when you return to its tab and
+every 10 minutes while it is visible. If the server runs a newer build, a banner offers to
+reload, so a tab left open across `filesdude-update` doesn't keep running the old version.
+
 ## Manual development setup
 
 FilesDude deliberately refuses to sign users in until a password hash and a strong session secret are configured.
