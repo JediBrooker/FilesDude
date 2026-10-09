@@ -25,6 +25,11 @@ export function runInScope<T>(scope: AccessScope, run: () => T): T {
   return storage.run(scope, run);
 }
 
+/** Runs work that belongs to the service itself, not to the account whose request started it. */
+export function runUnscoped<T>(run: () => T): T {
+  return storage.exit(run);
+}
+
 /** True when the relative path is the scope root or inside it. */
 export function withinScope(relativePath: string, root = scopeRoot()) {
   return !root || relativePath === root || relativePath.startsWith(`${root}/`);
