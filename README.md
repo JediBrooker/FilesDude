@@ -193,7 +193,8 @@ you in once if you lose your phone; save them, as they aren't shown again.
 
 - Each code works only once, and wrong codes count towards the sign-in limit.
 - Turning it on or off, or replacing recovery codes, needs your password and signs out
-  your other sessions (except replacing codes).
+  your other sessions. Turning it off or replacing codes also needs a code.
+- After five wrong codes, an account can't use a code for 15 minutes.
 - The owner can reset two-factor sign-in for another account from **Users**, for
   example after a lost phone; that account then signs in with its password and can set
   it up again.

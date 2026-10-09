@@ -5,7 +5,7 @@ import {
   clearLoginFailures,
   clientAddress,
   createSession,
-  recordLoginFailure,
+  refundLoginAttempt,
   sessionCookie,
   verifyPassword,
 } from "@/lib/auth";
@@ -27,13 +27,12 @@ export async function POST(request: Request) {
     const body = parsed && typeof parsed === "object" ? parsed as { username?: unknown; password?: unknown; challenge?: unknown; code?: unknown } : {};
 
     // Second step for accounts with two-factor sign-in: the challenge from the password step plus a
-    // code. Wrong codes count towards the same sign-in limit as wrong passwords.
+    // code. Each try counts towards the same sign-in limit as passwords (counted when it started).
     if (body.challenge !== undefined) {
       let completed;
       try {
         completed = await completeChallenge(body.challenge, body.code);
       } catch (error) {
-        recordLoginFailure(key);
         await audit("login.two_factor.failed", { client: key, reason: error instanceof AppError ? error.code : "ERROR" });
         throw error;
       }
@@ -58,13 +57,14 @@ export async function POST(request: Request) {
     // A password check runs even for unknown names, so response timing doesn't reveal which exist.
     const validPassword = await verifyPassword(inputValid ? password : "", account?.hash ?? credentials.passwordHash);
     if (!account || !validPassword) {
-      recordLoginFailure(key);
       await audit("login.failed", { username: username.slice(0, 64), client: key });
       throw new AppError("Invalid username or password", 401, "INVALID_CREDENTIALS");
     }
 
     // The password was right; an account with two-factor sign-in still needs a code before it gets a session.
     if (account.twoFactor) {
+      // A right password isn't a failed attempt; the code step counts its own tries.
+      refundLoginAttempt(key);
       await audit("login.two_factor.challenged", { username, client: key });
       return NextResponse.json({ twoFactorRequired: true, challenge: createChallenge(account) }, { headers: { "Cache-Control": "no-store" } });
     }

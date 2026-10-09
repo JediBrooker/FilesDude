@@ -111,6 +111,32 @@ function consumeCode(twoFactor: StoredTwoFactor, rawCode: unknown): { twoFactor:
 
 const wrongCode = () => new AppError("That code isn't right. Use the current code from your authenticator app, or a recovery code.", 401, "INVALID_TWO_FACTOR_CODE");
 
+// Each account may get a code wrong a few times in 15 minutes, wherever the code is entered (signing
+// in, turning two-factor sign-in off, or replacing recovery codes). A try is counted when it starts,
+// so parallel requests can't exceed the limit, and a right code clears the count.
+const CODE_ATTEMPT_LIMIT = 5;
+const CODE_LOCK_MS = 15 * 60_000;
+const codeAttempts = new Map<string, { count: number; resetAt: number }>();
+
+function reserveCodeAttempt(accountKey: string) {
+  const now = Date.now();
+  const attempt = codeAttempts.get(accountKey);
+  if (!attempt || attempt.resetAt <= now) {
+    codeAttempts.set(accountKey, { count: 1, resetAt: now + CODE_LOCK_MS });
+    return;
+  }
+  if (attempt.count >= CODE_ATTEMPT_LIMIT) throw new AppError("Too many wrong codes for this account. Try again in 15 minutes.", 429, "TWO_FACTOR_LOCKED");
+  attempt.count += 1;
+}
+
+/** Runs a code check for an account within its limit on wrong codes. */
+async function withCodeAttempt<T>(accountKey: string, check: () => Promise<T>) {
+  reserveCodeAttempt(accountKey);
+  const result = await check();
+  codeAttempts.delete(accountKey);
+  return result;
+}
+
 // --- Sign-in ---
 
 const challengeAttempts = new Map<string, { count: number; expiresAt: number }>();
@@ -135,12 +161,12 @@ export async function completeChallenge(challenge: unknown, code: unknown) {
   if (attempt.count >= MAX_CHALLENGE_ATTEMPTS) throw new AppError("Too many wrong codes. Enter your password again.", 401, "CHALLENGE_EXPIRED");
   attempt.count += 1;
   challengeAttempts.set(nonce, attempt);
-  const outcome = await changeTwoFactor(payload.k, (account) => {
+  const outcome = await withCodeAttempt(payload.k, () => changeTwoFactor(payload.k as string, (account) => {
     if (account.version !== payload.v || !account.twoFactor) throw new AppError("Your sign-in has expired. Enter your password again.", 401, "CHALLENGE_EXPIRED");
     const used = consumeCode(account.twoFactor, code);
     if (!used) throw wrongCode();
     return { twoFactor: used.twoFactor, result: { method: used.method, recoveryCodesLeft: used.twoFactor.recoveryCodes.length } };
-  });
+  }));
   challengeAttempts.delete(nonce);
   return { accountKey: payload.k, username: outcome.username, version: outcome.version, ...outcome.result };
 }
@@ -186,26 +212,30 @@ export async function finishSetup(accountKey: string, setupToken: unknown, code:
 
 /** Turns two-factor sign-in off, after a code (or recovery code) proves the device is at hand. */
 export async function disableTwoFactor(accountKey: string, code: unknown) {
-  return changeTwoFactor(accountKey, (account) => {
+  return withCodeAttempt(accountKey, () => changeTwoFactor(accountKey, (account) => {
     if (!account.twoFactor) throw new AppError("Two-factor sign-in is already off", 409, "TWO_FACTOR_DISABLED");
     if (!consumeCode(account.twoFactor, code)) throw wrongCode();
     return { twoFactor: null, bumpVersion: true, result: undefined };
-  });
+  }));
 }
 
-/** Replaces the recovery codes, after a code proves the device is at hand. */
+/** Replaces the recovery codes, after a code proves the device is at hand, and signs out other sessions. */
 export async function regenerateRecoveryCodes(accountKey: string, code: unknown) {
   const recoveryCodes = newRecoveryCodes();
-  return changeTwoFactor(accountKey, (account) => {
+  return withCodeAttempt(accountKey, () => changeTwoFactor(accountKey, (account) => {
     if (!account.twoFactor) throw new AppError("Two-factor sign-in is off", 409, "TWO_FACTOR_DISABLED");
     const used = consumeCode(account.twoFactor, code);
     if (!used) throw wrongCode();
-    return { twoFactor: { ...used.twoFactor, recoveryCodes: recoveryCodes.map((item) => hashRecoveryCode(normalizeCode(item))) }, result: recoveryCodes };
-  });
+    return { twoFactor: { ...used.twoFactor, recoveryCodes: recoveryCodes.map((item) => hashRecoveryCode(normalizeCode(item))) }, bumpVersion: true, result: recoveryCodes };
+  }));
 }
 
-/** Removes an account's two-factor sign-in (the owner's reset for a lost device) and signs it out. */
+/**
+ * Removes another account's two-factor sign-in (the owner's reset for a lost device) and signs it
+ * out. The owner's own can only be turned off with a code, or cleared on the server.
+ */
 export async function resetTwoFactor(accountKey: string) {
+  if (accountKey === "owner") throw new AppError("The owner turns off their own two-factor sign-in from Preferences", 400, "INVALID_REQUEST");
   return changeTwoFactor(accountKey, (account) => {
     if (!account.twoFactor) throw new AppError("Two-factor sign-in is already off for that account", 409, "TWO_FACTOR_DISABLED");
     return { twoFactor: null, bumpVersion: true, result: undefined };

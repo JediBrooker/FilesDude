@@ -39,6 +39,16 @@ export async function POST(request: Request) {
           throw new AppError("Current password is incorrect", 401, "INVALID_CURRENT_PASSWORD");
         }
       };
+      const auditWrongCode = async <T,>(check: () => Promise<T>) => {
+        try {
+          return await check();
+        } catch (error) {
+          if (error instanceof AppError && (error.code === "INVALID_TWO_FACTOR_CODE" || error.code === "TWO_FACTOR_LOCKED")) {
+            await audit("settings.two_factor.failed", { username: session.username, action: body.action, reason: error.code });
+          }
+          throw error;
+        }
+      };
       const withNewSession = (payload: Record<string, unknown>, version: number) => {
         const response = NextResponse.json({ ok: true, ...payload }, { headers: { "Cache-Control": "no-store" } });
         response.headers.set("Set-Cookie", sessionCookie(createSession(account.username, version, account.key), request));
@@ -55,15 +65,15 @@ export async function POST(request: Request) {
         }
         case "disable": {
           await requirePassword();
-          const { version } = await disableTwoFactor(account.key, body.code);
+          const { version } = await auditWrongCode(() => disableTwoFactor(account.key, body.code));
           await audit("settings.two_factor.disabled", { username: session.username });
           return withNewSession({}, version);
         }
         case "recovery-codes": {
           await requirePassword();
-          const { result: recoveryCodes } = await regenerateRecoveryCodes(account.key, body.code);
+          const { result: recoveryCodes, version } = await auditWrongCode(() => regenerateRecoveryCodes(account.key, body.code));
           await audit("settings.two_factor.recovery_codes", { username: session.username });
-          return NextResponse.json({ ok: true, recoveryCodes }, { headers: { "Cache-Control": "no-store" } });
+          return withNewSession({ recoveryCodes }, version);
         }
         default:
           throw new AppError("Unknown two-factor operation", 400, "UNKNOWN_ACTION");

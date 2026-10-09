@@ -420,14 +420,37 @@ test("two-factor sign-in: setup, codes used once, recovery codes, and attempts",
     const third = (await (await signIn({ username: "bob", password: USER_PASSWORD })).json()).challenge;
     assert.equal(await status(signIn({ challenge: third, code: recoveryCodes[0] })), 401);
 
+    // A right code clears the account's wrong-code count.
+    clearLoginFailures("direct-client");
+    const reset = (await (await signIn({ username: "bob", password: USER_PASSWORD })).json()).challenge;
+    assert.equal(await status(signIn({ challenge: reset, code: recoveryCodes[1] })), 200);
+
     // Each challenge allows five tries, after which the password is needed again.
     clearLoginFailures("direct-client");
     const limited = (await (await signIn({ username: "bob", password: USER_PASSWORD })).json()).challenge;
     for (let attempt = 0; attempt < 4; attempt += 1) assert.equal(await status(signIn({ challenge: limited, code: "000000" })), 401);
     clearLoginFailures("direct-client");
     assert.equal(await status(signIn({ challenge: limited, code: "000000" })), 401);
-    const exhausted = await signIn({ challenge: limited, code: recoveryCodes[1] });
+    const exhausted = await signIn({ challenge: limited, code: recoveryCodes[2] });
     assert.deepEqual([exhausted.status, (await exhausted.json()).code], [401, "CHALLENGE_EXPIRED"]);
+
+    // Five wrong codes also lock the account's codes for a while, even on a fresh challenge and
+    // even for a right code, so new challenges can't be used to keep guessing.
+    clearLoginFailures("direct-client");
+    const fresh2 = (await (await signIn({ username: "bob", password: USER_PASSWORD })).json()).challenge;
+    const locked = await signIn({ challenge: fresh2, code: recoveryCodes[2] });
+    assert.deepEqual([locked.status, (await locked.json()).code], [429, "TWO_FACTOR_LOCKED"]);
+    clearLoginFailures("direct-client");
+  });
+});
+
+test("sign-in attempts are counted as they start, so parallel requests can't exceed the limit", async () => {
+  await withAccounts(async () => {
+    clearLoginFailures("direct-client");
+    const results = await Promise.all(Array.from({ length: 12 }, () => signIn({ username: "bob", password: "wrong-password-here" })));
+    const statuses = results.map((response) => response.status);
+    assert.equal(statuses.filter((code) => code === 401).length, 5);
+    assert.equal(statuses.filter((code) => code === 429).length, 7);
     clearLoginFailures("direct-client");
   });
 });
@@ -450,6 +473,8 @@ test("two-factor sign-in can be turned off, reset by the owner, and survives cre
     const plain = await signIn({ username: "bob", password: USER_PASSWORD });
     assert.deepEqual([plain.status, (await plain.json()).authenticated], [200, true]);
     assert.equal(await status(call(usersAction, "/api/users", owner, { action: "resetTwoFactor", id: ids.bob })), 409);
+    // The owner's own can't be cleared through the reset, only turned off with a code.
+    assert.equal(await status(call(usersAction, "/api/users", owner, { action: "resetTwoFactor", id: "owner" })), 400);
 
     // The owner's own two-factor sign-in is kept when they change their password.
     const ownerTwoFactor = await enableTwoFactor(owner, OWNER_PASSWORD);
