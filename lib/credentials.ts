@@ -9,7 +9,21 @@ export interface StoredCredentials {
   passwordHash: string;
   version: number;
   updatedAt?: string;
+  twoFactor?: StoredTwoFactor;
 }
+
+/** An account's authenticator-app sign-in, stored with its credentials. */
+export interface StoredTwoFactor {
+  /** Base32 TOTP secret. */
+  secret: string;
+  /** SHA-256 hashes of the unused recovery codes. */
+  recoveryCodes: string[];
+  /** The last time step a code was accepted for, so no code works twice. */
+  lastStep: number;
+  enabledAt: string;
+}
+
+let mutationQueue: Promise<void> = Promise.resolve();
 
 function credentialsFile() {
   return path.join(config.stateDir, "credentials.json");
@@ -52,6 +66,18 @@ export function hashPassword(password: string) {
       else resolve(`scrypt$16384$8$1$${salt.toString("base64url")}$${derivedKey.toString("base64url")}`);
     });
   });
+}
+
+/** Reads, changes, and saves the owner's credentials, one change at a time; `change` returns null to leave them as they are. */
+export function updateCredentials<T>(change: (current: StoredCredentials) => Promise<{ next: StoredCredentials | null; result: T }>) {
+  const run = async () => {
+    const { next, result } = await change(await getCredentials());
+    if (next) await saveCredentials(next);
+    return result;
+  };
+  const result = mutationQueue.then(run, run);
+  mutationQueue = result.then(() => undefined, () => undefined);
+  return result;
 }
 
 export async function saveCredentials(credentials: StoredCredentials) {

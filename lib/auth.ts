@@ -147,6 +147,11 @@ function sweepLoginAttempts(now: number) {
   lastLoginAttemptSweep = now;
 }
 
+/**
+ * Counts a sign-in attempt as it starts, before anything is awaited, so requests sent in parallel
+ * can't all get past the limit. A successful sign-in clears the count; a right password that still
+ * needs a two-factor code gives its attempt back with refundLoginAttempt.
+ */
 export function checkLoginRateLimit(key: string) {
   const now = Date.now();
   sweepLoginAttempts(now);
@@ -155,18 +160,18 @@ export function checkLoginRateLimit(key: string) {
     if (loginAttempts.size >= MAX_LOGIN_RATE_LIMIT_KEYS) {
       throw new AppError("Too many login attempts. Try again later.", 429, "RATE_LIMITED");
     }
-    loginAttempts.set(key, { count: 0, resetAt: now + 15 * 60 * 1000 });
+    loginAttempts.set(key, { count: 1, resetAt: now + 15 * 60 * 1000 });
     return;
   }
   if (attempt.count >= 5) {
     throw new AppError("Too many login attempts. Try again later.", 429, "RATE_LIMITED");
   }
+  attempt.count += 1;
 }
 
-export function recordLoginFailure(key: string) {
-  const attempt = loginAttempts.get(key) || { count: 0, resetAt: Date.now() + 15 * 60 * 1000 };
-  attempt.count += 1;
-  loginAttempts.set(key, attempt);
+export function refundLoginAttempt(key: string) {
+  const attempt = loginAttempts.get(key);
+  if (attempt && attempt.count > 0) attempt.count -= 1;
 }
 
 export function clearLoginFailures(key: string) {

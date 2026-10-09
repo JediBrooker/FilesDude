@@ -26,6 +26,7 @@ FilesDude is a secure, self-hosted web file manager designed for a Proxmox host,
 - Protected trash by default with a Trash view for restoring items to their original folders, deleting them forever, or emptying the trash, plus optional automatic removal of items after 7, 30, or 90 days or a year; persistent favourites; and a JSON Lines audit log inside the protected state directory
 - Signed, expiring, HTTP-only, SameSite login sessions; scrypt password hashes; login throttling; same-origin mutation checks; and hardened response headers
 - Account preferences for changing the username and password; credential changes invalidate other sessions
+- Optional two-factor sign-in for every account with an authenticator app (6-digit codes), with one-time recovery codes
 - User accounts: the owner (the installer's login) can add editors (view and change files) and viewers (view and download only), each confined to one folder, from **Users** in the sidebar
 - Multi-selection toolbar actions, responsive UI, dark mode, keyboard shortcuts, and no external analytics or storage services
 
@@ -182,6 +183,28 @@ running as root, its owner; FIFOs, sockets, and devices aren't copied. Changing 
 folder, or password signs it out everywhere; accounts can change their own password from
 the account menu. Accounts are stored in `users.json` in the state directory.
 
+## Two-factor sign-in
+
+Any account can require a 6-digit code from an authenticator app (1Password, Google
+Authenticator, Authy, and so on) as well as its password: open **Preferences** (or
+**Your account**), choose **Set up** under Two-factor sign-in, confirm your password,
+scan the QR code, and enter a code. You then get 10 recovery codes, each of which signs
+you in once if you lose your phone; save them, as they aren't shown again.
+
+- Each code works only once, and wrong codes count towards the sign-in limit.
+- Turning it on or off, or replacing recovery codes, needs your password and signs out
+  your other sessions. Turning it off or replacing codes also needs a code.
+- After five wrong codes, an account can't use a code for 15 minutes.
+- The owner can reset two-factor sign-in for another account from **Users**, for
+  example after a lost phone; that account then signs in with its password and can set
+  it up again.
+- If the owner loses both their phone and recovery codes, remove the `twoFactor` entry
+  from `credentials.json` in the state directory as root (for example
+  `/var/lib/filesdude/credentials.json`) and restart the service.
+
+Passkeys aren't offered because browsers only allow them over HTTPS, and FilesDude is
+often reached over plain HTTP on a LAN.
+
 ## Share links
 
 Right-click a file or folder and choose **Share link…** to create a link that anyone can
@@ -288,7 +311,7 @@ Shortcuts are ignored while you are typing in a field such as search.
 
 The safest default set is already included. These are strong next additions when you need them:
 
-- OIDC or WebAuthn/passkeys for multi-user sign-in and two-factor authentication
+- OIDC single sign-on, and passkeys for installations served over HTTPS
 - Duplicate detection, video thumbnails, media metadata, and an index for searching file contents on very large trees
 - Antivirus scanning and upload quarantine for environments with untrusted uploaders
 - ZFS snapshot shortcuts and a version-history browser for Proxmox storage

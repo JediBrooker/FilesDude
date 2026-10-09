@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { withAccess } from "@/lib/access";
 import { createSession, sessionCookie, verifyPassword } from "@/lib/auth";
 import { audit } from "@/lib/audit";
-import { getCredentials, hashPassword, saveCredentials, validateNewPassword, validateUsername } from "@/lib/credentials";
+import { getCredentials, hashPassword, updateCredentials, validateNewPassword, validateUsername } from "@/lib/credentials";
 import { identityCatalog, isKnownIdentityPair } from "@/lib/files";
 import { assertMutationRequest, AppError, jsonError, readJsonBody } from "@/lib/http";
 import { getPreferences, parseTrashRetention, parseUploadOwnershipPreference, savePreferences } from "@/lib/preferences";
@@ -91,14 +91,13 @@ export async function POST(request: Request) {
     const updatedAt = new Date().toISOString();
     let credentialVersion = current.version;
     if (credentialsChanged) {
-      const updated = {
-        username,
-        passwordHash: body.newPassword ? await hashPassword(body.newPassword as string) : current.passwordHash,
-        version: current.version + 1,
-        updatedAt,
-      };
-      await saveCredentials(updated);
-      credentialVersion = updated.version;
+      const passwordHash = body.newPassword ? await hashPassword(body.newPassword as string) : undefined;
+      // Applied to the latest credentials through their update queue, so a two-factor change made
+      // meanwhile (and anything else stored with them) is kept.
+      credentialVersion = await updateCredentials(async (latest) => {
+        const next = { ...latest, username, passwordHash: passwordHash ?? latest.passwordHash, version: latest.version + 1, updatedAt };
+        return { next, result: next.version };
+      });
     }
     if (ownershipChanged || retentionChanged) await savePreferences({ ...storedPreferences, uploadOwnership, trashRetentionDays, updatedAt });
     await audit("settings.preferences.updated", {

@@ -3,6 +3,7 @@ import { withAccess } from "@/lib/access";
 import { audit } from "@/lib/audit";
 import { assertMutationRequest, AppError, jsonError, readJsonBody } from "@/lib/http";
 import { cancelAccountJobs } from "@/lib/jobs";
+import { resetTwoFactor } from "@/lib/two-factor";
 import { createUser, deleteUser, listUsers, updateUser } from "@/lib/users";
 
 export const runtime = "nodejs";
@@ -39,6 +40,15 @@ export async function POST(request: Request) {
           cancelAccountJobs(id);
           await audit("users.update", { username: session.username, account: user.username, role: user.role, root: user.root, passwordReset: body.password !== undefined });
           break;
+        case "resetTwoFactor": {
+          // For a lost authenticator: the account signs in with its password again and can set it up anew.
+          if (!id) throw new AppError("Choose an account", 400, "INVALID_REQUEST");
+          await resetTwoFactor(id);
+          cancelAccountJobs(id);
+          user = (await listUsers()).find((item) => item.id === id);
+          await audit("users.two_factor_reset", { username: session.username, account: user?.username });
+          break;
+        }
         case "delete":
           if (!id) throw new AppError("Choose an account", 400, "INVALID_REQUEST");
           user = await deleteUser(id);
