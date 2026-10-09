@@ -127,13 +127,18 @@ export async function POST(request: Request) {
     // folders on the way created as needed.
     let directory = baseDirectory;
     if (subfolders.length) {
-      const ensured = await ensureFolders(destination, baseDirectory, subfolders, { owner: requestedOwnership, uniqueFirst: url.searchParams.get("unique") === "1" });
+      // Other accounts' new folders take the owner of the folder each is made in, as their other new
+      // items do; the owner's choice (if any) applies throughout.
+      const inherit = session.role !== "owner";
+      const ensured = await ensureFolders(destination, baseDirectory, subfolders, { owner: inherit ? null : requestedOwnership, inheritOwner: inherit && requestedOwnership !== null, uniqueFirst: url.searchParams.get("unique") === "1" });
       target = ensured.folder;
       directory = ensured.relative;
-      if (url.searchParams.get("createFolder") === "1") {
-        await audit("fs.create", { username: session.username, path: baseDirectory, name: subfolders.length === 1 ? directory.split("/").at(-1) : subfolders.join("/"), upload: true });
-        return NextResponse.json({ ok: true, folder: directory });
+      if (inherit && requestedOwnership) requestedOwnership = { uid: target.stat.uid, gid: target.stat.gid };
+      // Every folder made is recorded now, under its actual name, even if the upload then fails.
+      for (const made of ensured.made) {
+        await audit("fs.create", { username: session.username, path: made.split("/").slice(0, -1).join("/"), name: made.split("/").at(-1), upload: true });
       }
+      if (url.searchParams.get("createFolder") === "1") return NextResponse.json({ ok: true, folder: directory });
     } else if (url.searchParams.get("createFolder") === "1") {
       throw new AppError("Choose a folder", 400, "INVALID_FOLDER");
     }

@@ -630,3 +630,40 @@ test("folder uploads stay inside the account's folder and never follow links", a
     assert.equal((await makeFolder(bob, "path=home/bob")).status, 400);
   });
 });
+
+test("folder uploads refuse overlong paths, step past links, and record every folder they make", async () => {
+  await withAccounts(async ({ root, bob }) => {
+    const home = path.join(root, "home", "bob");
+    // Too long as a whole, though each name is fine: refused before anything is made.
+    const long = Array.from({ length: 20 }, () => "n".repeat(250)).join("/");
+    assert.equal((await makeFolder(bob, `path=home/bob&folder=${long}`)).status, 400);
+    assert.ok(!(await fs.readdir(home)).includes("n".repeat(250)));
+    // A link where the top folder would go just means the name is taken.
+    await fs.symlink("/etc", path.join(home, "Photos"));
+    const made = await makeFolder(bob, "path=home/bob&folder=Photos&unique=1");
+    assert.equal(made.status, 200);
+    assert.equal((await made.json()).folder, "home/bob/Photos (1)");
+    // Folders made on the way are recorded under their real names, even when the upload then fails.
+    const failed = await upload(new Request("http://localhost/api/fs/upload?path=home/bob&folder=s1/s2", { method: "POST", headers: { cookie: bob, "x-filedude-request": "1", "content-type": "text/plain" }, body: "not multipart" }));
+    assert.equal(failed.status, 400);
+    const log = await fs.readFile(path.join(config.stateDir, "audit.jsonl"), "utf8");
+    const created = log.trim().split("\n").map((line) => JSON.parse(line)).filter((entry) => entry.event === "fs.create").map((entry) => `${entry.path}/${entry.name}`);
+    assert.deepEqual(created, ["home/bob/Photos (1)", "home/bob/s1", "home/bob/s1/s2"]);
+  });
+});
+
+// As root on Linux (like the service): new folders and files take the owner of the folder they're in.
+const asRoot = process.platform === "linux" && process.getuid?.() === 0;
+
+test("an editor's uploaded folders take the owner of the folder each lands in", { skip: !asRoot && "needs root on Linux" }, async () => {
+  await withAccounts(async ({ root, bob }) => {
+    const home = path.join(root, "home", "bob");
+    await fs.chown(home, 1000, 1000);
+    await fs.mkdir(path.join(home, "carol"));
+    await fs.chown(path.join(home, "carol"), 1001, 1001);
+    assert.equal((await sendUpload(bob, "path=home/bob&folder=carol/deep/er", [{ name: "f.txt", body: "x" }])).status, 200);
+    for (const item of ["carol/deep", "carol/deep/er", "carol/deep/er/f.txt"]) assert.equal((await fs.stat(path.join(home, item))).uid, 1001, item);
+    assert.equal((await sendUpload(bob, "path=home/bob&folder=mine/sub", [{ name: "g.txt", body: "y" }])).status, 200);
+    for (const item of ["mine", "mine/sub", "mine/sub/g.txt"]) assert.equal((await fs.stat(path.join(home, item))).uid, 1000, item);
+  });
+});

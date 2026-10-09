@@ -739,57 +739,79 @@ export const MAX_UPLOAD_FOLDER_DEPTH = 32;
  * uploading a folder with its structure). Each level is made and opened inside the previous one's
  * open handle and never through a symlink, and checked against the account's folder and FilesDude's
  * reserved names. With `uniqueFirst`, the first folder is always new: "Photos (1)" if "Photos" is
- * taken. New folders get `owner` (when running as root). The caller closes the returned folder.
+ * taken (or is a link). New folders get `owner`, or with `inheritOwner` the owner of the folder each
+ * is made in, as other new items do for confined accounts (when running as root). Returns the folder
+ * (which the caller closes) and the paths of the folders this call made.
  */
-export async function ensureFolders(base: AnchoredDirectory, baseRelative: string, names: string[], options: { owner?: { uid: number; gid: number } | null; uniqueFirst?: boolean } = {}) {
+export async function ensureFolders(base: AnchoredDirectory, baseRelative: string, names: string[], options: { owner?: { uid: number; gid: number } | null; inheritOwner?: boolean; uniqueFirst?: boolean } = {}) {
   if (!names.length) throw new AppError("Choose a folder", 400, "INVALID_FOLDER");
   if (names.length > MAX_UPLOAD_FOLDER_DEPTH) throw new AppError(`Folders nested more than ${MAX_UPLOAD_FOLDER_DEPTH} levels deep can't be uploaded`, 400, "TREE_TOO_DEEP");
-  // Every name is checked before anything is made, so a bad one further down leaves nothing behind.
+  // Every name, and the whole path's length, is checked before anything is made, so a bad one
+  // further down leaves nothing behind.
   const checked = names.map((raw) => {
     const name = validateName(raw);
     if (Buffer.byteLength(name, "utf8") > 255) throw new AppError("A folder name is too long", 400, "INVALID_NAME");
     return name;
   });
+  if (Buffer.byteLength(path.join(base.real, ...checked), "utf8") + (options.uniqueFirst ? 8 : 0) > 3_800) throw new AppError("That folder path is too long", 400, "PATH_TOO_LONG");
+  const made: string[] = [];
   let current = base;
   let relative = cleanRelative(baseRelative);
+  // Makes the folder unless it exists; true if this call made it.
+  const make = async (name: string) => {
+    try {
+      await fs.mkdir(inside(current, name));
+      return true;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "EEXIST") return false;
+      if (code === "ENAMETOOLONG") throw new AppError("That folder path is too long", 400, "PATH_TOO_LONG");
+      throw error;
+    }
+  };
   try {
     for (const [index, checkedName] of checked.entries()) {
       let name = checkedName;
       let created = false;
+      const startedAt = Date.now();
       if (index === 0 && options.uniqueFirst) {
-        const stem = name;
         for (let attempt = 0; ; attempt += 1) {
           if (attempt >= 1_000) throw new AppError("Unable to choose an available folder name", 409);
-          name = attempt ? `${stem} (${attempt})` : stem;
-          await safeResolve(childOf(relative, name), { mustExist: false });
+          name = attempt ? fitName(checkedName, ` (${attempt})`) : checkedName;
           try {
-            await fs.mkdir(inside(current, name));
-            created = true;
-            break;
+            await safeResolve(childOf(relative, name), { mustExist: false });
           } catch (error) {
-            if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+            // A link with this name (pointing anywhere) just means the name is taken.
+            if (error instanceof AppError && (error.code === "SYMLINK_OUTSIDE_ROOT" || error.code === "PATH_OUTSIDE_ROOT")) continue;
+            throw error;
           }
+          if ((created = await make(name))) break;
         }
       } else {
         await safeResolve(childOf(relative, name), { mustExist: false });
-        try {
-          await fs.mkdir(inside(current, name));
-          created = true;
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        }
+        created = await make(name);
       }
       // Opening without following links refuses a symlink (or a file) where a folder should be.
       const child = await openChild(current, name, true).catch((error: unknown) => {
         if (error instanceof AppError) throw error;
         throw new AppError(`“${name}” already exists and isn't a folder`, 409, "NOT_A_DIRECTORY");
       });
-      if (current !== base) await current.handle.close().catch(() => undefined);
+      const parent = current;
       current = child;
       relative = childOf(relative, name);
-      if (created && options.owner && runningAsRoot() && (await isFreshFolder(child))) await child.handle.chown(options.owner.uid, options.owner.gid);
+      if (created) made.push(relative);
+      const owner = options.inheritOwner ? { uid: parent.stat.uid, gid: parent.stat.gid } : options.owner;
+      if (parent !== base) await parent.handle.close().catch(() => undefined);
+      // Only a folder this call just made is given away: empty, with no subfolders, and born after
+      // the mkdir (so an existing empty folder swapped in under the name isn't).
+      const fresh = created && child.stat.nlink === 2 && (!child.stat.birthtimeMs || child.stat.birthtimeMs >= startedAt - 1_000);
+      if (fresh && owner && runningAsRoot() && (await isFreshFolder(child))) {
+        await child.handle.chown(owner.uid, owner.gid);
+        // Its new owner is what the next level inherits.
+        child.stat = await child.handle.stat();
+      }
     }
-    return { folder: current, relative };
+    return { folder: current, relative, made };
   } catch (error) {
     if (current !== base) await current.handle.close().catch(() => undefined);
     throw error;

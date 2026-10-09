@@ -148,7 +148,9 @@ type UploadItem = { file: File; folder: string };
 
 // System clutter left out of folder uploads.
 const SKIPPED_UPLOAD_NAMES = new Set([".DS_Store", "Thumbs.db", "desktop.ini"]);
+// Mirror the server's limits, so a folder that can't be uploaded is refused before anything is sent.
 const MAX_UPLOAD_ITEMS = 10_000;
+const MAX_UPLOAD_DEPTH = 32;
 
 // Every folder on the way to each of `paths`: "a/b" gives "a" and "a/b".
 function foldersOf(paths: string[]) {
@@ -184,7 +186,8 @@ async function uploadItemsFromDrop(transfer: DataTransfer) {
     next();
   });
   const walk = async (entry: FileSystemEntry, folder: string): Promise<void> => {
-    if (items.length > MAX_UPLOAD_ITEMS) throw new Error(`Upload at most ${MAX_UPLOAD_ITEMS.toLocaleString()} files at once`);
+    if (items.length >= MAX_UPLOAD_ITEMS || folders.length >= MAX_UPLOAD_ITEMS) throw new Error(`Upload at most ${MAX_UPLOAD_ITEMS.toLocaleString()} files and folders at once`);
+    if (folder.split("/").length >= MAX_UPLOAD_DEPTH) throw new Error(`Folders nested more than ${MAX_UPLOAD_DEPTH} levels deep can't be uploaded`);
     if (entry.isFile) {
       if (!(folder && SKIPPED_UPLOAD_NAMES.has(entry.name))) items.push({ file: await new Promise<File>((resolve, reject) => (entry as FileSystemFileEntry).file(resolve, reject)), folder });
       return;
@@ -1088,6 +1091,8 @@ export function FileManager() {
     if (uploadRef.current) uploadRef.current.value = "";
     if (folderUploadRef.current) folderUploadRef.current.value = "";
     if (!items.length && !folders.length) return;
+    if (items.length > MAX_UPLOAD_ITEMS || folders.length > MAX_UPLOAD_ITEMS) return notify(`Upload at most ${MAX_UPLOAD_ITEMS.toLocaleString()} files and folders at once`, "error");
+    if (folders.some((folder) => folder.split("/").length > MAX_UPLOAD_DEPTH)) return notify(`Folders nested more than ${MAX_UPLOAD_DEPTH} levels deep can't be uploaded`, "error");
     setDialog({ kind: "upload", items, folders });
   };
 
