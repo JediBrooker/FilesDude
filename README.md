@@ -26,6 +26,7 @@ FilesDude is a secure, self-hosted web file manager designed for a Proxmox host,
 - Recursive filename search, disk usage, owner/group display, symlink escape warnings, and a cached whole-tree largest-files view from the clickable Storage card
 - Filter largest files by a minimum size, load 100, 250, or 500 more at a time, export the currently loaded results to CSV, and move one or many selected files to protected trash (or permanently delete them after confirmation)
 - Protected trash by default with a Trash view for restoring items to their original folders, deleting them forever, or emptying the trash, plus optional automatic removal of items after 7, 30, or 90 days or a year; persistent favourites; and a JSON Lines audit log inside the protected state directory
+- Activity (owner): who did what and when, newest first, in plain sentences, filtered by kind (files, downloads, sign-ins, sharing, accounts, snapshots), account, or text
 - Signed, expiring, HTTP-only, SameSite login sessions; scrypt password hashes; login throttling; same-origin mutation checks; and hardened response headers
 - Account preferences for changing the username and password; credential changes invalidate other sessions
 - Optional two-factor sign-in for every account with an authenticator app (6-digit codes), with one-time recovery codes
@@ -249,6 +250,16 @@ The same sandbox runs ffprobe (`/usr/bin/ffprobe`, or set `FILEDUDE_FFPROBE_PATH
 length, resolution, codecs, and tags shown under **Video** or **Audio** in Properties; set
 `FILEDUDE_MEDIA_INFO=false` to turn that off. Image details are read by sharp from images
 up to 64 MB.
+
+## Activity
+
+The owner's **Activity** view (in the sidebar) reads the audit log, `audit.jsonl` in the
+state directory, newest first: sign-ins (and failed attempts, with the address), uploads,
+downloads, changes, shares and their downloads, account changes, and snapshots. Filter by
+kind, by account (including share links and FilesDude's own upkeep), or by any text such as
+a file name or address, and load older entries as you scroll back. Looking at an item's
+Properties is logged but not shown. The log rotates at 8 MB, keeping two older files
+(`audit.jsonl.1` and `.2`), so it never grows without limit.
 
 ## Duplicate files
 
