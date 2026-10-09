@@ -20,6 +20,7 @@ FilesDude is a secure, self-hosted web file manager designed for a Proxmox host,
 - Image thumbnails in grid view (JPEG, PNG, GIF, WebP, and AVIF up to 64 MB), generated on the server with EXIF rotation applied and all metadata stripped, and cached in the state directory
 - Video thumbnails in grid view (MP4, MKV, MOV, WebM, AVI, of any size) when ffmpeg is installed, taken by ffmpeg in a throwaway, locked-down systemd sandbox
 - Media details in Properties: an image's dimensions, format, colour, frames, and the camera and date taken from EXIF; a video's or audio file's length, resolution, frame rate, codecs, channels, bit rate, and title/artist/album tags (audio and video need ffmpeg, and are read by ffprobe in the same sandbox as video thumbnails)
+- Folder sizes in Properties: how many files and folders a folder holds, their total size, and the space they take on disk (showing what ZFS compression saves), counted when Properties opens; hard-linked files count once and links aren't followed
 - SHA-256 and MD5 checksums in Properties, calculated automatically for files up to 64 MB, with copy buttons and a field to compare against an expected checksum
 - POSIX `chmod` and numeric `chown` for one or many items
 - Bulk rename with find/replace, regular expressions, prefix, suffix, sequential numbering, live conflict detection, and two-phase application
