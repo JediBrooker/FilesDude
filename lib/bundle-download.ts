@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import path from "node:path";
 import type { Archiver } from "archiver";
-import { appendDirectory, appendFileAndWait, reservedPathCheck } from "./archives";
+import { appendDirectory, appendFileAndWait, archiveEntryName, reservedPathCheck } from "./archives";
 import { acquireFilesystemLock, normalizeRelative, openVerifiedFile } from "./files";
 import { AppError } from "./http";
 
@@ -22,8 +22,8 @@ export function bundlePaths(input: unknown): string[] {
   if (!Array.isArray(input) || !input.length) throw new AppError("Choose at least one item to download", 400, "INVALID_SELECTION");
   if (input.length > MAX_BUNDLE_ITEMS) throw new AppError(`Download at most ${MAX_BUNDLE_ITEMS.toLocaleString()} items at once`, 400, "TOO_MANY_ITEMS");
   const normalized = input.map((value) => {
-    if (typeof value !== "string" || value.length > 4096) throw new AppError("Invalid path", 400, "INVALID_PATH");
-    const relative = normalizeRelative(value);
+    if (typeof value !== "string" || value.length > 4096 || !value.isWellFormed()) throw new AppError("Invalid path", 400, "INVALID_PATH");
+    const relative = normalizeRelative(value).replace(/\/+$/, "");
     if (!relative) throw new AppError("Choose items inside a folder, not the whole root", 400, "INVALID_SELECTION");
     return relative;
   });
@@ -83,12 +83,16 @@ export function takeDownloadTicket(token: string, account: string) {
 }
 
 // Two selected items from different folders may share a name; later ones get " (2)" and so on.
+// Names are compared as the systems they're extracted on would: ignoring case, Unicode form, and
+// trailing dots and spaces (which Windows drops).
+const clashKey = (name: string) => name.normalize("NFC").toLowerCase().replace(/[. ]+$/, "");
+
 function uniqueName(name: string, used: Set<string>) {
   const extension = path.posix.extname(name);
   const stem = name.slice(0, name.length - extension.length);
   let candidate = name;
-  for (let index = 2; used.has(candidate.toLowerCase()); index += 1) candidate = `${stem} (${index})${extension}`;
-  used.add(candidate.toLowerCase());
+  for (let index = 2; used.has(clashKey(candidate)); index += 1) candidate = `${stem} (${index})${extension}`;
+  used.add(clashKey(candidate));
   return candidate;
 }
 
@@ -100,6 +104,10 @@ function uniqueName(name: string, used: Set<string>) {
 export async function appendBundle(archive: Archiver, paths: string[], signal?: AbortSignal) {
   const isReserved = await reservedPathCheck();
   const used = new Set<string>();
+  // The same file or folder reached twice (another spelling, or a link to it) is only added once, as
+  // is anything inside a folder already added.
+  const added = new Set<string>();
+  const addedFolders: string[] = [];
   for (const relative of paths) {
     if (signal?.aborted) throw new AppError("The download was cancelled", 499, "CANCELLED");
     const release = await acquireFilesystemLock();
@@ -114,8 +122,12 @@ export async function appendBundle(archive: Archiver, paths: string[], signal?: 
     let owned = true;
     try {
       if (isReserved(openedPath)) continue;
-      const name = uniqueName(path.basename(absolute) || "item", used);
+      const identity = `${stat.dev}:${stat.ino}`;
+      if (added.has(identity) || addedFolders.some((folder) => openedPath.startsWith(`${folder}${path.sep}`))) continue;
+      added.add(identity);
+      const name = uniqueName(archiveEntryName(path.basename(absolute) || "item"), used);
       if (stat.isDirectory()) {
+        addedFolders.push(openedPath);
         archive.append(Buffer.alloc(0), { name: `${name}/`, type: "directory", stats: stat });
         owned = false;
         await appendDirectory(archive, handle, openedPath, name, isReserved, signal);
@@ -123,8 +135,9 @@ export async function appendBundle(archive: Archiver, paths: string[], signal?: 
         archive.append(Buffer.alloc(0), { name, stats: stat });
       } else if (stat.isFile()) {
         // Only the size measured at open is read; the read stream owns the handle and closes it.
+        const stream = handle.createReadStream({ start: 0, end: stat.size - 1 });
         owned = false;
-        await appendFileAndWait(archive, handle.createReadStream({ start: 0, end: stat.size - 1 }), name, stat, signal);
+        await appendFileAndWait(archive, stream, name, stat, signal);
       }
     } finally {
       if (owned) await handle.close().catch(() => undefined);

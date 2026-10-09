@@ -121,6 +121,9 @@ for (const format of ["zip", "tar.gz"] as const) {
     await withTempRoot(async (root) => {
       await fs.mkdir(path.join(root, "dir"));
       await fs.writeFile(path.join(root, "dir", "real.txt"), "real");
+      // A link within the archive is stored (and skipped on extraction); one reaching outside it,
+      // like this absolute one, isn't stored at all.
+      await fs.symlink("real.txt", path.join(root, "dir", "alias"));
       await fs.symlink("/etc/passwd", path.join(root, "dir", "escape"));
       const archive = await compressEntries(["dir"], "", "links", format, noProgress, live());
       const extracted = await extractArchive(archive.path, noProgress, live());

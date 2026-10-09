@@ -71,6 +71,8 @@ test("a selection is normalised: duplicates and items inside selected folders ar
   assert.throws(() => bundlePaths(["/"]), /not the whole root/);
   assert.throws(() => bundlePaths([42]), /Invalid path/);
   assert.throws(() => bundlePaths(["a\0b"]), /Invalid path/);
+  assert.throws(() => bundlePaths(["\ud800/x", "y"]), /Invalid path/, "not well-formed Unicode");
+  assert.deepEqual(bundlePaths(["a", "a/", "a//", "b/"]), ["a", "b"]);
   assert.throws(() => bundlePaths(Array.from({ length: 1001 }, (_, index) => `f${index}`)), /at most 1,000/);
 });
 
@@ -114,6 +116,24 @@ test("several files and folders download as one ZIP, with clashing names kept ap
     // Two selected files with the same name from different folders.
     const clash = await zipOf(["docs/report.txt", "other/report.txt"]);
     assert.deepEqual(clash, { "report.txt": "report", "report (2).txt": "other report" });
+  });
+});
+
+test("the same item reached twice is added once, and names and links can't climb out of the ZIP", async () => {
+  await withRoot(async (root) => {
+    await write(root, { "docs/a.txt": "a", "docs/sub/b.txt": "b", "pic.jpg": "jpeg", "docs/a\\..\\..\\evil.txt": "evil" });
+    await fs.symlink("docs", path.join(root, "docs-alias"));
+    await fs.symlink("pic.jpg", path.join(root, "pic-alias.jpg"));
+    await fs.symlink("sub/b.txt", path.join(root, "docs/inside.txt"));
+    await fs.symlink("../../outside.txt", path.join(root, "docs/climbs.txt"));
+    await fs.symlink("/etc/passwd", path.join(root, "docs/absolute.txt"));
+    const contents = await zipOf(["docs", "docs-alias", "docs-alias/sub/b.txt", "pic.jpg", "pic-alias.jpg"]);
+    assert.deepEqual(Object.keys(contents).sort(), ["docs/", "docs/a.txt", "docs/a_.._.._evil.txt", "docs/inside.txt", "docs/sub/", "docs/sub/b.txt", "pic.jpg"]);
+    assert.equal(contents["docs/inside.txt"], "sub/b.txt", "a link within the ZIP is kept as a link");
+    // Unicode forms and Windows' trailing dots count as clashes too.
+    await write(root, { "x/café.txt": "nfc", "y/café.txt": "nfd", "z/notes.": "dot", "w/notes": "plain" });
+    const clashes = Object.keys(await zipOf(["x/café.txt", "y/café.txt", "w/notes", "z/notes."])).map((name) => name.normalize("NFC"));
+    assert.deepEqual(clashes.sort(), ["café (2).txt", "café.txt", "notes", "notes (2)."]);
   });
 });
 
