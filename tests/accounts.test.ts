@@ -580,3 +580,53 @@ test("accounts change their own password, which signs out their other sessions",
     assert.equal(await status(call(listFs, "/api/fs?path=home/bob", fresh)), 200);
   });
 });
+
+// A multipart upload of `files` (name and contents) with the given query.
+function sendUpload(cookie: string, query: string, files: Array<{ name: string; body: string }>) {
+  const boundary = "folder-upload-boundary";
+  const body = files.map((file) => `--${boundary}\r\nContent-Disposition: form-data; name="files"; filename="${file.name}"\r\nContent-Type: application/octet-stream\r\n\r\n${file.body}\r\n`).join("") + `--${boundary}--\r\n`;
+  return upload(new Request(`http://localhost/api/fs/upload?${query}`, { method: "POST", headers: { cookie, "x-filedude-request": "1", "content-type": `multipart/form-data; boundary=${boundary}` }, body }));
+}
+
+function makeFolder(cookie: string, query: string) {
+  return upload(new Request(`http://localhost/api/fs/upload?${query}&createFolder=1`, { method: "POST", headers: { cookie, "x-filedude-request": "1", "content-type": "application/json" }, body: "{}" }));
+}
+
+test("a folder uploads with its structure, into a new folder each time", async () => {
+  await withAccounts(async ({ root, bob }) => {
+    const home = path.join(root, "home", "bob");
+    const first = await makeFolder(bob, "path=home/bob&folder=Photos&unique=1");
+    assert.equal(first.status, 200);
+    assert.equal((await first.json()).folder, "home/bob/Photos");
+    // The same folder again goes into a new one rather than merging.
+    assert.equal((await (await makeFolder(bob, "path=home/bob&folder=Photos&unique=1")).json()).folder, "home/bob/Photos (1)");
+    const sent = await sendUpload(bob, "path=home/bob&folder=Photos/2024/summer", [{ name: "beach.jpg", body: "sand" }]);
+    assert.equal(sent.status, 200);
+    assert.deepEqual((await sent.json()).uploaded, ["home/bob/Photos/2024/summer/beach.jpg"]);
+    assert.equal(await fs.readFile(path.join(home, "Photos/2024/summer/beach.jpg"), "utf8"), "sand");
+    // Existing folders are reused and clashing files get new names.
+    assert.equal((await sendUpload(bob, "path=home/bob&folder=Photos/2024/summer", [{ name: "beach.jpg", body: "more sand" }])).status, 200);
+    assert.equal(await fs.readFile(path.join(home, "Photos/2024/summer/beach (1).jpg"), "utf8"), "more sand");
+    // Empty folders are made too.
+    assert.equal((await makeFolder(bob, "path=home/bob&folder=Photos/empty/inner")).status, 200);
+    assert.ok((await fs.stat(path.join(home, "Photos/empty/inner"))).isDirectory());
+  });
+});
+
+test("folder uploads stay inside the account's folder and never follow links", async () => {
+  await withAccounts(async ({ root, bob, viewer }) => {
+    const home = path.join(root, "home", "bob");
+    await fs.symlink("../alice", path.join(home, "to-alice"));
+    for (const folder of ["..", "../alice", "a/../../alice", ".filedude", "a//b", "to-alice", "to-alice/x", "docs/plan.txt", "docs/plan.txt/x", Array.from({ length: 40 }, () => "d").join("/")]) {
+      const made = await makeFolder(bob, `path=home/bob&folder=${encodeURIComponent(folder)}`);
+      assert.ok(made.status >= 400 && made.status < 500, `${folder}: ${made.status}`);
+      const sent = await sendUpload(bob, `path=home/bob&folder=${encodeURIComponent(folder)}`, [{ name: "x.txt", body: "x" }]);
+      assert.ok(sent.status >= 400 && sent.status < 500, `${folder}: ${sent.status}`);
+    }
+    assert.deepEqual((await fs.readdir(path.join(root, "home", "alice"))).sort(), ["diary.txt"]);
+    assert.ok(!(await fs.readdir(home)).includes("a"));
+    // Viewers can't upload folders, and a folder name needs a folder.
+    assert.equal((await makeFolder(viewer, "path=shared&folder=New&unique=1")).status, 403);
+    assert.equal((await makeFolder(bob, "path=home/bob")).status, 400);
+  });
+});

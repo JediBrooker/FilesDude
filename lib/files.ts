@@ -732,6 +732,70 @@ export function validateName(name: string) {
   return trimmed;
 }
 
+export const MAX_UPLOAD_FOLDER_DEPTH = 32;
+
+/**
+ * Opens the folders `names` inside `base`, one level at a time, creating any that don't exist (for
+ * uploading a folder with its structure). Each level is made and opened inside the previous one's
+ * open handle and never through a symlink, and checked against the account's folder and FilesDude's
+ * reserved names. With `uniqueFirst`, the first folder is always new: "Photos (1)" if "Photos" is
+ * taken. New folders get `owner` (when running as root). The caller closes the returned folder.
+ */
+export async function ensureFolders(base: AnchoredDirectory, baseRelative: string, names: string[], options: { owner?: { uid: number; gid: number } | null; uniqueFirst?: boolean } = {}) {
+  if (!names.length) throw new AppError("Choose a folder", 400, "INVALID_FOLDER");
+  if (names.length > MAX_UPLOAD_FOLDER_DEPTH) throw new AppError(`Folders nested more than ${MAX_UPLOAD_FOLDER_DEPTH} levels deep can't be uploaded`, 400, "TREE_TOO_DEEP");
+  // Every name is checked before anything is made, so a bad one further down leaves nothing behind.
+  const checked = names.map((raw) => {
+    const name = validateName(raw);
+    if (Buffer.byteLength(name, "utf8") > 255) throw new AppError("A folder name is too long", 400, "INVALID_NAME");
+    return name;
+  });
+  let current = base;
+  let relative = cleanRelative(baseRelative);
+  try {
+    for (const [index, checkedName] of checked.entries()) {
+      let name = checkedName;
+      let created = false;
+      if (index === 0 && options.uniqueFirst) {
+        const stem = name;
+        for (let attempt = 0; ; attempt += 1) {
+          if (attempt >= 1_000) throw new AppError("Unable to choose an available folder name", 409);
+          name = attempt ? `${stem} (${attempt})` : stem;
+          await safeResolve(childOf(relative, name), { mustExist: false });
+          try {
+            await fs.mkdir(inside(current, name));
+            created = true;
+            break;
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+          }
+        }
+      } else {
+        await safeResolve(childOf(relative, name), { mustExist: false });
+        try {
+          await fs.mkdir(inside(current, name));
+          created = true;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        }
+      }
+      // Opening without following links refuses a symlink (or a file) where a folder should be.
+      const child = await openChild(current, name, true).catch((error: unknown) => {
+        if (error instanceof AppError) throw error;
+        throw new AppError(`“${name}” already exists and isn't a folder`, 409, "NOT_A_DIRECTORY");
+      });
+      if (current !== base) await current.handle.close().catch(() => undefined);
+      current = child;
+      relative = childOf(relative, name);
+      if (created && options.owner && runningAsRoot() && (await isFreshFolder(child))) await child.handle.chown(options.owner.uid, options.owner.gid);
+    }
+    return { folder: current, relative };
+  } catch (error) {
+    if (current !== base) await current.handle.close().catch(() => undefined);
+    throw error;
+  }
+}
+
 export async function createEntry(parentPath: string, name: string, type: "file" | "directory") {
   const parentRelative = cleanRelative(parentPath);
   const entryName = validateName(name);

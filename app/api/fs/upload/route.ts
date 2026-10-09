@@ -7,7 +7,7 @@ import Busboy from "busboy";
 import { withAccess } from "@/lib/access";
 import { config } from "@/lib/config";
 import { audit } from "@/lib/audit";
-import { acquireFilesystemLock, inside, isAvailableUploadOwnership, openDirectory, removeIfSame, resolveOwnershipPair, safeResolve, uploadOwnershipOptions, withFilesystemLock, type AnchoredDirectory } from "@/lib/files";
+import { acquireFilesystemLock, ensureFolders, inside, isAvailableUploadOwnership, MAX_UPLOAD_FOLDER_DEPTH, openDirectory, removeIfSame, resolveOwnershipPair, safeResolve, uploadOwnershipOptions, withFilesystemLock, type AnchoredDirectory } from "@/lib/files";
 import { assertMutationRequest, AppError, jsonError } from "@/lib/http";
 import { getPreferences } from "@/lib/preferences";
 import { NextResponse } from "next/server";
@@ -49,6 +49,14 @@ async function reserveTarget(folder: AnchoredDirectory, directory: string, name:
   throw new AppError("Unable to choose an available upload name", 409);
 }
 
+// The folder inside the destination a file goes into, when uploading a folder: "Photos/2024".
+function folderNames(raw: string | null) {
+  if (raw === null) return [];
+  const names = raw.split("/");
+  if (raw.length > 4096 || names.length > MAX_UPLOAD_FOLDER_DEPTH || names.some((name) => !name)) throw new AppError("The upload folder is invalid", 400, "INVALID_FOLDER");
+  return names;
+}
+
 export async function GET(request: Request) {
   try {
     // Ownership options list the server's users and groups, so they are for the owner only.
@@ -75,6 +83,7 @@ export async function POST(request: Request) {
     return await withAccess(request, "write", async (session) => {
     const releaseFilesystem = await acquireFilesystemLock();
     let folder: AnchoredDirectory | null = null;
+    let target: AnchoredDirectory | null = null;
     try {
       const contentLength = Number(request.headers.get("content-length") || 0);
     if (contentLength > config.maxUploadBytes + 1024 * 1024) {
@@ -83,8 +92,9 @@ export async function POST(request: Request) {
     if (!request.body) throw new AppError("Upload body is missing");
 
     const url = new URL(request.url);
-    const directory = url.searchParams.get("path") || "";
-    folder = await openDirectory(directory).catch((error: unknown) => {
+    const baseDirectory = url.searchParams.get("path") || "";
+    const subfolders = folderNames(url.searchParams.get("folder"));
+    folder = await openDirectory(baseDirectory).catch((error: unknown) => {
       if (error instanceof AppError && error.code === "NOT_A_DIRECTORY") throw new AppError("Upload destination is not a folder", 400);
       throw error;
     });
@@ -106,11 +116,28 @@ export async function POST(request: Request) {
       const gid = Number(gidValue);
       const preference = (await getPreferences()).uploadOwnership;
       const savedDefault = preference.mode === "fixed" ? { uid: preference.uid, gid: preference.gid } : undefined;
-      if (!(await isAvailableUploadOwnership(directory, uid, gid, savedDefault))) {
+      if (!(await isAvailableUploadOwnership(baseDirectory, uid, gid, savedDefault))) {
         throw new AppError("That owner and group are not available for this folder", 400, "INVALID_UPLOAD_OWNERSHIP");
       }
       requestedOwnership = { uid, gid };
     }
+
+    // Uploading a folder: its top folder is made first (always new, so nothing is merged into an
+    // existing folder by accident), and each file then goes into its place inside it, with any
+    // folders on the way created as needed.
+    let directory = baseDirectory;
+    if (subfolders.length) {
+      const ensured = await ensureFolders(destination, baseDirectory, subfolders, { owner: requestedOwnership, uniqueFirst: url.searchParams.get("unique") === "1" });
+      target = ensured.folder;
+      directory = ensured.relative;
+      if (url.searchParams.get("createFolder") === "1") {
+        await audit("fs.create", { username: session.username, path: baseDirectory, name: subfolders.length === 1 ? directory.split("/").at(-1) : subfolders.join("/"), upload: true });
+        return NextResponse.json({ ok: true, folder: directory });
+      }
+    } else if (url.searchParams.get("createFolder") === "1") {
+      throw new AppError("Choose a folder", 400, "INVALID_FOLDER");
+    }
+    const into = target ?? destination;
 
     const uploaded: string[] = [];
     const createdTargets: Array<{ name: string; created: Stats }> = [];
@@ -141,7 +168,7 @@ export async function POST(request: Request) {
 
         const task = (async () => {
           const name = uploadName(info.filename);
-          const { name: createdName, relative, handle, created } = await reserveTarget(destination, directory, name);
+          const { name: createdName, relative, handle, created } = await reserveTarget(into, directory, name);
           createdTargets.push({ name: createdName, created });
           const meter = new Transform({
             transform(chunk: Buffer, _encoding, callback) {
@@ -172,7 +199,7 @@ export async function POST(request: Request) {
           } catch (error) {
             stream.resume();
             await handle.close().catch(() => undefined);
-            await removeIfSame(destination, createdName, created);
+            await removeIfSame(into, createdName, created);
             throw error;
           }
         })();
@@ -198,7 +225,7 @@ export async function POST(request: Request) {
       await Promise.all(tasks);
     } catch (error) {
       await Promise.allSettled(tasks);
-      await Promise.allSettled(createdTargets.map((target) => removeIfSame(destination, target.name, target.created)));
+      await Promise.allSettled(createdTargets.map((created) => removeIfSame(into, created.name, created.created)));
       throw error;
     } finally {
       request.signal.removeEventListener("abort", abortUpload);
@@ -208,6 +235,7 @@ export async function POST(request: Request) {
     await audit("fs.upload", { username: session.username, directory, files: uploaded, bytes: totalBytes, ownership: requestedOwnership || "service" });
     return NextResponse.json({ ok: true, uploaded, ownership: requestedOwnership || null });
     } finally {
+      await target?.handle.close().catch(() => undefined);
       await folder?.handle.close().catch(() => undefined);
       releaseFilesystem();
     }
