@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  Activity,
   ArrowDownToLine,
   ArrowDownWideNarrow,
   ArrowLeft,
@@ -71,6 +72,7 @@ import {
 } from "lucide-react";
 import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { ACTIVITY_CATEGORIES, activityCategory, activityUser, describeActivity, type ActivityCategory } from "@/lib/activity-text";
 import { isNewerBuild as differsFrom, type BuildIdentity } from "@/lib/build";
 import { moveCursor, selectionRange } from "@/lib/selection";
 import { INITIAL_DIRECTION, nextSort, parseSort, sortEntries, type SortKey, type SortState } from "@/lib/sort";
@@ -106,6 +108,7 @@ type DialogState =
   | { kind: "share"; entry: FileEntry }
   | { kind: "shares" }
   | { kind: "users" }
+  | { kind: "activity" }
   | { kind: "new" }
   | { kind: "rename"; entry: FileEntry }
   | { kind: "delete" }
@@ -1260,6 +1263,7 @@ export function FileManager() {
           {snapshotsAvailable && <button className="nav-item" onClick={() => { setDialog({ kind: "snapshots" }); setSidebarOpen(false); }}><History size={18} /><span>Snapshots</span></button>}
           {isOwner && <button className="nav-item" onClick={() => { setDialog({ kind: "duplicates" }); setSidebarOpen(false); }}><Files size={18} /><span>Duplicates</span></button>}
           {isOwner && <button className="nav-item" onClick={() => { setDialog({ kind: "users" }); setSidebarOpen(false); }}><Users size={18} /><span>Users</span></button>}
+          {isOwner && <button className="nav-item" onClick={() => { setDialog({ kind: "activity" }); setSidebarOpen(false); }}><Activity size={18} /><span>Activity</span></button>}
         </nav>
 
         <div className="sidebar-section favorites-section">
@@ -1814,6 +1818,7 @@ function DialogHost({ dialog, selected, currentPath, username, role, home, onClo
   if (dialog.kind === "compress") return <CompressDialog entries={selected} currentPath={currentPath} onClose={onClose} onStart={onStartJob} />;
   if (dialog.kind === "share") return <ShareDialog entry={dialog.entry} onClose={onClose} notify={notify} onChanged={onSharesChanged} />;
   if (dialog.kind === "shares") return <SharesDialog onClose={onClose} notify={notify} onChanged={onSharesChanged} />;
+  if (dialog.kind === "activity") return <ActivityDialog owner={username} onClose={onClose} />;
   if (dialog.kind === "new") return <NewDialog path={currentPath} onClose={onClose} onRun={onRun} />;
   if (dialog.kind === "rename") return <RenameDialog entry={dialog.entry} onClose={onClose} onRun={onRun} />;
   if (dialog.kind === "delete") return <DeleteDialog entries={selected} onClose={onClose} onRun={onRun} />;
@@ -2091,6 +2096,130 @@ function ShareDialog({ entry, onClose, notify, onChanged }: { entry: FileEntry; 
         {links === null ? <div className="ownership-loading"><LoaderCircle className="spin" size={18} /> Loading links…</div> : mine.length > 0 && <div className="share-links"><p className="share-links-title">Active links to this {entry.type === "directory" ? "folder" : "file"}</p>{mine.map((link) => <ShareLinkRow key={link.id} link={link} onCopy={copy} onRevoke={revoke} />)}</div>}
         <ModalActions onClose={onClose} submitLabel={mine.length ? "Create another link" : "Create link"} busy={busy} disabled={!enabled} />
       </form>
+    </Modal>
+  );
+}
+
+type ActivityItem = { at: string; event: string; [key: string]: unknown };
+
+const ACTIVITY_ICONS: Record<ActivityCategory, ReactNode> = {
+  files: <Folder size={15} />,
+  downloads: <Download size={15} />,
+  "sign-ins": <KeyRound size={15} />,
+  sharing: <Link2 size={15} />,
+  accounts: <Users size={15} />,
+  snapshots: <History size={15} />,
+};
+
+function activityDay(at: Date) {
+  const today = new Date();
+  const yesterday = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 1);
+  if (at.toDateString() === today.toDateString()) return "Today";
+  if (at.toDateString() === yesterday.toDateString()) return "Yesterday";
+  return at.toLocaleDateString(undefined, { weekday: "long", day: "numeric", month: "long", year: at.getFullYear() === today.getFullYear() ? undefined : "numeric" });
+}
+
+/** The owner's view of the audit log: who did what and when, newest first, with filters. */
+function ActivityDialog({ owner, onClose }: { owner: string; onClose: () => void }) {
+  const [category, setCategory] = useState<ActivityCategory | "all">("all");
+  const [user, setUser] = useState("");
+  const [query, setQuery] = useState("");
+  const [appliedQuery, setAppliedQuery] = useState("");
+  const [page, setPage] = useState<{ key: string; entries: ActivityItem[]; cursor: string | null; error?: string } | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [accounts, setAccounts] = useState<string[]>([]);
+  const filterKey = `${category}|${user}|${appliedQuery}`;
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setAppliedQuery(query.trim()), 300);
+    return () => window.clearTimeout(timer);
+  }, [query]);
+
+  useEffect(() => {
+    requestJson<{ users: ManagedUser[] }>("/api/users").then((result) => setAccounts(result.users.map((account) => account.username))).catch(() => undefined);
+  }, []);
+
+  const fetchPage = useCallback((cursor: string | null, signal?: AbortSignal) => {
+    const params = new URLSearchParams({ category });
+    if (user) params.set("user", user);
+    if (appliedQuery) params.set("q", appliedQuery);
+    if (cursor) params.set("cursor", cursor);
+    return requestJson<{ entries: ActivityItem[]; cursor: string | null }>(`/api/activity?${params}`, { signal });
+  }, [category, user, appliedQuery]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    fetchPage(null, controller.signal)
+      .then((result) => setPage({ key: filterKey, ...result }))
+      .catch((error: Error) => { if (error.name !== "AbortError") setPage({ key: filterKey, entries: [], cursor: null, error: error.message }); });
+    return () => controller.abort();
+  }, [fetchPage, filterKey]);
+
+  const loadMore = async () => {
+    if (!page?.cursor) return;
+    setLoadingMore(true);
+    try {
+      const result = await fetchPage(page.cursor);
+      setPage((current) => (current && current.key === filterKey ? { ...current, entries: [...current.entries, ...result.entries], cursor: result.cursor } : current));
+    } catch (error) {
+      setPage((current) => (current ? { ...current, error: (error as Error).message } : current));
+    } finally {
+      setLoadingMore(false);
+    }
+  };
+
+  const loading = !page || page.key !== filterKey;
+  const people = [owner, ...accounts.filter((account) => account !== owner)];
+  let lastDay = "";
+  return (
+    <Modal title="Activity" subtitle="Who did what, newest first, from the audit log" icon={<Activity size={19} />} onClose={onClose} wide>
+      <div className="storage-browser activity-browser">
+        <div className="activity-filters">
+          <div className="activity-categories" role="tablist" aria-label="Kind of activity">
+            {ACTIVITY_CATEGORIES.map((item) => <button key={item.id} type="button" role="tab" aria-selected={category === item.id} className={category === item.id ? "active" : ""} onClick={() => setCategory(item.id)}>{item.label}</button>)}
+          </div>
+          <div className="activity-search">
+            <select aria-label="Account" value={user} onChange={(event) => setUser(event.target.value)}>
+              <option value="">Everyone</option>
+              {people.map((person) => <option key={person} value={person}>{person}</option>)}
+              <option value="share link">Share links</option>
+              <option value="system">FilesDude itself</option>
+            </select>
+            <label className="search-field"><Search size={15} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Filter by name, path, or address" aria-label="Filter activity" /></label>
+          </div>
+        </div>
+        {loading ? <div className="storage-scan-state"><LoaderCircle className="spin" size={25} /><strong>Loading activity…</strong></div>
+          : page.error && !page.entries.length ? <div className="storage-scan-state error"><CircleAlert size={25} /><strong>Activity couldn&apos;t be loaded</strong><span>{page.error}</span></div>
+          : !page.entries.length ? <div className="storage-scan-state"><Activity size={25} /><strong>{page.cursor ? "Nothing found in recent activity" : "No matching activity"}</strong><span>{page.cursor ? "Older activity hasn't been searched yet." : "Try another filter."}</span></div>
+          : <div className="activity-list">
+            {page.entries.map((entry, index) => {
+              const at = new Date(entry.at);
+              const day = activityDay(at);
+              const heading = day !== lastDay ? <h3 className="activity-day">{day}</h3> : null;
+              lastDay = day;
+              const { text, detail, tone } = describeActivity(entry);
+              const actor = entry.event === "login.failed" ? "Someone" : activityUser(entry) || "Someone";
+              const kind = activityCategory(entry.event);
+              return (
+                <div key={`${entry.at}-${index}`}>
+                  {heading}
+                  <div className={`activity-row ${tone ?? ""}`}>
+                    <time dateTime={entry.at} title={at.toLocaleString()}>{at.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}</time>
+                    <span className={`activity-icon ${kind}`}>{ACTIVITY_ICONS[kind]}</span>
+                    <div><p><strong>{actor === "system" ? "FilesDude" : actor === "share link" ? "A share link" : actor}</strong> {text}</p>{detail && <small title={detail}>{detail}</small>}</div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>}
+        <div className="storage-scan-foot">
+          <span>{page && !loading && page.entries.length ? `${page.entries.length.toLocaleString()} shown` : ""}{page?.error && page.entries.length ? ` · ${page.error}` : ""}</span>
+          <div className="activity-foot-actions">
+            {!loading && page?.cursor && <button type="button" className="button secondary" disabled={loadingMore} onClick={() => void loadMore()}>{loadingMore && <LoaderCircle className="spin" size={15} />}{page.entries.length ? "Load older" : "Search older activity"}</button>}
+            <button className="button primary" onClick={onClose}>Done</button>
+          </div>
+        </div>
+      </div>
     </Modal>
   );
 }
