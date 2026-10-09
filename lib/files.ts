@@ -6,7 +6,7 @@ import crypto from "node:crypto";
 import { config } from "./config";
 import { AppError } from "./http";
 import { forgetCopies, readCopyJournal, recordCopy } from "./copy-journal";
-import { currentScope, scopeRoot, withinScope } from "./scope";
+import { currentScope, runUnscoped, scopeRoot, withinScope } from "./scope";
 
 // An account confined to a folder can't rename, move, or delete that folder itself.
 function assertNotHome(relativePath: string) {
@@ -1213,10 +1213,18 @@ async function transferOne(sourcePath: string, destination: AnchoredDirectory, d
           .then(() => { journaled = true; }, (error: unknown) => console.error("Could not record a copy in the journal", error));
         if (!move) unlock();
       };
-      const forget = async () => {
+      // Before placing, a failure to forget stops the copy, so no entry can outlive its placeholder
+      // and later match the finished copy; when cleaning up, it is only logged.
+      const forget = async (strict = false) => {
         if (!journaled) return;
         journaled = false;
-        await forgetCopies([journalId]).catch((error: unknown) => console.error("Could not update the copy journal", error));
+        await forgetCopies([journalId]).catch((error: unknown) => {
+          if (strict) {
+            journaled = true;
+            throw error;
+          }
+          console.error("Could not update the copy journal", error);
+        });
       };
       let targetName = name;
       let renamed = false;
@@ -1230,7 +1238,7 @@ async function transferOne(sourcePath: string, destination: AnchoredDirectory, d
         if (!move) ({ name: targetName, renamed } = await availableName(destination, name, type, "copy"));
         // Forgotten before placing, so a stale entry can never point at the finished copy; a crash in
         // between leaves a visible placeholder rather than risking the copy.
-        await forget();
+        await forget(true);
         await placeEntry(destination, temporary, destination, targetName);
       } catch (error) {
         await relock();
@@ -1261,6 +1269,7 @@ async function transferOne(sourcePath: string, destination: AnchoredDirectory, d
  * permissions a copy starts with (a folder 0700, a file 0600). Anything else is left alone.
  */
 export async function recoverInterruptedCopies() {
+  await ensureRoot();
   const entries = await readCopyJournal();
   for (const entry of entries) {
     try {
@@ -1286,7 +1295,8 @@ let recoveryStarted = false;
 function startRecovery() {
   if (recoveryStarted) return;
   recoveryStarted = true;
-  void recoverInterruptedCopies().catch((error: unknown) => console.error("Could not clean up interrupted copies", error));
+  // Outside the triggering request's account, which may be confined to a folder.
+  void runUnscoped(() => recoverInterruptedCopies()).catch((error: unknown) => console.error("Could not clean up interrupted copies", error));
 }
 
 export async function changeMode(paths: string[], mode: string) {

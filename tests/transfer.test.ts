@@ -7,6 +7,7 @@ import { config } from "../lib/config";
 import { execFileSync } from "node:child_process";
 import { acquireFilesystemLock, copyOrMove, deleteEntries, listTrash, recoverInterruptedCopies, PartialTransferError, renameEntry, restoreTrashItems, withFilesystemLock } from "../lib/files";
 import { listJobs, startJob } from "../lib/jobs";
+import { currentScope, runInScope, runUnscoped } from "../lib/scope";
 import { readCopyJournal, recordCopy } from "../lib/copy-journal";
 import { createShare, openSharedItem, resolveShareToken, rewriteSharePaths } from "../lib/shares";
 import type { JobProgress } from "../lib/types";
@@ -282,6 +283,15 @@ test("copies are journaled while they run, and placeholders left by a restart ar
     assert.deepEqual(await fs.readdir(path.join(root, "elsewhere-real")), ["keep (copying)"]);
     assert.deepEqual(await readCopyJournal(), []);
   });
+});
+
+test("service work started from an account's request doesn't run as that account", async () => {
+  const editor = { accountKey: "e", username: "e", role: "editor" as const, root: "home/e" };
+  const seen = await runInScope(editor, () => runUnscoped(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    return currentScope();
+  }));
+  assert.equal(seen, undefined);
 });
 
 test("a failed copy never removes an item that took over its placeholder name", async () => {
