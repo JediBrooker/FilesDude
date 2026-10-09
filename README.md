@@ -25,7 +25,8 @@ FilesDude is a secure, self-hosted web file manager designed for a Proxmox host,
 - POSIX `chmod` and numeric `chown` for one or many items
 - Bulk rename with find/replace, regular expressions, prefix, suffix, sequential numbering, live conflict detection, and two-phase application
 - Search inside files: switch the search box to **Contents** to find text in files under the current folder, with matching lines, line numbers, highlighting, and an optional match-case toggle. It reads text files up to 5 MB (skipping binary files, symlinks, and FilesDude's internal folders) and stops at 20,000 files, 256 MB, 15 seconds, or 200 matching files, saying when it did
-- Recursive filename search, disk usage, owner/group display, symlink escape warnings, and a cached whole-tree largest-files view from the clickable Storage card
+- Recursive filename search with filters (**Filters** next to Names/Contents) for kind (folders, images, videos, audio, documents, archives), when modified, and minimum size, which work with or without a name; results show their folder, and a search never holds up other work while it walks the tree
+- Disk usage, owner/group display, symlink escape warnings, and a cached whole-tree largest-files view from the clickable Storage card
 - Filter largest files by a minimum size, load 100, 250, or 500 more at a time, export the currently loaded results to CSV, and move one or many selected files to protected trash (or permanently delete them after confirmation)
 - Protected trash by default with a Trash view for restoring items to their original folders, deleting them forever, or emptying the trash, plus optional automatic removal of items after 7, 30, or 90 days or a year; persistent favourites; and a JSON Lines audit log inside the protected state directory
 - Activity (owner): who did what and when, newest first, in plain sentences, filtered by kind (files, downloads, sign-ins, sharing, accounts, snapshots), account, or text

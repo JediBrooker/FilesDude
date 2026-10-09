@@ -12,10 +12,10 @@ import {
   listDirectory,
   previewBulkRename,
   renameEntry,
-  searchFiles,
   withFilesystemLock,
   writeTextFile,
 } from "@/lib/files";
+import { SEARCH_KINDS, searchNames, type SearchKind } from "@/lib/name-search";
 import type { BulkRenameRule } from "@/lib/types";
 import { config } from "@/lib/config";
 import { waitForJob } from "@/lib/jobs";
@@ -36,11 +36,17 @@ export async function GET(request: Request) {
     return await withAccess(request, "read", async () => {
       const url = new URL(request.url);
       const relativePath = url.searchParams.get("path") || "";
-      const search = url.searchParams.get("search")?.trim();
+      const search = (url.searchParams.get("search") ?? "").trim().slice(0, 256);
       const showHidden = url.searchParams.get("hidden") === "true";
-      const result = await withFilesystemLock(() => search
-        ? searchFiles(relativePath, search, showHidden)
-        : listDirectory(relativePath, showHidden));
+      const kind = (url.searchParams.get("kind") || "any") as SearchKind;
+      if (!SEARCH_KINDS.includes(kind)) throw new AppError("Unknown kind of item", 400, "INVALID_FILTER");
+      const modifiedWithinDays = Number(url.searchParams.get("modifiedDays") || 0);
+      const minBytes = Number(url.searchParams.get("minBytes") || 0);
+      if (!Number.isFinite(modifiedWithinDays) || modifiedWithinDays < 0 || !Number.isFinite(minBytes) || minBytes < 0) throw new AppError("Invalid search filter", 400, "INVALID_FILTER");
+      // A search walks the tree without holding the filesystem lock (see name-search.ts).
+      const result = search || kind !== "any" || modifiedWithinDays || minBytes
+        ? await searchNames(relativePath, { query: search, hidden: showHidden, kind, modifiedWithinDays, minBytes }, request.signal)
+        : await withFilesystemLock(() => listDirectory(relativePath, showHidden));
       return NextResponse.json(result, { headers: { "Cache-Control": "no-store" } });
     });
   } catch (error) {

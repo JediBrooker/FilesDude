@@ -212,6 +212,9 @@ kbd { padding: 3px 5px; border: 1px solid var(--line); border-bottom-width: 2px;
 :root[data-theme="dark"] .file-icon.directory { background: #3d3323; color: #e6b765; }
 .file-name { min-width: 0; overflow: hidden; padding: 4px 0; border: 0; background: transparent; cursor: pointer; font-size: 11px; font-weight: 700; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
 .file-name:hover { color: var(--brand); }
+.file-name-stack { display: flex; min-width: 0; flex-direction: column; }
+.file-name-stack .file-name { padding-bottom: 1px; }
+.file-name-stack small { overflow: hidden; color: var(--ink-faint); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .muted { color: var(--ink-soft); font-size: 10px; }
 .owner-cell { display: flex; min-width: 0; align-items: center; gap: 7px; color: var(--ink-soft); font-size: 9px; }
 .owner-cell > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -543,6 +546,11 @@ kbd { padding: 3px 5px; border: 1px solid var(--line); border-bottom-width: 2px;
 .details-list dd { min-width: 0; margin: 0; overflow-wrap: anywhere; text-align: right; }
 .checksum-panel { display: grid; gap: 8px; margin: 14px 22px 0; }
 .media-panel { display: grid; gap: 8px; margin: 14px 22px 0; }
+.search-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin: -2px 0 11px; padding: 9px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+.search-filters label { display: inline-flex; align-items: center; gap: 7px; color: var(--ink-soft); font-size: 10px; font-weight: 700; }
+.search-filters select { height: 30px; padding: 0 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel-soft); color: var(--ink); font-size: 10px; }
+.search-filters small { flex-basis: 100%; color: var(--ink-faint); font-size: 9px; }
+.toolbar-button .nav-count { margin-left: 2px; }
 .activity-filters { display: grid; gap: 10px; margin-bottom: 12px; }
 .activity-categories { display: flex; flex-wrap: wrap; gap: 4px; }
 .activity-categories button { padding: 6px 10px; border: 1px solid var(--line); border-radius: 999px; background: var(--panel); color: var(--ink-soft); cursor: pointer; font-size: 9px; font-weight: 700; }

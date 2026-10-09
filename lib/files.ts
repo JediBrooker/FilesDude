@@ -641,7 +641,7 @@ export async function isAvailableUploadOwnership(relativePath: string, uid: numb
 }
 
 // `location` is where to look (usually inside an open folder); `relative` is the path shown to the user.
-async function toEntry(location: string, relative: string, name = path.posix.basename(relative), known?: Stats): Promise<FileEntry> {
+export async function toEntry(location: string, relative: string, name = path.posix.basename(relative), known?: Stats): Promise<FileEntry> {
   const stat = known ?? await fs.lstat(location);
   const ids = await identities();
   const type: FileEntry["type"] = stat.isDirectory() ? "directory" : stat.isSymbolicLink() ? "symlink" : "file";
@@ -697,30 +697,6 @@ export async function listDirectory(relativePath = "", showHidden = false) {
     return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" });
   });
   return { path: normalizeRelative(relativePath), entries, disk: await diskInfo() };
-}
-
-export async function searchFiles(relativePath: string, query: string, showHidden = false) {
-  const relative = cleanRelative(relativePath);
-  const needle = query.toLocaleLowerCase();
-  const results: FileEntry[] = [];
-
-  async function walk(directory: AnchoredDirectory, directoryRelative: string, depth: number) {
-    if (depth > 20 || results.length >= 500) return;
-    const entries = await fs.readdir(directory.base, { withFileTypes: true });
-    for (const entry of entries) {
-      if (results.length >= 500) return;
-      if (INTERNAL_NAMES.has(entry.name) || (!showHidden && entry.name.startsWith("."))) continue;
-      const entryRelative = childOf(directoryRelative, entry.name);
-      if (entry.name.toLocaleLowerCase().includes(needle)) results.push(await toEntry(inside(directory, entry.name), entryRelative, entry.name));
-      if (!entry.isDirectory()) continue;
-      // A folder swapped for a symlink since it was listed is skipped rather than followed.
-      const child = await openChild(directory, entry.name, true).catch(() => null);
-      if (child) await withOpen(Promise.resolve(child), (opened) => walk(opened, entryRelative, depth + 1));
-    }
-  }
-
-  await withOpen(openDirectory(relative), (directory) => walk(directory, relative, 0));
-  return { path: normalizeRelative(relativePath), entries: results, disk: await diskInfo(), truncated: results.length >= 500 };
 }
 
 export function validateName(name: string) {
