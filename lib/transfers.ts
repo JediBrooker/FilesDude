@@ -1,15 +1,15 @@
 import path from "node:path";
 import { audit } from "./audit";
 import { rewriteFavoritePaths } from "./favorites";
-import { copyOrMove } from "./files";
+import { copyOrMove, type CopiedItems } from "./files";
 import { startJob } from "./jobs";
 import { rewriteSharePaths } from "./shares";
 
 /** Favourites and share links follow items that are renamed or moved, and drop deleted ones. */
-export async function rewriteLinkedPaths(changes: Array<{ from: string; to?: string }>, username: string) {
+export async function rewriteLinkedPaths(changes: Array<{ from: string; to?: string }>, username: string, copies?: CopiedItems) {
   if (!changes.length) return;
   await rewriteFavoritePaths(changes);
-  const revoked = await rewriteSharePaths(changes);
+  const revoked = await rewriteSharePaths(changes, copies);
   if (revoked.length) await audit("share.revoke", { username, ids: revoked, reason: "item deleted" });
 }
 
@@ -25,7 +25,7 @@ export function startTransferJob(username: string, action: "copy" | "move", path
     (report, signal) => copyOrMove(paths, destination, move, {
       report,
       signal,
-      moved: (item) => rewriteLinkedPaths([{ from: item.source, to: item.path }], username),
+      moved: (item, copies) => rewriteLinkedPaths([{ from: item.source, to: item.path }], username, copies),
     }),
     async (job) => {
       await audit(`fs.${action}`, { username, paths, destination, status: job.status, transferred: job.transferred?.length ?? 0, error: job.error });

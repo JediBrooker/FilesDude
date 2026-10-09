@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { reservedPathCheck } from "./archives";
 import { config } from "./config";
-import { ensureRoot, normalizeRelative, safeResolve, verifyFileHandleWithinRoot } from "./files";
+import { ensureRoot, normalizeRelative, safeResolve, verifyFileHandleWithinRoot, type CopiedItems } from "./files";
 import { AppError } from "./http";
 import type { ShareLink } from "./types";
 
@@ -149,8 +149,13 @@ export async function revokeShare(id: string) {
 /**
  * Keeps links pointing at items that are renamed or moved; links to deleted items are revoked.
  * Returns the ids of revoked links.
+ *
+ * A move between filesystems copies items, so `copies` maps each original that was copied (by device
+ * and inode) to its copy. Links to those follow the copy; links to anything not copied stay where
+ * they are, since that item is still there. The mapping comes from the copy itself, never from
+ * looking the new path up, so nothing swapped in at that path can take a link over.
  */
-export async function rewriteSharePaths(changes: Array<{ from: string; to?: string }>) {
+export async function rewriteSharePaths(changes: Array<{ from: string; to?: string }>, copies?: CopiedItems) {
   const normalized = changes.map((change) => ({ from: sharePath(change.from), to: change.to === undefined ? undefined : sharePath(change.to) }));
   return mutate(async (shares) => {
     const revoked: string[] = [];
@@ -161,8 +166,10 @@ export async function rewriteSharePaths(changes: Array<{ from: string; to?: stri
         revoked.push(share.id);
         return [];
       }
+      const copy = copies?.get(`${share.dev}:${share.ino}`);
+      if (copies && !copy) return [share];
       const nextPath = [change.to, share.path.slice(change.from.length).replace(/^\//, "")].filter(Boolean).join("/");
-      return [{ ...share, path: nextPath, name: path.posix.basename(nextPath) }];
+      return [{ ...share, ...copy, path: nextPath, name: path.posix.basename(nextPath) }];
     });
     return { shares: updated, result: revoked };
   });

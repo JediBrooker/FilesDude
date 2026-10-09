@@ -5,6 +5,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { config } from "./config";
 import { AppError } from "./http";
+import { forgetCopies, readCopyJournal, recordCopy } from "./copy-journal";
 import { currentScope, scopeRoot, withinScope } from "./scope";
 
 // An account confined to a folder can't rename, move, or delete that folder itself.
@@ -289,19 +290,28 @@ async function removeEntry(directory: AnchoredDirectory, name: string, depth = 0
   await fs.rmdir(location);
 }
 
+/** Device and inode as share links store them, for following items a move had to copy. */
+export type ItemIdentity = { dev: string; ino: string };
+export type CopiedItems = ReadonlyMap<string, ItemIdentity>;
+
 // What a copy carries through its walk: folders it made (so it never copies into itself), a way to
-// stop it, and a running count of bytes for progress. `sources` collects what was copied when a move
-// will remove it afterwards, `top` identifies the item the copy created and `created` is told as
-// soon as it exists, and `moved` is told about each item a move puts in place, under the lock.
+// stop it, and a running count of bytes for progress. For a move that will remove the original,
+// `sources` collects what was copied unchanged and `copies` maps each such original's identity to
+// its copy's. `top` identifies the item the copy created and `created` is told (and awaited) as soon
+// as it exists; `moved` is told about each item a move puts in place, under the lock.
 type CopyContext = {
   made: Set<string>;
   signal?: AbortSignal;
   copied?: (bytes: number) => void;
   sources?: Set<string>;
+  copies?: Map<string, ItemIdentity>;
   top?: string;
-  created?: () => void;
-  moved?: (item: TransferResult) => Promise<void>;
+  created?: () => Promise<void>;
+  moved?: (item: TransferResult, copies?: CopiedItems) => Promise<void>;
 };
+
+const itemIdentityOf = (stat: BigIntStats): ItemIdentity => ({ dev: String(stat.dev), ino: String(stat.ino) });
+const itemKey = (identity: ItemIdentity) => `${identity.dev}:${identity.ino}`;
 
 const identityOf = (stat: Stats) => `${stat.dev}:${stat.ino}`;
 // What a move may remove once copied: folders by identity, anything else by identity, size, and
@@ -310,10 +320,10 @@ const fingerprintOf = (stat: BigIntStats) => (stat.isDirectory()
   ? `d:${stat.dev}:${stat.ino}`
   : `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`);
 
-function markCreated(context: CopyContext, depth: number, stat: Stats) {
+async function markCreated(context: CopyContext, depth: number, stat: Stats) {
   if (depth !== 0) return;
   context.top = identityOf(stat);
-  context.created?.();
+  await context.created?.();
 }
 
 function throwIfCancelled(signal?: AbortSignal) {
@@ -353,7 +363,7 @@ async function copyEntry(from: AnchoredDirectory, name: string, to: AnchoredDire
     await fs.symlink(await fs.readlink(source), target);
     // Only a link that wasn't replaced while it was read may be removed by a move.
     if (before && before === fingerprintOf(await fs.lstat(source, { bigint: true }))) context.sources!.add(before);
-    if (depth === 0) markCreated(context, depth, await fs.lstat(target));
+    if (depth === 0) await markCreated(context, depth, await fs.lstat(target));
     return;
   }
   if (stat.isDirectory()) {
@@ -365,9 +375,13 @@ async function copyEntry(from: AnchoredDirectory, name: string, to: AnchoredDire
         throw new AppError("The destination changed while it was being copied to", 409, "PATH_CHANGED");
       }
       context.made.add(identityOf(created.stat));
-      markCreated(context, depth, created.stat);
+      await markCreated(context, depth, created.stat);
       const original = await withOpen(openChild(from, name), async (folder) => {
-        context.sources?.add(fingerprintOf(await folder.handle.stat({ bigint: true })));
+        if (context.sources) {
+          const folderStat = await folder.handle.stat({ bigint: true });
+          context.sources.add(fingerprintOf(folderStat));
+          context.copies?.set(itemKey(itemIdentityOf(folderStat)), itemIdentityOf(await created.handle.stat({ bigint: true })));
+        }
         for (const entry of await fs.readdir(folder.base)) await copyEntry(folder, entry, created, entry, context, depth + 1);
         return folder.stat;
       });
@@ -381,14 +395,19 @@ async function copyEntry(from: AnchoredDirectory, name: string, to: AnchoredDire
   try {
     const opened = await input.stat();
     if (!opened.isFile()) throw special;
-    const before = context.sources && fingerprintOf(await input.stat({ bigint: true }));
+    const beforeStat = context.sources && await input.stat({ bigint: true });
+    const before = beforeStat && fingerprintOf(beforeStat);
     const output = await fs.open(target, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
     try {
-      markCreated(context, depth, await output.stat());
+      await markCreated(context, depth, await output.stat());
       await copyContents(input, output, context);
       await applyCopiedAttributes(output, opened);
-      // Only a file that didn't change while it was copied may be removed by a move.
-      if (before && before === fingerprintOf(await input.stat({ bigint: true }))) context.sources!.add(before);
+      // Only a file that didn't change while it was copied may be removed by a move, and only then
+      // do links to it follow the copy.
+      if (before && before === fingerprintOf(await input.stat({ bigint: true }))) {
+        context.sources!.add(before);
+        context.copies?.set(itemKey(itemIdentityOf(beforeStat)), itemIdentityOf(await output.stat({ bigint: true })));
+      }
     } finally {
       await output.close();
     }
@@ -1075,8 +1094,12 @@ export class PartialTransferError extends AppError {
 export type TransferOptions = {
   report?: (progress: JobProgress) => void;
   signal?: AbortSignal;
-  /** Called for each moved item as soon as it is in place, while the filesystem lock is held. */
-  moved?: (item: TransferResult) => Promise<void>;
+  /**
+   * Called for each moved item as soon as it is in place, while the filesystem lock is held. For a
+   * move between filesystems, `copies` maps each original that was copied unchanged (by device and
+   * inode) to its copy; anything not in it stayed where it was.
+   */
+  moved?: (item: TransferResult, copies?: CopiedItems) => Promise<void>;
 };
 
 // The total size of what a copy will write, for progress; undefined when it can't be measured fully.
@@ -1157,7 +1180,7 @@ async function transferOne(sourcePath: string, destination: AnchoredDirectory, d
       // Favourites and share links following a moved item are bookkeeping: if updating them fails,
       // the move itself still stands.
       const placed = async (item: TransferResult) => {
-        await context.moved?.(item).catch((error: unknown) => console.error("Could not update links for a moved item", error));
+        await context.moved?.(item, context.copies).catch((error: unknown) => console.error("Could not update links for a moved item", error));
         return item;
       };
       if (move) {
@@ -1175,8 +1198,20 @@ async function transferOne(sourcePath: string, destination: AnchoredDirectory, d
       // lock throughout, so nothing else in FilesDude changes the original meanwhile, and removes
       // only what it copied unchanged; anything other processes add or change stays where it was.
       const { name: temporary } = await availableName(destination, name, type, "copying", true);
-      if (move) context.sources = new Set();
-      else context.created = unlock;
+      if (move) Object.assign(context, { sources: new Set(), copies: new Map() });
+      // The placeholder is journaled as soon as it exists, so a restart part-way through the copy
+      // doesn't leave it behind (see recoverInterruptedCopies).
+      const journalId = crypto.randomUUID();
+      let journaled = false;
+      context.created = async () => {
+        // The journal only helps clean up after a restart; a copy goes ahead without it.
+        await recordCopy({ id: journalId, directory: destination.real, name: temporary, identity: context.top!, startedAt: new Date().toISOString() })
+          .then(() => { journaled = true; }, (error: unknown) => console.error("Could not record a copy in the journal", error));
+        if (!move) unlock();
+      };
+      const forget = async () => {
+        if (journaled) await forgetCopies([journalId]).catch((error: unknown) => console.error("Could not update the copy journal", error));
+      };
       let targetName = name;
       let renamed = false;
       try {
@@ -1191,8 +1226,10 @@ async function transferOne(sourcePath: string, destination: AnchoredDirectory, d
       } catch (error) {
         await relock();
         await removeCreated(destination, temporary, context.top).catch(() => undefined);
+        await forget();
         throw error;
       }
+      await forget();
       if (!move) return result(targetName, renamed);
       // The item is in place, so the move stands even if removing the original stops part-way;
       // whatever is left (changed or added while it was copied) is reported, not lost.
@@ -1205,6 +1242,31 @@ async function transferOne(sourcePath: string, destination: AnchoredDirectory, d
   } finally {
     unlock();
   }
+}
+
+/**
+ * Removes copy placeholders a restart left behind, run once when the service starts. A placeholder
+ * is removed only if its folder still has the recorded real location, and the item there is still
+ * the one this service created: the same identity, still owned by the service.
+ */
+export async function recoverInterruptedCopies() {
+  const entries = await readCopyJournal();
+  if (!entries.length) return;
+  await withFilesystemLock(async () => {
+    for (const entry of entries) {
+      try {
+        await withOpen(openAnchored(entry.directory, { follow: true, checkReserved: true }), async (directory) => {
+          if (directory.real !== entry.directory) return;
+          const stat = await fs.lstat(inside(directory, entry.name)).catch(missingAsNull);
+          const ours = stat && identityOf(stat) === entry.identity && (typeof process.getuid !== "function" || stat.uid === process.getuid());
+          if (ours) await removeCreated(directory, entry.name, entry.identity);
+        });
+      } catch (error) {
+        if (!(error instanceof AppError && error.code === "NOT_FOUND")) console.error("Could not clean up an interrupted copy", error);
+      }
+    }
+    await forgetCopies(entries.map((entry) => entry.id));
+  });
 }
 
 export async function changeMode(paths: string[], mode: string) {

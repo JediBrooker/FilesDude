@@ -5,17 +5,18 @@ import path from "node:path";
 import test from "node:test";
 import { config } from "../lib/config";
 import { execFileSync } from "node:child_process";
-import { acquireFilesystemLock, copyOrMove, deleteEntries, listTrash, PartialTransferError, renameEntry, restoreTrashItems, withFilesystemLock } from "../lib/files";
+import { acquireFilesystemLock, copyOrMove, deleteEntries, listTrash, recoverInterruptedCopies, PartialTransferError, renameEntry, restoreTrashItems, withFilesystemLock } from "../lib/files";
 import { listJobs, startJob } from "../lib/jobs";
+import { readCopyJournal, recordCopy } from "../lib/copy-journal";
+import { createShare, openSharedItem, resolveShareToken, rewriteSharePaths } from "../lib/shares";
 import type { JobProgress } from "../lib/types";
 
 const MB = 1024 * 1024;
 
 async function withTempRoot<T>(run: (root: string) => Promise<T>) {
   const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "filesdude-transfer-")));
-  const original = { root: config.root, trashEnabled: config.trashEnabled };
-  config.root = root;
-  config.trashEnabled = true;
+  const original = { root: config.root, trashEnabled: config.trashEnabled, stateDir: config.stateDir, sessionSecret: config.sessionSecret, sharingEnabled: config.sharingEnabled };
+  Object.assign(config, { root, trashEnabled: true, stateDir: path.join(root, ".filedude"), sessionSecret: "transfer-test-session-secret-with-more-than-32-characters", sharingEnabled: true });
   try {
     return await run(root);
   } finally {
@@ -176,11 +177,23 @@ test("a move between filesystems removes only what it copied and leaves anything
         return result;
       },
     });
+    const folderShare = await createShare("src", 1, null);
+    const fileShare = await createShare("src/a.txt", 1, null);
     try {
-      const moved = await copyOrMove(["src"], "dest", true);
+      const moved = await copyOrMove(["src"], "dest", true, {
+        moved: async (item, copies) => { await rewriteSharePaths([{ from: item.source, to: item.path }], copies); },
+      });
       assert.deepEqual(moved, [{ source: "src", path: "dest/src", renamed: false, leftBehind: true }]);
     } finally {
       Object.assign(fs, original);
+    }
+    // Links follow the copies, which have new identities, and still open.
+    for (const [share, expected] of [[folderShare, "dest/src"], [fileShare, "dest/src/a.txt"]] as const) {
+      const resolved = await resolveShareToken(share.url.replace(/^\/s\//, ""));
+      assert.equal(resolved?.path, expected);
+      const opened = await openSharedItem(resolved!);
+      assert.ok(opened, `${expected} opens`);
+      await opened.handle.close();
     }
     assert.ok(injected);
     assert.deepEqual(await fs.readdir(path.join(root, "dest", "src")), ["a.txt"]);
@@ -221,6 +234,45 @@ test("copies of items with names near the length limit still get a placeholder t
     assert.deepEqual(await copyOrMove([name], "dest", false), [{ source: name, path: `dest/${name}`, renamed: false }]);
     const second = await copyOrMove([name], "dest", false);
     assert.ok(Buffer.byteLength(path.posix.basename(second[0].path)) <= 255 && second[0].renamed);
+  });
+});
+
+test("copies are journaled while they run, and placeholders left by a restart are cleaned up", async () => {
+  await withTempRoot(async (root) => {
+    await fs.mkdir(path.join(root, "dest"));
+    await fs.writeFile(path.join(root, "file.bin"), Buffer.alloc(3 * MB));
+    let journaled: string[] = [];
+    let checked = false;
+    await copyOrMove(["file.bin"], "dest", false, {
+      report: (progress) => {
+        if (progress.done > 0 && !checked) {
+          checked = true;
+          void readCopyJournal().then((entries) => { journaled = entries.map((entry) => entry.name); });
+        }
+      },
+    });
+    assert.deepEqual(journaled, ["file (copying).bin"]);
+    assert.deepEqual(await readCopyJournal(), []);
+
+    // Placeholders a restart left behind: one still as created, one replaced by someone else's item,
+    // and one whose folder is now reached through a symlink.
+    const identity = async (location: string) => { const stat = await fs.lstat(location); return `${stat.dev}:${stat.ino}`; };
+    const real = await fs.realpath(path.join(root, "dest"));
+    await fs.mkdir(path.join(root, "dest", "left (copying)"));
+    await fs.writeFile(path.join(root, "dest", "left (copying)", "part.bin"), "partial");
+    await fs.writeFile(path.join(root, "dest", "theirs (copying).txt"), "x");
+    const replacedIdentity = "1:1";
+    await fs.mkdir(path.join(root, "elsewhere"));
+    await fs.mkdir(path.join(root, "elsewhere", "keep (copying)"));
+    await fs.rename(path.join(root, "elsewhere"), path.join(root, "elsewhere-real"));
+    await fs.symlink("elsewhere-real", path.join(root, "elsewhere"));
+    await recordCopy({ id: "a", directory: real, name: "left (copying)", identity: await identity(path.join(root, "dest", "left (copying)")), startedAt: "" });
+    await recordCopy({ id: "b", directory: real, name: "theirs (copying).txt", identity: replacedIdentity, startedAt: "" });
+    await recordCopy({ id: "c", directory: path.join(root, "elsewhere"), name: "keep (copying)", identity: await identity(path.join(root, "elsewhere-real", "keep (copying)")), startedAt: "" });
+    await recoverInterruptedCopies();
+    assert.deepEqual((await fs.readdir(path.join(root, "dest"))).sort(), ["file.bin", "theirs (copying).txt"]);
+    assert.deepEqual(await fs.readdir(path.join(root, "elsewhere-real")), ["keep (copying)"]);
+    assert.deepEqual(await readCopyJournal(), []);
   });
 });
 
