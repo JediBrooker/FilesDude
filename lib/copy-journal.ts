@@ -11,6 +11,8 @@ export interface CopyJournalEntry {
   directory: string;
   name: string;
   identity: string;
+  /** The placeholder's creation time in nanoseconds, so a reused inode can't match. */
+  birth?: string;
   startedAt: string;
 }
 

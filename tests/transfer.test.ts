@@ -258,9 +258,15 @@ test("copies are journaled while they run, and placeholders left by a restart ar
     // and one whose folder is now reached through a symlink.
     const identity = async (location: string) => { const stat = await fs.lstat(location); return `${stat.dev}:${stat.ino}`; };
     const real = await fs.realpath(path.join(root, "dest"));
-    await fs.mkdir(path.join(root, "dest", "left (copying)"));
+    await fs.mkdir(path.join(root, "dest", "left (copying)"), 0o700);
+    await fs.chmod(path.join(root, "dest", "left (copying)"), 0o700);
     await fs.writeFile(path.join(root, "dest", "left (copying)", "part.bin"), "partial");
     await fs.writeFile(path.join(root, "dest", "theirs (copying).txt"), "x");
+    // A placeholder that has since been finished (its permissions applied) is left alone, as is one
+    // whose creation time doesn't match (a reused inode).
+    await fs.mkdir(path.join(root, "dest", "done (copying)"), 0o755);
+    await fs.writeFile(path.join(root, "dest", "reused (copying).bin"), "x", { mode: 0o600 });
+    await fs.chmod(path.join(root, "dest", "reused (copying).bin"), 0o600);
     const replacedIdentity = "1:1";
     await fs.mkdir(path.join(root, "elsewhere"));
     await fs.mkdir(path.join(root, "elsewhere", "keep (copying)"));
@@ -269,8 +275,10 @@ test("copies are journaled while they run, and placeholders left by a restart ar
     await recordCopy({ id: "a", directory: real, name: "left (copying)", identity: await identity(path.join(root, "dest", "left (copying)")), startedAt: "" });
     await recordCopy({ id: "b", directory: real, name: "theirs (copying).txt", identity: replacedIdentity, startedAt: "" });
     await recordCopy({ id: "c", directory: path.join(root, "elsewhere"), name: "keep (copying)", identity: await identity(path.join(root, "elsewhere-real", "keep (copying)")), startedAt: "" });
+    await recordCopy({ id: "d", directory: real, name: "done (copying)", identity: await identity(path.join(root, "dest", "done (copying)")), startedAt: "" });
+    await recordCopy({ id: "e", directory: real, name: "reused (copying).bin", identity: await identity(path.join(root, "dest", "reused (copying).bin")), birth: "1", startedAt: "" });
     await recoverInterruptedCopies();
-    assert.deepEqual((await fs.readdir(path.join(root, "dest"))).sort(), ["file.bin", "theirs (copying).txt"]);
+    assert.deepEqual((await fs.readdir(path.join(root, "dest"))).sort(), ["done (copying)", "file.bin", "reused (copying).bin", "theirs (copying).txt"]);
     assert.deepEqual(await fs.readdir(path.join(root, "elsewhere-real")), ["keep (copying)"]);
     assert.deepEqual(await readCopyJournal(), []);
   });
