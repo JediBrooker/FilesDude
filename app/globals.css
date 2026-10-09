@@ -537,6 +537,10 @@ kbd { padding: 3px 5px; border: 1px solid var(--line); border-bottom-width: 2px;
 .details-list dd { min-width: 0; margin: 0; overflow-wrap: anywhere; text-align: right; }
 .checksum-panel { display: grid; gap: 8px; margin: 14px 22px 0; }
 .media-panel { display: grid; gap: 8px; margin: 14px 22px 0; }
+.update-banner { display: flex; align-items: center; gap: 10px; margin: 14px 28px 0; padding: 10px 12px 10px 14px; border: 1px solid var(--brand); border-radius: 10px; background: var(--panel); color: var(--ink); font-size: 10px; }
+.update-banner > svg { flex: none; color: var(--brand); }
+.update-banner > span { flex: 1; min-width: 0; }
+.update-banner .button { min-height: 30px; padding: 0 14px; font-size: 9px; }
 .checksum-heading { display: flex; align-items: center; justify-content: space-between; }
 .checksum-heading strong { font-size: 10px; }
 .checksum-panel > .button { justify-self: start; min-height: 32px; font-size: 9px; }

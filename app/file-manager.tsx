@@ -70,6 +70,7 @@ import {
 } from "lucide-react";
 import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { isNewerBuild as differsFrom, type BuildIdentity } from "@/lib/build";
 import { moveCursor, selectionRange } from "@/lib/selection";
 import { INITIAL_DIRECTION, nextSort, parseSort, sortEntries, type SortKey, type SortState } from "@/lib/sort";
 import type { ContentSearchHit, ContentSearchResult, ShareLink } from "@/lib/types";
@@ -87,7 +88,10 @@ type AuthState = {
   configurationIssues: string[];
   /** What this server can do (sent once signed in). */
   features?: { videoThumbnails: boolean };
+  /** The build the server runs (sent once signed in). */
+  build?: ServerBuild;
 };
+type ServerBuild = BuildIdentity;
 type ManagedUser = { id: string; username: string; role: "editor" | "viewer"; root: string; createdAt: string; updatedAt: string; twoFactor: boolean };
 type TwoFactorStatus = { enabled: boolean; enabledAt: string | null; recoveryCodesLeft: number };
 
@@ -168,6 +172,9 @@ const AUTO_CHECKSUM_BYTES = 64 * 1024 * 1024;
 const APP_VERSION = process.env.NEXT_PUBLIC_FILESDUDE_VERSION || "dev";
 const APP_COMMIT = process.env.NEXT_PUBLIC_FILESDUDE_COMMIT || "";
 const APP_BUILT_AT = process.env.NEXT_PUBLIC_FILESDUDE_BUILT_AT || "";
+// How often an open page asks whether the server has been updated (also on returning to the tab).
+const UPDATE_CHECK_MS = 10 * 60 * 1000;
+const isNewerBuild = (server: ServerBuild | undefined) => differsFrom(server, { version: APP_VERSION, commit: APP_COMMIT });
 
 const SORT_LABELS: Record<SortKey, string> = { name: "Name", size: "Size", owner: "Owner", mode: "Permissions", modified: "Modified" };
 const SORT_STORAGE_KEY = "filesdude-sort";
@@ -431,6 +438,9 @@ export function FileManager() {
   const [loading, setLoading] = useState(false);
   const [dialog, setDialog] = useState<DialogState>(null);
   const [toast, setToast] = useState<{ message: string; tone?: "error"; undo?: UndoAction } | null>(null);
+  // A newer build the server runs than this page, and one the user chose not to reload for yet.
+  const [serverBuild, setServerBuild] = useState<ServerBuild | null>(null);
+  const [dismissedBuild, setDismissedBuild] = useState("");
   const [menu, setMenu] = useState<MenuState | null>(null);
   const [clipboard, setClipboard] = useState<ClipboardState | null>(null);
   const [dropTarget, setDropTarget] = useState<string | null>(null);
@@ -472,10 +482,34 @@ export function FileManager() {
     try {
       const result = await requestJson<Omit<AuthState, "loading">>("/api/auth/status");
       setAuth({ ...result, loading: false });
+      if (isNewerBuild(result.build)) setServerBuild(result.build!);
     } catch {
       setAuth((previous) => ({ ...previous, loading: false }));
     }
   }, []);
+
+  // A page left open across an update keeps running the old code, so it checks now and then (and on
+  // returning to the tab) and offers a reload. Only the build is looked at; the session is untouched.
+  useEffect(() => {
+    if (!auth.authenticated) return;
+    let last = Date.now();
+    const check = async () => {
+      last = Date.now();
+      const result = await requestJson<{ build?: ServerBuild }>("/api/auth/status").catch(() => null);
+      if (result && isNewerBuild(result.build)) setServerBuild(result.build!);
+    };
+    const onVisible = () => {
+      if (document.visibilityState === "visible" && Date.now() - last > 30_000) void check();
+    };
+    const timer = window.setInterval(() => { if (document.visibilityState === "visible") void check(); }, UPDATE_CHECK_MS);
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onVisible);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onVisible);
+    };
+  }, [auth.authenticated]);
 
   useEffect(() => {
     const stored = window.localStorage.getItem("filesdude-theme");
@@ -1235,6 +1269,14 @@ export function FileManager() {
       </aside>
 
       <main className="main-panel">
+        {serverBuild && dismissedBuild !== `${serverBuild.version}:${serverBuild.commit}` && (
+          <div className="update-banner" role="status">
+            <RefreshCw size={16} />
+            <span><strong>FilesDude has been updated</strong> to v{serverBuild.version}{serverBuild.commit ? ` · ${serverBuild.commit}` : ""}. Reload to use the new version.</span>
+            <button type="button" className="button primary" onClick={() => window.location.reload()}>Reload</button>
+            <button type="button" className="icon-button" aria-label="Dismiss" title="Not now" onClick={() => setDismissedBuild(`${serverBuild.version}:${serverBuild.commit}`)}><X size={15} /></button>
+          </div>
+        )}
         <header className="topbar">
           <button className="icon-button mobile-menu" aria-label="Open navigation" onClick={() => setSidebarOpen(true)}><Menu size={20} /></button>
           <div className="history-buttons">
