@@ -258,6 +258,19 @@ if [[ ${SERVICE_ACCOUNT} == "root" ]]; then
   CAPABILITIES=$'CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_FSETID\nAmbientCapabilities=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_FSETID'
 fi
 
+# ZFS snapshots: when the service runs as root over a folder on ZFS, it gets /dev/zfs (bound into
+# its otherwise private /dev) and only the ZFS permissions snapshots need on that one dataset,
+# delegated with zfs allow, instead of the broad CAP_SYS_ADMIN capability.
+ZFS_UNIT=""
+if [[ ${SERVICE_ACCOUNT} == "root" && -c /dev/zfs ]] && command -v zfs >/dev/null 2>&1; then
+  ZFS_DATASET="$(zfs list -H -o name "${ROOT_PATH}" 2>/dev/null | head -n 1 || true)"
+  if [[ -n ${ZFS_DATASET} ]]; then
+    say "Allowing ZFS snapshots of ${ZFS_DATASET}"
+    zfs allow -u root snapshot,destroy,mount "${ZFS_DATASET}"
+    ZFS_UNIT=$'BindPaths=/dev/zfs\nDeviceAllow=/dev/zfs rw'
+  fi
+fi
+
 say "Installing the systemd service"
 cat >"${UNIT_FILE}" <<EOF
 [Unit]
@@ -294,6 +307,7 @@ LockPersonality=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 ReadWritePaths=${ROOT_UNIT} ${STATE_UNIT}
 ${CAPABILITIES}
+${ZFS_UNIT}
 
 [Install]
 WantedBy=multi-user.target

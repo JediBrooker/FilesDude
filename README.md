@@ -233,6 +233,15 @@ When `FILEDUDE_ROOT` is on a ZFS dataset (such as a Proxmox container's
 each item's menu. FilesDude finds the dataset itself; set `FILEDUDE_ZFS_PATH` if the `zfs`
 command isn't in `/usr/sbin`, `/sbin`, or `/usr/local/sbin`.
 
+The installer sets this up when the service runs as root over a ZFS folder: it binds
+`/dev/zfs` into the service's otherwise private `/dev`, and delegates only the ZFS
+permissions snapshots need on that dataset (`zfs allow -u root snapshot,destroy,mount
+<dataset>`) rather than giving the service `CAP_SYS_ADMIN`. ZFS can't limit `destroy` to
+snapshots, so the service could also destroy the dataset itself; it can already delete
+every file in it. If snapshots don't appear, check `journalctl -u filesdude` for a
+"zfs list failed" warning. To withdraw the access, run
+`zfs unallow -u root snapshot,destroy,mount <dataset>`.
+
 - **Who can see them:** only the owner, until the owner shares snapshots with editors or
   with everyone (**Who can see snapshots** in the Snapshots dialog). Shared accounts see
   only their own folder in each snapshot, but as it was then, including anything since
