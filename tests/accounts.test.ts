@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -7,6 +8,9 @@ import test from "node:test";
 import { createSession } from "../lib/auth";
 import { config } from "../lib/config";
 import { getCredentials } from "../lib/credentials";
+import { inside, openDirectory, withOpen } from "../lib/files";
+import { cancelAccountJobs, getJob, startJob } from "../lib/jobs";
+import { runInScope, type AccessScope } from "../lib/scope";
 import { createUser, deleteUser, updateUser } from "../lib/users";
 import { POST as login } from "../app/api/auth/login/route";
 import { POST as preferences } from "../app/api/auth/preferences/route";
@@ -226,6 +230,71 @@ test("only the owner chooses upload ownership, and usernames stay unique", async
     assert.equal(await status(call(usersAction, "/api/users", owner, { action: "create", username: "owner", password: USER_PASSWORD, role: "viewer", root: "shared" })), 409);
     assert.equal(await status(call(preferences, "/api/auth/preferences", owner, { username: "alice", currentPassword: OWNER_PASSWORD })), 409);
     assert.equal(await status(call(usersAction, "/api/users", owner, { action: "create", username: "carol", password: USER_PASSWORD, role: "editor", root: "home/missing" })), 404);
+  });
+});
+
+test("accounts can't be given the whole root", async () => {
+  await withAccounts(async ({ owner, ids }) => {
+    for (const root of ["", "/", "."]) {
+      assert.equal(await status(call(usersAction, "/api/users", owner, { action: "create", username: "carol", password: USER_PASSWORD, role: "editor", root })), 400, root);
+      assert.equal(await status(call(usersAction, "/api/users", owner, { action: "update", id: ids.bob, root })), 400, root);
+    }
+  });
+});
+
+test("copies and deletes never follow symlinks or open special files", async () => {
+  await withAccounts(async ({ root, bob }) => {
+    const home = path.join(root, "home", "bob");
+    await fs.symlink("../../alice", path.join(home, "docs", "alice-link"));
+    await fs.chmod(path.join(home, "docs", "plan.txt"), 0o640);
+    const copied = await call(fsAction, "/api/fs", bob, { action: "copy", paths: ["home/bob/docs"], destination: "home/bob" });
+    assert.equal(copied.status, 200);
+    const copy = path.join(home, "docs (copy)");
+    assert.equal(await fs.readFile(path.join(copy, "plan.txt"), "utf8"), "bob's plan");
+    assert.equal((await fs.stat(path.join(copy, "plan.txt"))).mode & 0o777, 0o640);
+    assert.equal(await fs.readlink(path.join(copy, "alice-link")), "../../alice");
+
+    assert.equal(await status(call(fsAction, "/api/fs", bob, { action: "delete", paths: ["home/bob/docs (copy)"], permanent: true })), 200);
+    await assert.rejects(fs.lstat(copy));
+    assert.equal(await fs.readFile(path.join(root, "home", "alice", "diary.txt"), "utf8"), "alice's secret");
+
+    // Copying a FIFO used to block on opening it; it is refused instead.
+    execFileSync("mkfifo", [path.join(home, "pipe")]);
+    assert.equal(await status(call(fsAction, "/api/fs", bob, { action: "copy", paths: ["home/bob/pipe"], destination: "home/bob/docs" })), 400);
+    await assert.rejects(fs.lstat(path.join(home, "docs", "pipe")));
+  });
+});
+
+test("work continues in the folder that was checked even if its path is swapped for a symlink", { skip: process.platform !== "linux" && "needs /proc/self/fd" }, async () => {
+  await withAccounts(async ({ root }) => {
+    const docs = path.join(root, "home", "bob", "docs");
+    await withOpen(openDirectory("home/bob/docs"), async (directory) => {
+      await fs.rename(docs, `${docs}-old`);
+      await fs.symlink("../alice", docs);
+      await fs.writeFile(inside(directory, "new.txt"), "written");
+      await fs.rename(inside(directory, "plan.txt"), inside(directory, "plan-2.txt"));
+    });
+    assert.equal(await fs.readFile(path.join(`${docs}-old`, "new.txt"), "utf8"), "written");
+    assert.ok(await fs.lstat(path.join(`${docs}-old`, "plan-2.txt")));
+    assert.deepEqual(await fs.readdir(path.join(root, "home", "alice")), ["diary.txt"]);
+  });
+});
+
+test("each account runs its own jobs, which stop when the account changes", async () => {
+  await withAccounts(async ({ owner, ids }) => {
+    const scope = (accountKey: string, root: string): AccessScope => ({ accountKey, username: accountKey, role: "editor", root });
+    const waitForCancel = (_report: unknown, signal: AbortSignal) => new Promise<never>((_resolve, reject) => {
+      signal.addEventListener("abort", () => reject(new Error("stopped")), { once: true });
+    });
+    const start = (accountKey: string, root: string) => runInScope(scope(accountKey, root), () => startJob("compress", accountKey, { done: 0, unit: "bytes" }, waitForCancel));
+    const bobJob = start(ids.bob, "home/bob");
+    const aliceJob = start(ids.alice, "home/alice");
+    assert.throws(() => start(ids.bob, "home/bob"), /still running/);
+    assert.equal(await status(call(usersAction, "/api/users", owner, { action: "update", id: ids.bob, role: "viewer" })), 200);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(getJob(bobJob.id)?.status, "cancelled");
+    assert.equal(getJob(aliceJob.id)?.status, "running");
+    cancelAccountJobs(ids.alice);
   });
 });
 

@@ -29,13 +29,17 @@ function prune() {
   }
 }
 
-/** Starts a job, allowing one at a time so large archives never compete for the same disk. */
+/**
+ * Starts a job, allowing one at a time per account so large archives don't compete for the disk,
+ * and so one account's job never blocks another's.
+ */
 export function startJob(kind: JobState["kind"], label: string, initial: JobProgress, run: JobRunner, onFinish?: (job: JobState) => void) {
   prune();
-  if ([...jobs.values()].some((job) => job.status === "running")) {
+  const accountKey = currentScope()?.accountKey ?? "owner";
+  if ([...jobs.values()].some((job) => job.status === "running" && job.accountKey === accountKey)) {
     throw new AppError("Another archive job is still running. Wait for it to finish or cancel it first.", 409, "JOB_RUNNING");
   }
-  const job: Job = { id: crypto.randomUUID(), kind, label, status: "running", startedAt: new Date().toISOString(), progress: initial, controller: new AbortController(), accountKey: currentScope()?.accountKey ?? "owner" };
+  const job: Job = { id: crypto.randomUUID(), kind, label, status: "running", startedAt: new Date().toISOString(), progress: initial, controller: new AbortController(), accountKey };
   jobs.set(job.id, job);
   void run((progress) => { job.progress = progress; }, job.controller.signal)
     .then((result) => {
@@ -69,6 +73,13 @@ export function getJob(id: string) {
 export function listJobs() {
   prune();
   return [...jobs.values()].filter(visible).map(snapshot);
+}
+
+/** Stops an account's running jobs, used when the account is changed or deleted. */
+export function cancelAccountJobs(accountKey: string) {
+  for (const job of jobs.values()) {
+    if (job.accountKey === accountKey && job.status === "running") job.controller.abort();
+  }
 }
 
 export function cancelJob(id: string) {

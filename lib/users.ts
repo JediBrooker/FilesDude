@@ -81,6 +81,8 @@ function validateRole(role: unknown): UserRole {
 export async function validateUserRoot(root: unknown) {
   if (typeof root !== "string" || root.length > 4096) throw new AppError("Choose a folder for this account", 400, "INVALID_ROOT");
   const normalized = normalizeRelative(root).replace(/\/+$/, "");
+  // An empty folder would mean the whole root, which only the owner has.
+  if (!normalized) throw new AppError("Choose a folder inside the root for this account", 400, "INVALID_ROOT");
   const absolute = await safeResolve(normalized);
   if (!(await fs.stat(absolute)).isDirectory()) throw new AppError("The account's folder must be a folder", 400, "INVALID_ROOT");
   if ((await fs.realpath(absolute)) !== absolute) throw new AppError("Choose the folder's real location, not a path through a link", 400, "INVALID_ROOT");

@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { withAccess } from "@/lib/access";
 import { audit } from "@/lib/audit";
 import { assertMutationRequest, AppError, jsonError, readJsonBody } from "@/lib/http";
+import { cancelAccountJobs } from "@/lib/jobs";
 import { createUser, deleteUser, listUsers, updateUser } from "@/lib/users";
 
 export const runtime = "nodejs";
@@ -34,11 +35,14 @@ export async function POST(request: Request) {
         case "update":
           if (!id) throw new AppError("Choose an account", 400, "INVALID_REQUEST");
           user = await updateUser(id, { role: body.role, root: body.root, password: body.password });
+          // Jobs keep the role and folder they started with, so they stop along with the old sessions.
+          cancelAccountJobs(id);
           await audit("users.update", { username: session.username, account: user.username, role: user.role, root: user.root, passwordReset: body.password !== undefined });
           break;
         case "delete":
           if (!id) throw new AppError("Choose an account", 400, "INVALID_REQUEST");
           user = await deleteUser(id);
+          cancelAccountJobs(id);
           await audit("users.delete", { username: session.username, account: user.username });
           break;
         default:

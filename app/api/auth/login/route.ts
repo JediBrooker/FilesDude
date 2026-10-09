@@ -28,7 +28,9 @@ export async function POST(request: Request) {
     const password = typeof body.password === "string" ? body.password : "";
     const inputValid = username.length > 0 && username.length <= 64 && password.length > 0 && password.length <= 512;
     const credentials = await getCredentials();
-    const user = inputValid && username !== credentials.username ? await findUserByName(username) : undefined;
+    // Every valid attempt reads the account list, so the owner's name doesn't respond faster.
+    const found = inputValid ? await findUserByName(username) : undefined;
+    const user = username !== credentials.username ? found : undefined;
     const account = !inputValid ? null
       : username === credentials.username ? { key: "owner", hash: credentials.passwordHash, version: credentials.version }
         : user ? { key: user.id, hash: user.passwordHash, version: user.version } : null;

@@ -4,7 +4,7 @@ import path from "node:path";
 import { config } from "./config";
 import { safeResolve, normalizeRelative } from "./files";
 import { AppError } from "./http";
-import { currentScope } from "./scope";
+import { currentScope, withinScope } from "./scope";
 
 export interface FavoriteLocation {
   path: string;
@@ -67,8 +67,9 @@ function mutate<T>(operation: () => Promise<T>) {
   return result;
 }
 
+/** Favourites outside the account's folder (after the owner moved it) are hidden, not deleted. */
 export async function listFavorites() {
-  return readStoredFavorites();
+  return (await readStoredFavorites()).filter((favorite) => withinScope(favorite.path));
 }
 
 export async function addFavorite(relativePath: string) {
