@@ -273,6 +273,16 @@ function jobProgressText(job: JobState) {
   return total ? `${formatBytes(done)} of ${formatBytes(total)}` : formatBytes(done);
 }
 
+// Downloads go through a temporary link, which saves the file and leaves the page as it is.
+function startDownload(pathValue: string) {
+  const link = document.createElement("a");
+  link.href = `/api/fs/download?path=${encodePath(pathValue)}`;
+  link.download = "";
+  document.body.append(link);
+  link.click();
+  link.remove();
+}
+
 function parentOf(pathValue: string) {
   return pathValue.split("/").slice(0, -1).join("/");
 }
@@ -925,7 +935,7 @@ export function FileManager() {
   const downloadSelected = () => {
     const chosen = entries.filter((entry) => selected.has(entry.path));
     if (chosen.length !== 1) return;
-    window.location.href = `/api/fs/download?path=${encodePath(chosen[0].path)}`;
+    startDownload(chosen[0].path);
   };
 
   const toggleFavorite = async (folderPath: string) => {
@@ -957,7 +967,7 @@ export function FileManager() {
         setDialog({ kind: "edit", entry });
         break;
       case "download":
-        window.location.assign(`/api/fs/download?path=${encodePath(entry.path)}`);
+        startDownload(entry.path);
         break;
       case "favorite":
         void toggleFavorite(entry.path);
