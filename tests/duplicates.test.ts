@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { config } from "../lib/config";
-import { cancelDuplicateScan, checkDuplicateRemoval, duplicateStatus, forgetDuplicatePaths, startDuplicateScan, trashDuplicates, waitForDuplicateScan } from "../lib/duplicates";
+import { cancelDuplicateScan, checkDuplicateRemoval, duplicateStatus, forgetDuplicatePaths, linkDuplicates, startDuplicateScan, trashDuplicates, waitForDuplicateScan } from "../lib/duplicates";
 import { listTrash, withFilesystemLock } from "../lib/files";
 
 const MB = 1024 * 1024;
@@ -94,6 +94,38 @@ test("removing copies checks each one against the disk first", async () => {
     assert.ok(await fs.lstat(path.join(root, "secret", "x.bin")), "the file behind the link is untouched");
     assert.deepEqual((await listTrash()).items.map((item) => item.originalPath), ["d/x.bin"]);
     assert.deepEqual(duplicateStatus().report?.groups[0].copies.map((copy) => copy.path).sort(), ["a/x.bin", "secret/x.bin"]);
+  });
+});
+
+test("copies can be replaced with hard links, keeping every path and sending originals to the trash", async () => {
+  await withRoot(async (root) => {
+    for (const folder of ["media", "torrents", "other", "changed"]) await fs.mkdir(path.join(root, folder));
+    const content = pattern(MB, 21);
+    await fs.writeFile(path.join(root, "media", "film.mkv"), content);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    for (const copy of ["torrents/film.mkv", "other/film.mkv", "changed/film.mkv"]) await fs.writeFile(path.join(root, copy), content);
+    await fs.chmod(path.join(root, "other", "film.mkv"), 0o600);
+    await startDuplicateScan("", MB);
+    await waitForDuplicateScan();
+    await fs.writeFile(path.join(root, "changed", "film.mkv"), pattern(MB, 22));
+
+    assert.throws(() => checkDuplicateRemoval(["media/film.mkv", "torrents/film.mkv", "other/film.mkv", "changed/film.mkv"]), /Keep at least one copy/);
+    const outcome = await withFilesystemLock(() => linkDuplicates(["torrents/film.mkv", "other/film.mkv", "changed/film.mkv"]));
+    assert.deepEqual(outcome.linked.map((item) => [item.path, item.target]), [["torrents/film.mkv", "media/film.mkv"]]);
+    assert.deepEqual(outcome.skipped.map((item) => [item.path, item.reason]).sort(), [["changed/film.mkv", "changed"], ["other/film.mkv", "different-owner"]]);
+
+    // The path still works and now shares the kept file's data; the original is in the trash.
+    const [kept, linked] = await Promise.all([fs.stat(path.join(root, "media", "film.mkv")), fs.stat(path.join(root, "torrents", "film.mkv"))]);
+    assert.equal(linked.ino, kept.ino);
+    assert.equal(kept.nlink, 2);
+    assert.deepEqual(await fs.readFile(path.join(root, "torrents", "film.mkv")), content);
+    assert.deepEqual((await listTrash()).items.map((item) => item.originalPath), ["torrents/film.mkv"]);
+    assert.ok(!(await fs.readdir(path.join(root, "torrents"))).some((name) => name.startsWith(".filedude-link-")));
+
+    // The report now counts the linked copy as the same file as the kept one.
+    const group = duplicateStatus().report!.groups[0];
+    assert.equal(group.copies.find((copy) => copy.path === "torrents/film.mkv")!.inode, group.copies.find((copy) => copy.path === "media/film.mkv")!.inode);
+    assert.equal(group.wastedBytes, MB * 2, "other/ and changed/ still hold extra copies");
   });
 });
 

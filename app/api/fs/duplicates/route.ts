@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { withAccess } from "@/lib/access";
 import { audit } from "@/lib/audit";
 import { config } from "@/lib/config";
-import { cancelDuplicateScan, duplicateStatus, startDuplicateScan, trashDuplicates } from "@/lib/duplicates";
+import { cancelDuplicateScan, duplicateStatus, linkDuplicates, startDuplicateScan, trashDuplicates } from "@/lib/duplicates";
 import { withFilesystemLock } from "@/lib/files";
 import { assertMutationRequest, AppError, jsonError, readJsonBody } from "@/lib/http";
 import { rewriteLinkedPaths } from "@/lib/transfers";
@@ -47,6 +47,17 @@ export async function POST(request: Request) {
         case "cancel":
           cancelDuplicateScan();
           return NextResponse.json({ ok: true }, noStore);
+        case "link": {
+          if (!config.trashEnabled) throw new AppError("Protected trash is turned off, so duplicates can't be replaced safely here", 409, "TRASH_DISABLED");
+          const requested = Array.isArray(body.paths) ? body.paths : [];
+          if (!requested.length || requested.length > 1000 || requested.some((item) => typeof item !== "string" || item.length > 4096)) {
+            throw new AppError("Choose between 1 and 1,000 copies", 400, "INVALID_PATHS");
+          }
+          // The paths keep working as links, so favourites and share links stay put.
+          const result = await withFilesystemLock(() => linkDuplicates(requested as string[]));
+          await audit("duplicates.link", { username: session.username, linked: result.linked.map((item) => ({ path: item.path, to: item.target })), skipped: result.skipped });
+          return NextResponse.json({ ok: true, result, ...duplicateStatus() }, noStore);
+        }
         case "trash": {
           if (!config.trashEnabled) throw new AppError("Protected trash is turned off, so duplicates can't be removed safely here", 409, "TRASH_DISABLED");
           const requested = Array.isArray(body.paths) ? body.paths : [];

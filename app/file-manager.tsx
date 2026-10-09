@@ -2313,6 +2313,33 @@ function DuplicatesDialog({ startPath, onClose, notify, onRefresh, onReveal }: {
     }
   };
 
+  // Each chosen copy becomes a hard link to a kept copy; the copies replaced go to the trash.
+  const linkSelected = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const paths = [...selected];
+      let linked = 0;
+      const skipped: Array<{ path: string; reason: string }> = [];
+      for (let start = 0; start < paths.length; start += 500) {
+        const response = await requestJson<DuplicateStatus & { result: { linked: unknown[]; skipped: Array<{ path: string; reason: string }> } }>("/api/fs/duplicates", { method: "POST", body: JSON.stringify({ action: "link", paths: paths.slice(start, start + 500) }) });
+        setStatus(response);
+        linked += response.result.linked.length;
+        skipped.push(...response.result.skipped);
+      }
+      const reasons = new Map<string, number>();
+      for (const item of skipped) reasons.set(item.reason, (reasons.get(item.reason) ?? 0) + 1);
+      const why = [...reasons].map(([reason, count]) => `${count} ${({ "different-owner": "with a different owner or permissions", changed: "changed since the scan", "other-filesystem": "on another filesystem", taken: "whose name was taken meanwhile" } as Record<string, string>)[reason] ?? reason}`).join(", ");
+      notify(`${itemCount(linked)} replaced with hard links (originals in the trash)${skipped.length ? ` · left alone: ${why}` : ""}`, skipped.length ? "error" : undefined);
+      setSelected(new Set());
+      await onRefresh();
+    } catch (caught) {
+      setError((caught as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const scanning = status?.scanning ?? null;
   const percent = scanning?.phase === "hashing" && scanning.bytesToHash ? Math.min(100, (scanning.bytesHashed / scanning.bytesToHash) * 100) : undefined;
   return (
@@ -2330,7 +2357,7 @@ function DuplicatesDialog({ startPath, onClose, notify, onRefresh, onReveal }: {
         {!scanning && !report && status !== null && <div className="snapshot-empty"><Files size={22} /><strong>No scan yet</strong><span>Scanning reads files of the same size to compare them, so large folders take a while. Duplicates are moved to the trash, never deleted outright, and one copy of each is always kept.</span></div>}
         {report && <>
           <div className="storage-scan-note"><Info size={15} /> {report.totalGroups ? `${report.totalGroups.toLocaleString()} ${report.totalGroups === 1 ? "set" : "sets"} of duplicates in /${report.folder} · ${formatBytes(report.wastedBytes)} taken by extra copies` : `No duplicates of ${formatBytes(report.minBytes)} or more in /${report.folder}`} · {report.filesSeen.toLocaleString()} files checked {formatDateTime(report.generatedAt)}{report.skipped ? ` · ${report.skipped.toLocaleString()} skipped (unreadable or changed)` : ""}</div>
-          {groups.length > 0 && <div className="duplicate-actions"><span className="muted">Select:</span><button className="button secondary" onClick={() => keepOne("oldest")}>All but the oldest</button><button className="button secondary" onClick={() => keepOne("newest")}>All but the newest</button>{selected.size > 0 && <button className="button secondary" onClick={() => setSelected(new Set())}>Clear</button>}<span className="duplicate-actions-gap" />{selected.size > 0 && <button className="button danger" disabled={busy} onClick={() => void trashSelected()}>{busy ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />} Move {itemCount(selected.size)} to trash{freed ? ` (${formatBytes(freed)})` : ""}</button>}</div>}
+          {groups.length > 0 && <div className="duplicate-actions"><span className="muted">Select:</span><button className="button secondary" onClick={() => keepOne("oldest")}>All but the oldest</button><button className="button secondary" onClick={() => keepOne("newest")}>All but the newest</button>{selected.size > 0 && <button className="button secondary" onClick={() => setSelected(new Set())}>Clear</button>}<span className="duplicate-actions-gap" />{selected.size > 0 && <button className="button secondary" disabled={busy} title="Each chosen copy becomes a hard link to a copy you keep, so its path still works (handy for files a torrent client is seeding). The copies replaced go to the trash." onClick={() => void linkSelected()}><Link2 size={15} /> Replace with hard links</button>}{selected.size > 0 && <button className="button danger" disabled={busy} onClick={() => void trashSelected()}>{busy ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />} Move {itemCount(selected.size)} to trash{freed ? ` (${formatBytes(freed)})` : ""}</button>}</div>}
           <div className="duplicate-groups">
             {groups.map((group) => (
               <div key={group.copies[0].path} className="duplicate-group">
@@ -2352,7 +2379,7 @@ function DuplicatesDialog({ startPath, onClose, notify, onRefresh, onReveal }: {
           </div>
           {groups.length < report.totalGroups && <div className="storage-show-more"><span>Showing {groups.length.toLocaleString()} of {report.totalGroups.toLocaleString()} sets</span><button className="button secondary" onClick={() => void load(groups.length)}><Plus size={15} /> Show more</button></div>}
         </>}
-        <div className="storage-scan-foot"><span className="muted">Removing a copy a torrent client is still seeding will break that torrent.</span><button className="button primary" onClick={onClose}>Done</button></div>
+        <div className="storage-scan-foot"><span className="muted">Removing a copy a torrent client is still seeding breaks that torrent; replacing it with a hard link keeps it working.</span><button className="button primary" onClick={onClose}>Done</button></div>
       </div>
     </Modal>
   );

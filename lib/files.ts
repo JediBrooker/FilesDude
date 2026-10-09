@@ -1213,6 +1213,47 @@ export async function trashIfUnchanged(relativePath: string, expected: FileIdent
   return withUnchangedFile(relativePath, expected, (parent, name, relative) => moveToTrash(parent, name, relative, trash));
 }
 
+export type LinkOutcome = { linked: true; trashId: string } | { linked: false; reason: "changed" | "different-owner" | "other-filesystem" | "taken" };
+
+/**
+ * Replaces a duplicate file with a hard link to an identical kept file, keeping the duplicate's
+ * path working while the two share one copy of the data. Both must still be exactly as described,
+ * at their real locations, with the same owner, group, and permissions (a hard link shares them).
+ * The link is made first under a temporary name, the duplicate is moved to the protected trash (so
+ * this can be undone), and the link then takes its name without replacing anything that appeared
+ * meanwhile. Call with the filesystem lock held.
+ */
+export async function replaceWithLink(copyPath: string, copy: FileIdentity, targetPath: string, target: FileIdentity): Promise<LinkOutcome> {
+  if (!config.trashEnabled) throw new AppError("Protected trash is turned off", 409, "TRASH_DISABLED");
+  if (copy.dev !== target.dev) return { linked: false, reason: "other-filesystem" };
+  const trash = await trashDirectories(true);
+  const outcome = await withUnchangedFile(targetPath, target, async (targetParent, targetName) => withUnchangedFile(copyPath, copy, async (parent, name, relative): Promise<LinkOutcome> => {
+    const [kept, duplicate] = await Promise.all([fs.lstat(inside(targetParent, targetName)), fs.lstat(inside(parent, name))]);
+    if (kept.uid !== duplicate.uid || kept.gid !== duplicate.gid || (kept.mode & 0o7777) !== (duplicate.mode & 0o7777)) return { linked: false, reason: "different-owner" };
+    const temporary = `.filedude-link-${crypto.randomUUID()}`;
+    try {
+      await fs.link(inside(targetParent, targetName), inside(parent, temporary));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EXDEV") return { linked: false, reason: "other-filesystem" };
+      throw error;
+    }
+    try {
+      const trashId = await moveToTrash(parent, name, relative, trash);
+      try {
+        // A link can't replace a name, so anything that took the name meanwhile is kept.
+        await fs.link(inside(parent, temporary), inside(parent, name));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") return { linked: false, reason: "taken" };
+        throw error;
+      }
+      return { linked: true, trashId };
+    } finally {
+      await fs.unlink(inside(parent, temporary)).catch(() => undefined);
+    }
+  }));
+  return outcome ?? { linked: false, reason: "changed" };
+}
+
 export async function emptyTrash() {
   const trash = await trashDirectories();
   if (!trash) return { removed: 0 };
