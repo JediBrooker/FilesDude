@@ -17,6 +17,7 @@ FilesDude is a secure, self-hosted web file manager designed for a Proxmox host,
 - Compress selected items into `.zip` or `.tar.gz` and extract `.zip`, `.tar`, `.tar.gz`, and `.tgz` archives into a new folder, as background jobs with progress and cancel; extraction refuses archives with absolute or `..` paths, never creates links or devices, and stops before filling the disk
 - Inline previews for text, code, JSON, images, PDF, audio, and video; media uses byte-range streaming
 - Image thumbnails in grid view (JPEG, PNG, GIF, WebP, and AVIF up to 64 MB), generated on the server with EXIF rotation applied and all metadata stripped, and cached in the state directory
+- Video thumbnails in grid view (MP4, MKV, MOV, WebM, AVI, of any size) when ffmpeg is installed, taken by ffmpeg in a throwaway, locked-down systemd sandbox
 - SHA-256 and MD5 checksums in Properties, calculated automatically for files up to 64 MB, with copy buttons and a field to compare against an expected checksum
 - POSIX `chmod` and numeric `chown` for one or many items
 - Bulk rename with find/replace, regular expressions, prefix, suffix, sequential numbering, live conflict detection, and two-phase application
@@ -227,6 +228,17 @@ copy and revoke buttons.
   anyone on the network path; use HTTPS for anything sensitive.
 - Set `FILEDUDE_SHARING_ENABLED=false` to turn sharing off entirely.
 
+## Video thumbnails
+
+When the host has ffmpeg (`/usr/bin/ffmpeg`, or set `FILEDUDE_FFMPEG_PATH`) and the
+service runs as root under systemd, videos get thumbnails in grid view from a frame a few
+seconds in. ffmpeg decodes files other users control, so it never runs inside FilesDude:
+each frame comes from a throwaway systemd unit running as a temporary unprivileged user,
+with no network or capabilities, a system-call filter, memory, task, CPU, and time
+limits, and no view of the data root, FilesDude's state, or `/etc` beyond what the
+dynamic linker needs. The video is passed in as the already-opened file, never by path.
+Set `FILEDUDE_VIDEO_THUMBNAILS=false` to turn this off.
+
 ## Duplicate files
 
 The owner can open **Duplicates** in the sidebar, choose a folder (or everything) and a
@@ -377,7 +389,7 @@ Shortcuts are ignored while you are typing in a field such as search.
 The safest default set is already included. These are strong next additions when you need them:
 
 - OIDC single sign-on, and passkeys for installations served over HTTPS
-- Video thumbnails, media metadata, and an index for searching file contents on very large trees
+- Media metadata (duration, resolution, codecs) and an index for searching file contents on very large trees
 - Antivirus scanning and upload quarantine for environments with untrusted uploaders
 - SFTP/SMB/NFS connection profiles for managing remote roots without mounting them into the app container
 

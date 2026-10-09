@@ -108,7 +108,9 @@ test("files disguised as images never reach other decoders", async () => {
 test("a named pipe dressed as an image neither blocks nor holds the lock", { skip: process.platform === "win32" }, async () => {
   await withRoot(async (root, cookie) => {
     execFileSync("mkfifo", [path.join(root, "trap.jpg")]);
-    await assert.rejects(withinTime(thumbnailFor("trap.jpg")), /Only images have thumbnails/);
+    await assert.rejects(withinTime(thumbnailFor("trap.jpg")), /Only images and videos have thumbnails/);
+    execFileSync("mkfifo", [path.join(root, "trap.mp4")]);
+    await assert.rejects(withinTime(thumbnailFor("trap.mp4")), /Only images and videos have thumbnails|aren't available/);
     const response = await withinTime(checksum(new Request("http://localhost/api/fs/checksum?path=trap.jpg", { headers: { cookie } })));
     assert.equal(response.status, 400);
     assert.equal(await withinTime(withFilesystemLock(async () => "free")), "free");

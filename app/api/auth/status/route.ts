@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { configurationIssues } from "@/lib/config";
 import { getSession } from "@/lib/auth";
+import { videoThumbnailsAvailable } from "@/lib/video-frames";
 
 export const runtime = "nodejs";
 
@@ -14,5 +15,7 @@ export async function GET(request: Request) {
     root: session?.root ?? null,
     configured: issues.length === 0,
     configurationIssues: issues,
+    // What this server can do, for signed-in pages to offer.
+    ...(session ? { features: { videoThumbnails: await videoThumbnailsAvailable() } } : {}),
   }, { headers: { "Cache-Control": "no-store" } });
 }
