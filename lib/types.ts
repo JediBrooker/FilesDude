@@ -101,6 +101,8 @@ export interface TrashListing {
   enabled: boolean;
   items: TrashItem[];
   totalBytes: number;
+  /** Days items are kept before being deleted forever, or null to keep them until removed. */
+  retentionDays?: number | null;
 }
 
 export interface TransferResult {

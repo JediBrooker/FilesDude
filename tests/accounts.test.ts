@@ -13,7 +13,7 @@ import { cancelAccountJobs, getJob, startJob } from "../lib/jobs";
 import { runInScope, type AccessScope } from "../lib/scope";
 import { createUser, deleteUser, updateUser } from "../lib/users";
 import { POST as login } from "../app/api/auth/login/route";
-import { POST as preferences } from "../app/api/auth/preferences/route";
+import { GET as readPreferences, POST as preferences } from "../app/api/auth/preferences/route";
 import { GET as archiveStatus, POST as archive } from "../app/api/fs/archive/route";
 import { GET as download } from "../app/api/fs/download/route";
 import { GET as largest } from "../app/api/fs/largest/route";
@@ -343,6 +343,24 @@ test("copy and move jobs respect accounts and keep favourites following moved it
     assert.equal(await status(call(jobsStatus, `/api/fs/jobs?id=${moved.job.id}`, bob)), 200);
     assert.equal(await status(call(jobsStatus, `/api/fs/jobs?id=${moved.job.id}`, alice)), 404);
     assert.equal(await status(call(jobsAction, "/api/fs/jobs", alice, { action: "cancel", id: moved.job.id })), 404);
+  });
+});
+
+test("only the owner sets trash retention, and the trash shows it", async () => {
+  await withAccounts(async ({ owner, bob }) => {
+    assert.equal(await status(call(preferences, "/api/auth/preferences", bob, { trashRetentionDays: 7 })), 403);
+    for (const invalid of [0, -1, 1.5, "30", 4000]) {
+      assert.equal(await status(call(preferences, "/api/auth/preferences", owner, { trashRetentionDays: invalid })), 400, String(invalid));
+    }
+    assert.equal(await status(call(preferences, "/api/auth/preferences", owner, { trashRetentionDays: 30 })), 200);
+    assert.equal((await (await call(readPreferences, "/api/auth/preferences", owner)).json()).trashRetentionDays, 30);
+    assert.equal((await (await call(trashList, "/api/fs/trash", bob)).json()).retentionDays, 30);
+    // Upload ownership survives a retention-only change, and retention survives an ownership change.
+    assert.equal(await status(call(preferences, "/api/auth/preferences", owner, { uploadOwnership: { mode: "service" } })), 200);
+    const saved = await (await call(readPreferences, "/api/auth/preferences", owner)).json();
+    assert.deepEqual([saved.trashRetentionDays, saved.uploadOwnership], [30, { mode: "service" }]);
+    assert.equal(await status(call(preferences, "/api/auth/preferences", owner, { trashRetentionDays: null })), 200);
+    assert.equal((await (await call(readPreferences, "/api/auth/preferences", owner)).json()).trashRetentionDays, null);
   });
 });
 

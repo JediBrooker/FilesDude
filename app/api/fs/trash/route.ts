@@ -3,6 +3,7 @@ import { assertPermission, withAccess } from "@/lib/access";
 import { audit } from "@/lib/audit";
 import { deleteTrashItems, emptyTrash, listTrash, restoreTrashItems, withFilesystemLock } from "@/lib/files";
 import { assertMutationRequest, AppError, jsonError, readJsonBody } from "@/lib/http";
+import { getPreferences } from "@/lib/preferences";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -10,8 +11,8 @@ export const dynamic = "force-dynamic";
 export async function GET(request: Request) {
   try {
     return await withAccess(request, "write", async () => {
-      const result = await withFilesystemLock(() => listTrash());
-      return NextResponse.json(result, { headers: { "Cache-Control": "no-store" } });
+      const [result, preferences] = await Promise.all([withFilesystemLock(() => listTrash()), getPreferences()]);
+      return NextResponse.json({ ...result, retentionDays: preferences.trashRetentionDays }, { headers: { "Cache-Control": "no-store" } });
     });
   } catch (error) {
     return jsonError(error);

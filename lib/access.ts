@@ -1,6 +1,7 @@
 import { requireSession, type Session } from "./auth";
 import { AppError } from "./http";
 import { runInScope, type Role } from "./scope";
+import { startTrashRetention } from "./trash-retention";
 
 export type Permission = "read" | "write" | "owner";
 
@@ -23,6 +24,9 @@ export function assertPermission(session: Pick<Session, "role">, permission: Per
  */
 export async function withAccess<T>(request: Request, permission: Permission, run: (session: Session) => Promise<T>): Promise<T> {
   const session = await requireSession(request);
+  // Background upkeep starts with the first signed-in request, in the same module instance as the
+  // routes (so it shares their filesystem lock).
+  startTrashRetention();
   assertPermission(session, permission);
   return runInScope({ accountKey: session.accountKey, username: session.username, role: session.role, root: session.root }, () => run(session));
 }

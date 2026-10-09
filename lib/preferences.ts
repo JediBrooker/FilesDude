@@ -7,13 +7,23 @@ import type { UploadOwnershipPreference } from "./types";
 
 export interface StoredPreferences {
   uploadOwnership: UploadOwnershipPreference;
+  /** Days trashed items are kept before being deleted forever; null keeps them until removed by hand. */
+  trashRetentionDays: number | null;
   updatedAt?: string;
 }
+
+export const MAX_TRASH_RETENTION_DAYS = 3650;
 
 function preferencesFile() {
   return path.join(config.stateDir, "preferences.json");
 }
-const defaults: StoredPreferences = { uploadOwnership: { mode: "destination" } };
+const defaults: StoredPreferences = { uploadOwnership: { mode: "destination" }, trashRetentionDays: null };
+
+export function parseTrashRetention(value: unknown): number | null {
+  if (value === null) return null;
+  if (Number.isInteger(value) && Number(value) >= 1 && Number(value) <= MAX_TRASH_RETENTION_DAYS) return Number(value);
+  throw new AppError(`Keep trashed items for 1 to ${MAX_TRASH_RETENTION_DAYS.toLocaleString()} days, or until removed`, 400, "INVALID_TRASH_RETENTION");
+}
 
 export function parseUploadOwnershipPreference(value: unknown): UploadOwnershipPreference {
   if (!value || typeof value !== "object") throw new AppError("Choose a valid default upload owner and group", 400, "INVALID_UPLOAD_OWNERSHIP");
@@ -30,6 +40,7 @@ export async function getPreferences(): Promise<StoredPreferences> {
     const value = JSON.parse(await fs.readFile(preferencesFile(), "utf8")) as Partial<StoredPreferences>;
     return {
       uploadOwnership: value.uploadOwnership ? parseUploadOwnershipPreference(value.uploadOwnership) : defaults.uploadOwnership,
+      trashRetentionDays: value.trashRetentionDays === undefined ? defaults.trashRetentionDays : parseTrashRetention(value.trashRetentionDays),
       updatedAt: typeof value.updatedAt === "string" ? value.updatedAt : undefined,
     };
   } catch (error) {

@@ -5,9 +5,11 @@ import path from "node:path";
 import test from "node:test";
 import { config } from "../lib/config";
 import { execFileSync } from "node:child_process";
-import { acquireFilesystemLock, copyOrMove, deleteEntries, listTrash, recoverInterruptedCopies, PartialTransferError, renameEntry, restoreTrashItems, withFilesystemLock } from "../lib/files";
+import { acquireFilesystemLock, copyOrMove, deleteEntries, listTrash, purgeExpiredTrash, recoverInterruptedCopies, PartialTransferError, renameEntry, restoreTrashItems, withFilesystemLock } from "../lib/files";
 import { listJobs, startJob } from "../lib/jobs";
 import { currentScope, runInScope, runUnscoped } from "../lib/scope";
+import { getPreferences, savePreferences } from "../lib/preferences";
+import { runTrashRetention } from "../lib/trash-retention";
 import { readCopyJournal, recordCopy } from "../lib/copy-journal";
 import { createShare, openSharedItem, resolveShareToken, rewriteSharePaths } from "../lib/shares";
 import type { JobProgress } from "../lib/types";
@@ -282,6 +284,91 @@ test("copies are journaled while they run, and placeholders left by a restart ar
     assert.deepEqual((await fs.readdir(path.join(root, "dest"))).sort(), ["done (copying)", "file.bin", "reused (copying).bin", "theirs (copying).txt"]);
     assert.deepEqual(await fs.readdir(path.join(root, "elsewhere-real")), ["keep (copying)"]);
     assert.deepEqual(await readCopyJournal(), []);
+  });
+});
+
+test("trash retention removes only items deleted longer ago than the setting", async () => {
+  await withTempRoot(async (root) => {
+    for (const name of ["old.txt", "recent.txt"]) await fs.writeFile(path.join(root, name), name);
+    await fs.mkdir(path.join(root, "old-folder"));
+    await fs.writeFile(path.join(root, "old-folder", "inside.txt"), "x");
+    const { trashed } = await deleteEntries(["old.txt", "recent.txt", "old-folder"]);
+    const infoDir = path.join(root, ".filedude", "trash-info");
+    // Backdate two of them by 40 days.
+    for (const item of trashed.filter((entry) => entry.path !== "recent.txt")) {
+      const infoPath = path.join(infoDir, `${item.id}.json`);
+      const info = JSON.parse(await fs.readFile(infoPath, "utf8"));
+      await fs.writeFile(infoPath, JSON.stringify({ ...info, deletedAt: new Date(Date.now() - 40 * 86_400_000).toISOString() }));
+    }
+    // A legacy item (no record) named with an old timestamp, and an item with a damaged record.
+    const itemsDir = path.join(root, ".filedude", "trash");
+    await fs.writeFile(path.join(itemsDir, `legacy.txt.${Date.now() - 50 * 86_400_000}-abcdef`), "legacy");
+    await fs.writeFile(path.join(itemsDir, "undated"), "x");
+    await fs.writeFile(path.join(infoDir, "undated.json"), "not json");
+
+    // An item with no known deletion time is kept however old it is.
+    const old = new Date(Date.now() - 400 * 86_400_000);
+    await fs.utimes(path.join(itemsDir, "undated"), old, old);
+
+    const thirtyDays = async () => 30;
+    const first = await purgeExpiredTrash(thirtyDays);
+    assert.equal(first.removed.length, 3);
+    assert.equal(first.failed, 0);
+    assert.deepEqual(first.removed.map((item) => item.originalPath).sort((a, b) => String(a).localeCompare(String(b))), [null, "old-folder", "old.txt"]);
+    const left = (await listTrash()).items.map((item) => item.name).sort();
+    assert.deepEqual(left, ["recent.txt", "undated"]);
+    assert.ok(!(await fs.readdir(infoDir)).some((name) => trashed.some((item) => item.path !== "recent.txt" && name === `${item.id}.json`)));
+    assert.deepEqual(await purgeExpiredTrash(thirtyDays), { removed: [], failed: 0 });
+  });
+});
+
+test("an item that can't be removed doesn't stop the purge, and turning retention off stops a run", async () => {
+  await withTempRoot(async (root) => {
+    const backdate = async (id: string) => {
+      const infoPath = path.join(root, ".filedude", "trash-info", `${id}.json`);
+      const info = JSON.parse(await fs.readFile(infoPath, "utf8"));
+      await fs.writeFile(infoPath, JSON.stringify({ ...info, deletedAt: new Date(Date.now() - 40 * 86_400_000).toISOString() }));
+    };
+    // A folder nested deeper than delete allows, plus ordinary items.
+    let deep = path.join(root, "deep");
+    await fs.mkdir(deep);
+    for (let level = 0; level < 260; level += 1) {
+      deep = path.join(deep, "d");
+      await fs.mkdir(deep);
+    }
+    for (const name of ["a.txt", "b.txt", "c.txt"]) await fs.writeFile(path.join(root, name), name);
+    const { trashed } = await deleteEntries(["deep", "a.txt", "b.txt", "c.txt"]);
+    for (const item of trashed) await backdate(item.id);
+
+    const result = await purgeExpiredTrash(async () => 30);
+    assert.equal(result.failed, 1);
+    assert.deepEqual(result.removed.map((item) => item.originalPath).sort(), ["a.txt", "b.txt", "c.txt"]);
+    assert.deepEqual((await listTrash()).items.map((item) => item.name), ["deep"]);
+
+    // Retention switched off part-way: nothing more is removed.
+    for (const name of ["x.txt", "y.txt"]) await fs.writeFile(path.join(root, name), name);
+    for (const item of (await deleteEntries(["x.txt", "y.txt"])).trashed) await backdate(item.id);
+    let checks = 0;
+    const stopped = await purgeExpiredTrash(async () => (checks++ === 0 ? 30 : null));
+    assert.ok(stopped.removed.length <= 1, `${stopped.removed.length} removed after retention was turned off`);
+  });
+});
+
+test("the retention run does nothing until the owner chooses a period", async () => {
+  await withTempRoot(async (root) => {
+    await fs.writeFile(path.join(root, "a.txt"), "a");
+    const { trashed } = await deleteEntries(["a.txt"]);
+    const infoPath = path.join(root, ".filedude", "trash-info", `${trashed[0].id}.json`);
+    const info = JSON.parse(await fs.readFile(infoPath, "utf8"));
+    await fs.writeFile(infoPath, JSON.stringify({ ...info, deletedAt: new Date(Date.now() - 10 * 86_400_000).toISOString() }));
+    assert.equal((await getPreferences()).trashRetentionDays, null);
+    assert.equal(await runTrashRetention(), 0);
+    await savePreferences({ ...(await getPreferences()), trashRetentionDays: 7 });
+    assert.equal(await runTrashRetention(), 1);
+    assert.deepEqual((await listTrash()).items, []);
+    const audited = (await fs.readFile(path.join(root, ".filedude", "audit.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    const purge = audited.find((entry) => entry.event === "trash.purge");
+    assert.deepEqual([purge?.removed, purge?.items?.[0]?.originalPath, purge?.failed, purge?.retentionDays], [1, "a.txt", 0, 7]);
   });
 });
 
