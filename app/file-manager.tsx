@@ -28,6 +28,7 @@ import {
   FileText,
   FileVideo,
   Folder,
+  Files,
   FolderInput,
   FolderOpen,
   FolderPlus,
@@ -110,6 +111,7 @@ type DialogState =
   | { kind: "preferences" }
   | { kind: "twoFactor" }
   | { kind: "snapshots" }
+  | { kind: "duplicates" }
   | { kind: "versions"; entry: FileEntry }
   | { kind: "details"; entry: FileEntry }
   | null;
@@ -1192,6 +1194,7 @@ export function FileManager() {
           {canWrite && <button className="nav-item" onClick={() => { setDialog({ kind: "trash" }); setSidebarOpen(false); }}><Trash2 size={18} /><span>Trash</span></button>}
           {isOwner && <button className="nav-item" onClick={() => { setDialog({ kind: "shares" }); setSidebarOpen(false); }}><Link2 size={18} /><span>Shared links</span>{sharedPaths.size > 0 && <em className="nav-count">{sharedPaths.size}</em>}</button>}
           {snapshotsAvailable && <button className="nav-item" onClick={() => { setDialog({ kind: "snapshots" }); setSidebarOpen(false); }}><History size={18} /><span>Snapshots</span></button>}
+          {isOwner && <button className="nav-item" onClick={() => { setDialog({ kind: "duplicates" }); setSidebarOpen(false); }}><Files size={18} /><span>Duplicates</span></button>}
           {isOwner && <button className="nav-item" onClick={() => { setDialog({ kind: "users" }); setSidebarOpen(false); }}><Users size={18} /><span>Users</span></button>}
         </nav>
 
@@ -1729,6 +1732,7 @@ function DialogHost({ dialog, selected, currentPath, username, role, home, onClo
 }) {
   if (dialog.kind === "upload") return <UploadDialog files={dialog.files} currentPath={currentPath} chooseOwnership={role === "owner"} onClose={onClose} notify={notify} onComplete={onRefresh} />;
   if (dialog.kind === "users") return <UsersDialog onClose={onClose} notify={notify} />;
+  if (dialog.kind === "duplicates") return <DuplicatesDialog startPath={currentPath} onClose={onClose} notify={notify} onRefresh={onRefresh} onReveal={onReveal} />;
   if (dialog.kind === "storage") return <StorageDialog onClose={onClose} onReveal={onReveal} onPreview={onPreview} notify={notify} />;
   if (dialog.kind === "trash") return <TrashDialog onClose={onClose} notify={notify} onRefresh={onRefresh} />;
   if (dialog.kind === "compress") return <CompressDialog entries={selected} currentPath={currentPath} onClose={onClose} onStart={onStartJob} />;
@@ -2198,6 +2202,163 @@ function VersionsDialog({ entry, canWrite, isOwner, onClose, notify, onJob }: { 
     </Modal>
   );
 }
+
+type DuplicateCopy = { path: string; modified: string; inode: string; links: number };
+type DuplicateGroup = { size: number; copies: DuplicateCopy[]; wastedBytes: number };
+type DuplicateReport = { folder: string; minBytes: number; generatedAt: string; durationMs: number; filesSeen: number; skipped: number; groups: DuplicateGroup[]; totalGroups: number; wastedBytes: number };
+type DuplicateProgress = { phase: "listing" | "comparing" | "hashing"; folder: string; filesSeen: number; directoriesSeen: number; candidates: number; bytesToHash: number; bytesHashed: number; elapsedMs: number };
+type DuplicateStatus = { scanning: DuplicateProgress | null; report: DuplicateReport | null; error: string | null };
+const DUPLICATE_MINIMUMS = [[1024 * 1024, "1 MB"], [10 * 1024 * 1024, "10 MB"], [100 * 1024 * 1024, "100 MB"], [1024 * 1024 * 1024, "1 GB"]] as const;
+
+function duplicateProgressText(progress: DuplicateProgress) {
+  if (progress.phase === "listing") return `Listing files · ${progress.filesSeen.toLocaleString()} files in ${progress.directoriesSeen.toLocaleString()} folders`;
+  if (progress.phase === "comparing") return `Comparing ${progress.candidates.toLocaleString()} files of matching sizes`;
+  return `Checking contents · ${formatBytes(progress.bytesHashed)} of ${formatBytes(progress.bytesToHash)}`;
+}
+
+function DuplicatesDialog({ startPath, onClose, notify, onRefresh, onReveal }: { startPath: string; onClose: () => void; notify: (message: string, tone?: "error") => void; onRefresh: () => Promise<void>; onReveal: (entry: FileEntry) => void }) {
+  const [status, setStatus] = useState<DuplicateStatus | null>(null);
+  const [folder, setFolder] = useState(startPath);
+  const [minBytes, setMinBytes] = useState<number>(DUPLICATE_MINIMUMS[1][0]);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const load = useCallback(async (offset = 0) => {
+    const next = await requestJson<DuplicateStatus>(`/api/fs/duplicates?offset=${offset}&limit=200`);
+    setStatus((current) => (offset && current?.report && next.report ? { ...next, report: { ...next.report, groups: [...current.report.groups, ...next.report.groups] } } : next));
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => void load().catch((caught) => setError((caught as Error).message)), 0);
+    return () => window.clearTimeout(timer);
+  }, [load]);
+
+  // While a scan runs, its progress is checked every second and a half.
+  useEffect(() => {
+    if (!status?.scanning) return;
+    const timer = window.setTimeout(() => void load().catch(() => undefined), 1500);
+    return () => window.clearTimeout(timer);
+  }, [status, load]);
+
+  const post = async (body: Record<string, unknown>) => requestJson<DuplicateStatus>("/api/fs/duplicates", { method: "POST", body: JSON.stringify(body) });
+  const startScan = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      setSelected(new Set());
+      setStatus(await post({ action: "scan", path: folder, minBytes }));
+    } catch (caught) {
+      setError((caught as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const cancelScan = async () => {
+    await post({ action: "cancel" }).catch(() => undefined);
+    await load().catch(() => undefined);
+  };
+
+  const report = status?.report ?? null;
+  const groups = report?.groups ?? [];
+  // Every group keeps at least one copy: a box can't be ticked if it would select a group's last one.
+  const remainingIn = (group: DuplicateGroup) => group.copies.filter((copy) => !selected.has(copy.path)).length;
+  const toggle = (group: DuplicateGroup, copy: DuplicateCopy) => {
+    setSelected((current) => {
+      const next = new Set(current);
+      if (next.has(copy.path)) next.delete(copy.path);
+      else if (remainingIn(group) > 1) next.add(copy.path);
+      return next;
+    });
+  };
+  const keepOne = (which: "oldest" | "newest") => {
+    const next = new Set<string>();
+    for (const group of groups) {
+      const keep = which === "oldest" ? group.copies[0] : group.copies[group.copies.length - 1];
+      for (const copy of group.copies) if (copy.inode !== keep.inode) next.add(copy.path);
+    }
+    setSelected(next);
+  };
+  // Space freed: each file all of whose selected paths go (a hard-linked file with paths left keeps its space).
+  const freed = groups.reduce((total, group) => {
+    const inodes = new Set(group.copies.map((copy) => copy.inode));
+    let freedHere = 0;
+    for (const inode of inodes) {
+      const paths = group.copies.filter((copy) => copy.inode === inode);
+      if (paths.every((copy) => selected.has(copy.path)) && paths[0].links <= paths.length) freedHere += group.size;
+    }
+    return total + freedHere;
+  }, 0);
+
+  const trashSelected = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const paths = [...selected];
+      let trashed = 0;
+      let changed = 0;
+      for (let start = 0; start < paths.length; start += 500) {
+        const response = await requestJson<DuplicateStatus & { result: { trashed: unknown[]; changed: unknown[] } }>("/api/fs/duplicates", { method: "POST", body: JSON.stringify({ action: "trash", paths: paths.slice(start, start + 500) }) });
+        setStatus(response);
+        trashed += response.result.trashed.length;
+        changed += response.result.changed.length;
+      }
+      notify(`${itemCount(trashed)} moved to the trash${changed ? ` · ${itemCount(changed)} changed since the scan and ${changed === 1 ? "was" : "were"} left alone` : ""}`, changed ? "error" : undefined);
+      setSelected(new Set());
+      await onRefresh();
+    } catch (caught) {
+      setError((caught as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const scanning = status?.scanning ?? null;
+  const percent = scanning?.phase === "hashing" && scanning.bytesToHash ? Math.min(100, (scanning.bytesHashed / scanning.bytesToHash) * 100) : undefined;
+  return (
+    <Modal title="Duplicate files" subtitle="Find files with identical contents and keep one copy of each" icon={<Files size={19} />} onClose={onClose} wide>
+      <div className="storage-browser duplicates-dialog">
+        <div className="snapshot-controls">
+          <div className="snapshot-schedule">
+            <FormField label="Folder to scan"><div className="path-input"><span>/</span><input value={folder} onChange={(event) => setFolder(event.target.value.replace(/^\/+/, ""))} placeholder="Everything" disabled={Boolean(scanning)} /></div></FormField>
+            <FormField label="Ignore files smaller than"><select value={minBytes} onChange={(event) => setMinBytes(Number(event.target.value))} disabled={Boolean(scanning)}>{DUPLICATE_MINIMUMS.map(([bytes, label]) => <option key={bytes} value={bytes}>{label}</option>)}</select></FormField>
+          </div>
+          {scanning ? <button className="button secondary" onClick={() => void cancelScan()}><X size={15} /> Cancel scan</button> : <button className="button primary" disabled={busy || status === null} onClick={() => void startScan()}>{busy ? <LoaderCircle className="spin" size={15} /> : <Search size={15} />} {report ? "Scan again" : "Scan for duplicates"}</button>}
+        </div>
+        {scanning && <div className="duplicate-progress" role="status"><div><LoaderCircle className="spin" size={15} /> {duplicateProgressText(scanning)}</div><div className={`job-panel-track ${percent === undefined ? "indeterminate" : ""}`}><span style={percent === undefined ? undefined : { width: `${percent}%` }} /></div><small className="muted">Scanning /{scanning.folder} · {Math.round(scanning.elapsedMs / 1000)}s so far. You can close this window; the scan keeps going.</small></div>}
+        {(error || status?.error) && <div className="form-error"><CircleAlert size={16} />{error || status?.error}</div>}
+        {!scanning && !report && status !== null && <div className="snapshot-empty"><Files size={22} /><strong>No scan yet</strong><span>Scanning reads files of the same size to compare them, so large folders take a while. Duplicates are moved to the trash, never deleted outright, and one copy of each is always kept.</span></div>}
+        {report && <>
+          <div className="storage-scan-note"><Info size={15} /> {report.totalGroups ? `${report.totalGroups.toLocaleString()} ${report.totalGroups === 1 ? "set" : "sets"} of duplicates in /${report.folder} · ${formatBytes(report.wastedBytes)} taken by extra copies` : `No duplicates of ${formatBytes(report.minBytes)} or more in /${report.folder}`} · {report.filesSeen.toLocaleString()} files checked {formatDateTime(report.generatedAt)}{report.skipped ? ` · ${report.skipped.toLocaleString()} skipped (unreadable or changed)` : ""}</div>
+          {groups.length > 0 && <div className="duplicate-actions"><span className="muted">Select:</span><button className="button secondary" onClick={() => keepOne("oldest")}>All but the oldest</button><button className="button secondary" onClick={() => keepOne("newest")}>All but the newest</button>{selected.size > 0 && <button className="button secondary" onClick={() => setSelected(new Set())}>Clear</button>}<span className="duplicate-actions-gap" />{selected.size > 0 && <button className="button danger" disabled={busy} onClick={() => void trashSelected()}>{busy ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />} Move {itemCount(selected.size)} to trash{freed ? ` (${formatBytes(freed)})` : ""}</button>}</div>}
+          <div className="duplicate-groups">
+            {groups.map((group) => (
+              <div key={group.copies[0].path} className="duplicate-group">
+                <div className="duplicate-group-head"><strong>{lastSegment(group.copies[0].path)}</strong><span className="muted">{group.copies.length} copies · {formatBytes(group.size)} each · {formatBytes(group.wastedBytes)} extra</span></div>
+                {group.copies.map((copy) => {
+                  const parent = parentOf(copy.path);
+                  const lastLeft = !selected.has(copy.path) && remainingIn(group) <= 1;
+                  return (
+                    <div key={copy.path} className={`duplicate-copy ${selected.has(copy.path) ? "selected" : ""}`}>
+                      <CheckBox checked={selected.has(copy.path)} onChange={() => toggle(group, copy)} label={lastLeft ? `Keep ${copy.path}: the last copy` : `Select ${copy.path}`} />
+                      <button className="duplicate-path" title={`Show /${parent || ""} in the file list`} onClick={() => onReveal({ path: copy.path } as FileEntry)}><span className="muted">/{parent ? `${parent}/` : ""}</span>{lastSegment(copy.path)}</button>
+                      {copy.links > 1 && <span className="two-factor-badge" title="This file has other hard links, so removing this path frees no space by itself">hard-linked</span>}
+                      <span className="muted" title={new Date(copy.modified).toLocaleString()}>{formatDate(copy.modified)}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            ))}
+          </div>
+          {groups.length < report.totalGroups && <div className="storage-show-more"><span>Showing {groups.length.toLocaleString()} of {report.totalGroups.toLocaleString()} sets</span><button className="button secondary" onClick={() => void load(groups.length)}><Plus size={15} /> Show more</button></div>}
+        </>}
+        <div className="storage-scan-foot"><span className="muted">Removing a copy a torrent client is still seeding will break that torrent.</span><button className="button primary" onClick={onClose}>Done</button></div>
+      </div>
+    </Modal>
+  );
+}
+
+const lastSegment = (value: string) => value.split("/").at(-1) ?? value;
 
 // How long until an item is removed by trash retention.
 function expiryLabel(deletedAt: string, retentionDays: number) {

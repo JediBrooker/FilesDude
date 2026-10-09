@@ -1179,6 +1179,40 @@ export async function purgeExpiredTrash(retentionDays: () => Promise<number | nu
   return result;
 }
 
+export type FileIdentity = { dev: number; ino: number; size: number; mtimeMs: number };
+
+// Opens the folder holding `relativePath` only if it is its real location (no link anywhere on
+// the way), and checks the item there is still exactly the file described by `expected`.
+async function withUnchangedFile<T>(relativePath: string, expected: FileIdentity, run: (parent: AnchoredDirectory, name: string, relative: string) => Promise<T>): Promise<T | null> {
+  const root = await ensureRoot();
+  return withParent(relativePath, async (parent, name, relative) => {
+    const parentRelative = parentOf(relative);
+    if (parent.real !== (parentRelative ? path.join(root, ...parentRelative.split("/")) : root)) return null;
+    const stat = await fs.lstat(inside(parent, name)).catch(missingAsNull);
+    if (!stat?.isFile() || stat.dev !== expected.dev || stat.ino !== expected.ino || stat.size !== expected.size || stat.mtimeMs !== expected.mtimeMs) return null;
+    return run(parent, name, relative);
+  }).catch((error: unknown) => {
+    if (error instanceof AppError && ["NOT_FOUND", "NOT_A_DIRECTORY", "PATH_CHANGED"].includes(error.code ?? "")) return null;
+    throw error;
+  });
+}
+
+/** Whether `relativePath` is still exactly the file described, at its real location. */
+export async function isUnchangedFile(relativePath: string, expected: FileIdentity) {
+  return (await withUnchangedFile(relativePath, expected, async () => true)) === true;
+}
+
+/**
+ * Moves a file to the protected trash only if it is still exactly the file described (same
+ * identity, size, and modification time, at its real location). Returns its trash id, or null if
+ * it changed. Call with the filesystem lock held.
+ */
+export async function trashIfUnchanged(relativePath: string, expected: FileIdentity) {
+  if (!config.trashEnabled) throw new AppError("Protected trash is turned off", 409, "TRASH_DISABLED");
+  const trash = await trashDirectories(true);
+  return withUnchangedFile(relativePath, expected, (parent, name, relative) => moveToTrash(parent, name, relative, trash));
+}
+
 export async function emptyTrash() {
   const trash = await trashDirectories();
   if (!trash) return { removed: 0 };
