@@ -27,6 +27,7 @@ const MAX_VERSION_SNAPSHOTS = 100;
 let runner: ZfsRunner | null | undefined;
 let cachedDataset: { at: number; value: Dataset | null } | null = null;
 let cachedSnapshots: { at: number; value: Snapshot[] } | null = null;
+let warnedUnusable = false;
 
 /** Replaces how zfs is run (tests use a fake); null means ZFS isn't available. */
 export function setZfsRunner(replacement: ZfsRunner | null) {
@@ -62,7 +63,12 @@ async function findDataset(): Promise<Dataset | null> {
   let value: Dataset | null = null;
   if (run) {
     const root = await ensureRoot();
-    const output = await run(["list", "-H", "-p", "-o", "name,mountpoint", "-t", "filesystem"]).catch(() => "");
+    const output = await run(["list", "-H", "-p", "-o", "name,mountpoint", "-t", "filesystem"]).catch((error: unknown) => {
+      // Usually the service can't reach /dev/zfs (see install.sh); say so once rather than silently.
+      if (!warnedUnusable) console.warn(`ZFS is installed but "zfs list" failed, so snapshots are unavailable: ${(error as Error).message}`);
+      warnedUnusable = true;
+      return "";
+    });
     for (const [dataset, mountpoint] of rows(output)) {
       if (!dataset || !mountpoint?.startsWith("/")) continue;
       const inside = root === mountpoint || root.startsWith(`${mountpoint === "/" ? "" : mountpoint}/`);
