@@ -7,7 +7,8 @@ import { withAccess } from "@/lib/access";
 import { audit } from "@/lib/audit";
 import { getMime } from "@/lib/files";
 import { AppError, jsonError } from "@/lib/http";
-import { snapshotItem } from "@/lib/snapshots";
+import { assertSnapshotAccess } from "@/lib/snapshot-access";
+import { snapshotHandleVerifier, snapshotItem } from "@/lib/snapshots";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -21,6 +22,7 @@ function dispositionName(name: string) {
 export async function GET(request: Request) {
   try {
     return await withAccess(request, "read", async (session) => {
+      await assertSnapshotAccess(session.role);
       const url = new URL(request.url);
       const item = await snapshotItem(url.searchParams.get("snapshot") || "", url.searchParams.get("path") || "");
       if (!item.relative) throw new AppError("Choose an item inside the snapshot", 400, "INVALID_REQUEST");
@@ -40,7 +42,7 @@ export async function GET(request: Request) {
           void (async () => {
             try {
               archive.append(Buffer.alloc(0), { name: `${item.name}/`, type: "directory", stats: stat });
-              await appendDirectory(archive, handle, item.location, item.name, await reservedPathCheck());
+              await appendDirectory(archive, handle, item.location, item.name, await reservedPathCheck(), undefined, true, snapshotHandleVerifier(item.location));
               await archive.finalize();
             } catch (error) {
               output.destroy(error as Error);

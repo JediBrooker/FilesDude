@@ -117,6 +117,7 @@ type DialogState =
 type ViewMode = "list" | "grid";
 type SnapshotInfo = { name: string; createdAt: string; used?: number; kind: "auto" | "manual" | "other" };
 type SnapshotSchedule = { frequency: "off" | "hourly" | "daily"; keep: number };
+type SnapshotAccess = "owner" | "editors" | "everyone";
 type SnapshotEntry = { name: string; path: string; type: "file" | "directory" | "symlink" | "other"; size: number; modified: string; mime: string };
 type SnapshotVersion = { snapshot: string; snapshotCreatedAt: string; type: SnapshotEntry["type"]; size: number; modified: string };
 const SNAPSHOT_KIND_LABELS: Record<SnapshotInfo["kind"], string> = { auto: "Scheduled", manual: "Manual", other: "Other" };
@@ -2041,6 +2042,7 @@ function SnapshotsDialog({ isOwner, canWrite, home, onClose, notify, onJob }: { 
   const [snapshots, setSnapshots] = useState<SnapshotInfo[] | null>(null);
   const [schedule, setSchedule] = useState<SnapshotSchedule>({ frequency: "off", keep: 24 });
   const [savedSchedule, setSavedSchedule] = useState<SnapshotSchedule | null>(null);
+  const [access, setAccess] = useState<SnapshotAccess | null>(null);
   const [chosen, setChosen] = useState<string | null>(null);
   const [browsePath, setBrowsePath] = useState(home);
   const [entries, setEntries] = useState<SnapshotEntry[] | null>(null);
@@ -2050,9 +2052,10 @@ function SnapshotsDialog({ isOwner, canWrite, home, onClose, notify, onJob }: { 
 
   useEffect(() => {
     const controller = new AbortController();
-    requestJson<{ available: boolean; snapshots?: SnapshotInfo[]; schedule?: SnapshotSchedule }>("/api/fs/snapshots", { signal: controller.signal })
+    requestJson<{ available: boolean; snapshots?: SnapshotInfo[]; schedule?: SnapshotSchedule; access?: SnapshotAccess }>("/api/fs/snapshots", { signal: controller.signal })
       .then((result) => {
         setSnapshots(result.snapshots ?? []);
+        if (result.access) setAccess(result.access);
         if (result.schedule) {
           setSchedule(result.schedule);
           setSavedSchedule(result.schedule);
@@ -2085,9 +2088,10 @@ function SnapshotsDialog({ isOwner, canWrite, home, onClose, notify, onJob }: { 
     setBusy(true);
     setError("");
     try {
-      const result = await requestJson<{ snapshots: SnapshotInfo[]; schedule?: SnapshotSchedule }>("/api/fs/snapshots", { method: "POST", body: JSON.stringify(body) });
+      const result = await requestJson<{ snapshots: SnapshotInfo[]; schedule?: SnapshotSchedule; access?: SnapshotAccess }>("/api/fs/snapshots", { method: "POST", body: JSON.stringify(body) });
       setSnapshots(result.snapshots);
       if (result.schedule) setSavedSchedule(result.schedule);
+      if (result.access) setAccess(result.access);
       setRemoving(null);
       notify(success);
     } catch (caught) {
@@ -2113,10 +2117,12 @@ function SnapshotsDialog({ isOwner, canWrite, home, onClose, notify, onJob }: { 
           <div className="snapshot-schedule">
             <FormField label="Automatic snapshots"><select value={schedule.frequency} onChange={(event) => setSchedule({ frequency: event.target.value as SnapshotSchedule["frequency"], keep: event.target.value === "daily" && schedule.keep === 24 ? 14 : event.target.value === "hourly" && schedule.keep === 14 ? 24 : schedule.keep })} disabled={savedSchedule === null}><option value="off">Off</option><option value="hourly">Every hour</option><option value="daily">Every day</option></select></FormField>
             {schedule.frequency !== "off" && <FormField label="Keep the newest"><input type="number" min={1} max={1000} value={schedule.keep} onChange={(event) => setSchedule({ ...schedule, keep: Number(event.target.value) })} /></FormField>}
-            {scheduleChanged && <button className="button primary" disabled={busy} onClick={() => void send({ action: "schedule", schedule }, schedule.frequency === "off" ? "Automatic snapshots turned off" : "Snapshot schedule saved")}>Save</button>}
+            {scheduleChanged && <button className="button primary" disabled={busy} onClick={() => void send({ action: "schedule", schedule }, schedule.frequency === "off" ? "Automatic snapshots turned off" : "Snapshot schedule saved · the next snapshot is taken within 5 minutes")}>Save</button>}
+            <FormField label="Who can see snapshots"><select value={access ?? "owner"} disabled={access === null || busy} onChange={(event) => void send({ action: "access", access: event.target.value }, event.target.value === "owner" ? "Only you can see snapshots now" : "Snapshot access updated")}><option value="owner">Only me</option><option value="editors">Editors and me</option><option value="everyone">Everyone</option></select></FormField>
           </div>
           <button className="button secondary" disabled={busy || snapshots === null} onClick={() => void send({ action: "create" }, "Snapshot taken")}>{busy ? <LoaderCircle className="spin" size={15} /> : <Camera size={15} />} Take snapshot now</button>
         </div>}
+        {isOwner && access !== null && access !== "owner" && <div className="storage-scan-note trash-note"><Info size={15} /> Shared accounts see their own folder in each snapshot as it was then, including anything since moved out of it. Delete a snapshot to remove what it holds.</div>}
         {removing && <div className="storage-delete-confirm trash-confirm" role="alert"><div><Trash2 size={19} /><span><strong>Delete the snapshot from {formatDateTime(removing.createdAt)}?</strong><small>The earlier versions it holds can no longer be restored. Current files aren&apos;t affected.</small></span></div><div><button className="button secondary" disabled={busy} onClick={() => setRemoving(null)}>Cancel</button><button className="button danger" disabled={busy} onClick={() => void send({ action: "delete", name: removing.name }, "Snapshot deleted")}>Delete snapshot</button></div></div>}
         {error && <div className="form-error"><CircleAlert size={16} />{error}</div>}
         <div className="snapshots-layout">

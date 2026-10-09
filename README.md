@@ -233,12 +233,17 @@ When `FILEDUDE_ROOT` is on a ZFS dataset (such as a Proxmox container's
 each item's menu. FilesDude finds the dataset itself; set `FILEDUDE_ZFS_PATH` if the `zfs`
 command isn't in `/usr/sbin`, `/sbin`, or `/usr/local/sbin`.
 
-- **Everyone** can browse snapshots and download earlier versions, within their own folder.
-  Editors and the owner can also restore an item: it is copied back beside the current
-  one as `name (restored <date>)` (or under its own name if that is free), so nothing is
-  ever replaced.
+- **Who can see them:** only the owner, until the owner shares snapshots with editors or
+  with everyone (**Who can see snapshots** in the Snapshots dialog). Shared accounts see
+  only their own folder in each snapshot, but as it was then, including anything since
+  moved out of it; delete a snapshot to remove what it holds.
+- Accounts that can see snapshots browse them and download earlier versions (folders as
+  ZIPs). Editors and the owner can also restore an item: it is copied back beside the
+  current one as `name (restored <date>)` (or under its own name if that is free), so
+  nothing is ever replaced.
 - **The owner** can take a snapshot at any time, or turn on automatic snapshots every
-  hour or every day, keeping the newest so many. Automatic snapshots are off by default.
+  hour or every day, keeping the newest so many. Automatic snapshots are off by default;
+  once on, they are taken from when the service starts, whether or not anyone signs in.
 - FilesDude names its snapshots `filesdude-auto-...` and `filesdude-manual-...`, and only
   ever deletes those: automatic ones beyond the number to keep, or ones the owner
   deletes. Other snapshots, such as Proxmox's, are listed and browsable but never

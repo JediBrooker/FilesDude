@@ -5,8 +5,8 @@ import { audit } from "@/lib/audit";
 import { details, restoreFromSnapshot, withFilesystemLock } from "@/lib/files";
 import { assertMutationRequest, AppError, jsonError, readJsonBody } from "@/lib/http";
 import { startJob, waitForJob } from "@/lib/jobs";
-import { getPreferences, parseSnapshotSchedule, savePreferences } from "@/lib/preferences";
-import { runSnapshotSchedule } from "@/lib/snapshot-schedule";
+import { getPreferences, parseSnapshotAccess, parseSnapshotSchedule, savePreferences } from "@/lib/preferences";
+import { assertSnapshotAccess, canUseSnapshots, withSnapshotSlot } from "@/lib/snapshot-access";
 import { createSnapshot, deleteSnapshot, itemVersions, listSnapshotFolder, listSnapshots, snapshotItem, snapshotSupport } from "@/lib/snapshots";
 
 export const runtime = "nodejs";
@@ -17,7 +17,8 @@ const noStore = { headers: { "Cache-Control": "no-store" } };
 /**
  * Without parameters: whether snapshots are available and the list (with sizes, the dataset, and
  * the schedule for the owner). view=versions&path=: an item's earlier versions. view=browse&snapshot=
- * &path=: a folder inside a snapshot. Every account sees only what is inside its own folder.
+ * &path=: a folder inside a snapshot. Every account sees only what is inside its own folder, and
+ * accounts besides the owner only once the owner has shared snapshots with them.
  */
 export async function GET(request: Request) {
   try {
@@ -26,20 +27,23 @@ export async function GET(request: Request) {
       const view = url.searchParams.get("view");
       const itemPath = url.searchParams.get("path") || "";
       if (view === "versions") {
+        await assertSnapshotAccess(session.role);
         const current = await withFilesystemLock(() => details(itemPath)).catch(() => null);
-        return NextResponse.json({ versions: await itemVersions(itemPath, current) }, noStore);
+        return NextResponse.json({ versions: await withSnapshotSlot(session.accountKey, () => itemVersions(itemPath, current)) }, noStore);
       }
       if (view === "browse") {
-        return NextResponse.json(await listSnapshotFolder(url.searchParams.get("snapshot") || "", itemPath, url.searchParams.get("hidden") === "true"), noStore);
+        await assertSnapshotAccess(session.role);
+        return NextResponse.json(await withSnapshotSlot(session.accountKey, () => listSnapshotFolder(url.searchParams.get("snapshot") || "", itemPath, url.searchParams.get("hidden") === "true")), noStore);
       }
       const support = await snapshotSupport();
-      if (!support.available) return NextResponse.json({ available: false }, noStore);
+      if (!support.available || !(await canUseSnapshots(session.role))) return NextResponse.json({ available: false }, noStore);
       const isOwner = session.role === "owner";
       const snapshots = (await listSnapshots()).map((snapshot) => (isOwner ? snapshot : { ...snapshot, used: undefined }));
+      const preferences = isOwner ? await getPreferences() : null;
       return NextResponse.json({
         available: true,
         snapshots,
-        ...(isOwner ? { dataset: support.dataset, schedule: (await getPreferences()).snapshotSchedule } : {}),
+        ...(preferences ? { dataset: support.dataset, schedule: preferences.snapshotSchedule, access: preferences.snapshotAccess } : {}),
       }, noStore);
     });
   } catch (error) {
@@ -47,7 +51,7 @@ export async function GET(request: Request) {
   }
 }
 
-type SnapshotsBody = { action?: unknown; name?: unknown; snapshot?: unknown; path?: unknown; schedule?: unknown };
+type SnapshotsBody = { action?: unknown; name?: unknown; snapshot?: unknown; path?: unknown; schedule?: unknown; access?: unknown };
 
 function restoredLabel(createdAt: string) {
   const date = new Date(createdAt);
@@ -65,6 +69,7 @@ export async function POST(request: Request) {
       const body = parsed as SnapshotsBody;
       switch (body.action) {
         case "restore": {
+          await assertSnapshotAccess(session.role);
           if (typeof body.snapshot !== "string" || typeof body.path !== "string" || body.path.length > 4096) throw new AppError("Choose a snapshot and an item", 400, "INVALID_REQUEST");
           const item = await snapshotItem(body.snapshot, body.path);
           if (!item.relative) throw new AppError("Choose an item inside the snapshot to restore", 400, "INVALID_REQUEST");
@@ -98,9 +103,16 @@ export async function POST(request: Request) {
           if (!(await snapshotSupport()).available) throw new AppError("Snapshots need the root folder to be on ZFS", 404, "SNAPSHOTS_UNAVAILABLE");
           await savePreferences({ ...(await getPreferences()), snapshotSchedule: schedule, updatedAt: new Date().toISOString() });
           await audit("snapshots.schedule", { username: session.username, schedule });
-          // Applied straight away: a first snapshot if one is due, and pruning to the new limit.
-          if (schedule.frequency !== "off") await runSnapshotSchedule().catch((error: unknown) => console.error("Scheduled snapshot failed", error));
+          // The scheduler that runs from server start picks this up within a few minutes; running it
+          // here as well could race it.
           return NextResponse.json({ ok: true, schedule, snapshots: await listSnapshots(true) }, noStore);
+        }
+        case "access": {
+          assertPermission(session, "owner");
+          const access = parseSnapshotAccess(body.access);
+          await savePreferences({ ...(await getPreferences()), snapshotAccess: access, updatedAt: new Date().toISOString() });
+          await audit("snapshots.access", { username: session.username, access });
+          return NextResponse.json({ ok: true, access, snapshots: await listSnapshots() }, noStore);
         }
         default:
           throw new AppError("Unknown snapshot operation", 400, "UNKNOWN_ACTION");

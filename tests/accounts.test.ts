@@ -506,10 +506,21 @@ test("snapshots: everyone browses inside their folder, editors restore, only the
       return "";
     });
     try {
+      // Only the owner sees snapshots until the owner shares them.
+      assert.deepEqual(await (await call(snapshotsInfo, "/api/fs/snapshots", viewer)).json(), { available: false });
+      assert.equal(await status(call(snapshotDownload, "/api/fs/snapshots/download?snapshot=s1&path=shared/notice.txt", viewer)), 403);
+      assert.equal(await status(call(snapshotsInfo, "/api/fs/snapshots?view=versions&path=home/bob/docs/plan.txt", bob)), 403);
+      assert.equal(await status(call(snapshotsAction, "/api/fs/snapshots", bob, { action: "restore", snapshot: "s1", path: "home/bob/docs/plan.txt" })), 403);
+      assert.equal(await status(call(snapshotsAction, "/api/fs/snapshots", bob, { action: "access", access: "everyone" })), 403);
+      assert.equal(await status(call(snapshotsAction, "/api/fs/snapshots", owner, { action: "access", access: "editors" })), 200);
+      assert.equal((await (await call(snapshotsInfo, "/api/fs/snapshots", bob)).json()).available, true);
+      assert.equal((await (await call(snapshotsInfo, "/api/fs/snapshots", viewer)).json()).available, false);
+      assert.equal(await status(call(snapshotsAction, "/api/fs/snapshots", owner, { action: "access", access: "everyone" })), 200);
+
       const forViewer = await (await call(snapshotsInfo, "/api/fs/snapshots", viewer)).json();
       assert.deepEqual([forViewer.available, forViewer.snapshots[0].used, forViewer.schedule], [true, undefined, undefined]);
       const forOwner = await (await call(snapshotsInfo, "/api/fs/snapshots", owner)).json();
-      assert.deepEqual([forOwner.snapshots[0].used, forOwner.schedule.frequency, forOwner.dataset], [4096, "off", "pool/ct100"]);
+      assert.deepEqual([forOwner.snapshots[0].used, forOwner.schedule.frequency, forOwner.dataset, forOwner.access], [4096, "off", "pool/ct100", "everyone"]);
 
       assert.equal(await status(call(snapshotsAction, "/api/fs/snapshots", bob, { action: "create" })), 403);
       assert.equal(await status(call(snapshotsAction, "/api/fs/snapshots", bob, { action: "schedule", schedule: { frequency: "daily", keep: 7 } })), 403);

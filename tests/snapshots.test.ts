@@ -93,7 +93,36 @@ test("items in snapshots stay inside the account's folder and never go through l
       assert.deepEqual(listing.entries.map((entry) => [entry.name, entry.type]), [["notes.txt", "file"], ["sneaky", "symlink"]]);
     });
     await assert.rejects(snapshotItem("s1", ".filedude/credentials.json"), /reserved/);
+    // A state folder inside the root under another name is just as private.
+    const stateDir = config.stateDir;
+    config.stateDir = path.join(config.root, "var", "filesdude");
+    try {
+      await assert.rejects(snapshotItem("s1", "var/filesdude/users.json"), /reserved/);
+    } finally {
+      config.stateDir = stateDir;
+    }
     await assert.rejects(snapshotItem("nope", "home"), /no longer exists/);
+  });
+});
+
+test("folders download from snapshots as ZIPs for accounts confined to a folder", async () => {
+  await withFakeZfs(async ({ snap }) => {
+    await snap("s1", { "home/bob/project/a.txt": "a", "home/bob/project/sub/b.txt": "b" }, 1_000);
+    const { appendDirectory, reservedPathCheck } = await import("../lib/archives");
+    const { snapshotHandleVerifier } = await import("../lib/snapshots");
+    const { ZipArchive } = await import("archiver");
+    const { constants } = await import("node:fs");
+    await runInScope(editor, async () => {
+      const item = await snapshotItem("s1", "home/bob/project");
+      const handle = await fs.open(item.location, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+      const archive = new ZipArchive();
+      const names: string[] = [];
+      archive.on("entry", (entry) => names.push(entry.name));
+      archive.resume();
+      await appendDirectory(archive, handle, item.location, "project", await reservedPathCheck(), undefined, true, snapshotHandleVerifier(item.location));
+      await archive.finalize();
+      assert.deepEqual(names.sort(), ["project/a.txt", "project/sub/", "project/sub/b.txt"]);
+    });
   });
 });
 

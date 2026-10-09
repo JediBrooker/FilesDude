@@ -2,6 +2,8 @@ import { execFile } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import type { FileHandle } from "node:fs/promises";
+import { config } from "./config";
 import { ensureRoot, getMime, INTERNAL_NAMES, normalizeRelative } from "./files";
 import { AppError } from "./http";
 import { withinScope } from "./scope";
@@ -20,6 +22,8 @@ type Dataset = { dataset: string; mountpoint: string; offset: string };
 export type ZfsRunner = (args: string[]) => Promise<string>;
 const ZFS_BINARIES = ["/usr/sbin/zfs", "/sbin/zfs", "/usr/local/sbin/zfs"];
 const INFO_CACHE_MS = 30_000;
+// Previous versions look through at most this many of the newest snapshots: each look mounts one.
+const MAX_VERSION_SNAPSHOTS = 100;
 let runner: ZfsRunner | null | undefined;
 let cachedDataset: { at: number; value: Dataset | null } | null = null;
 let cachedSnapshots: { at: number; value: Snapshot[] } | null = null;
@@ -141,11 +145,16 @@ function entryType(stat: { isFile(): boolean; isDirectory(): boolean; isSymbolic
  */
 export async function snapshotItem(snapshotName: string, relativePath: string) {
   const dataset = await requireDataset();
-  const snapshot = (await listSnapshots()).find((item) => item.name === snapshotName) ?? (await listSnapshots(true)).find((item) => item.name === snapshotName);
+  // From the cached list, so asking for names that don't exist can't make zfs run on every request.
+  const snapshot = (await listSnapshots()).find((item) => item.name === snapshotName);
   if (!snapshot) throw new AppError("That snapshot no longer exists", 404, "NOT_FOUND");
   const relative = normalizeRelative(relativePath).replace(/\/+$/, "");
   if (!withinScope(relative)) throw new AppError("That location is outside your folder", 403, "OUTSIDE_SCOPE");
-  if (relative.split("/").some((part) => INTERNAL_NAMES.has(part))) throw new AppError("That path is reserved by FilesDude", 403, "RESERVED_PATH");
+  const reserved = new AppError("That path is reserved by FilesDude", 403, "RESERVED_PATH");
+  if (relative.split("/").some((part) => INTERNAL_NAMES.has(part))) throw reserved;
+  // A state folder inside the root (FILEDUDE_STATE_DIR) is as private in a snapshot as it is live.
+  const stateRelative = path.relative(await ensureRoot(), path.resolve(config.stateDir)).split(path.sep).join("/");
+  if (stateRelative && !stateRelative.startsWith("..") && !path.isAbsolute(stateRelative) && (relative === stateRelative || relative.startsWith(`${stateRelative}/`))) throw reserved;
   const base = path.join(dataset.mountpoint, ".zfs", "snapshot", snapshot.name, dataset.offset);
   const location = relative ? path.join(base, ...relative.split("/")) : base;
   const folder = path.dirname(location);
@@ -156,6 +165,15 @@ export async function snapshotItem(snapshotName: string, relativePath: string) {
   const stat = await fs.lstat(location).catch(() => null);
   if (!stat) throw notFound();
   return { snapshot, relative, location, folder, name: path.basename(location), stat };
+}
+
+/** Checks an opened handle is inside `base` (a folder in a snapshot), for walking it as an archive. */
+export function snapshotHandleVerifier(base: string) {
+  return async (handle: FileHandle, location: string) => {
+    const openedPath = process.platform === "linux" ? await fs.realpath(`/proc/self/fd/${handle.fd}`) : await fs.realpath(location);
+    if (openedPath !== base && !openedPath.startsWith(`${base}/`)) throw new AppError("That item isn't inside the snapshot folder", 403, "PATH_OUTSIDE_ROOT");
+    return { openedPath, stat: await handle.stat() };
+  };
 }
 
 const toEntry = (name: string, relative: string, stat: Awaited<ReturnType<typeof fs.lstat>>): SnapshotEntry => {
@@ -184,7 +202,7 @@ export async function listSnapshotFolder(snapshotName: string, relativePath: str
 export async function itemVersions(relativePath: string, current: { size: number; modified: string } | null) {
   const versions: SnapshotVersion[] = [];
   let previous = current ? `${current.size}:${current.modified}` : "";
-  for (const snapshot of await listSnapshots()) {
+  for (const snapshot of (await listSnapshots()).slice(0, MAX_VERSION_SNAPSHOTS)) {
     const item = await snapshotItem(snapshot.name, relativePath).catch((error: unknown) => {
       if (error instanceof AppError && (error.code === "NOT_FOUND" || error.code === "SNAPSHOT_LINK")) return null;
       throw error;
