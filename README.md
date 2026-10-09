@@ -27,6 +27,7 @@ FilesDude is a secure, self-hosted web file manager designed for a Proxmox host,
 - Signed, expiring, HTTP-only, SameSite login sessions; scrypt password hashes; login throttling; same-origin mutation checks; and hardened response headers
 - Account preferences for changing the username and password; credential changes invalidate other sessions
 - Optional two-factor sign-in for every account with an authenticator app (6-digit codes), with one-time recovery codes
+- Duplicate finder (owner): scan a folder for files with identical contents, see which copies waste the most space, and move extra copies to the trash, always keeping one of each
 - ZFS snapshots: when the root is a ZFS dataset, browse earlier versions of files ("Previous versions" or **Snapshots**), download them, and restore them beside the current version; the owner can take snapshots or schedule them hourly or daily
 - User accounts: the owner (the installer's login) can add editors (view and change files) and viewers (view and download only), each confined to one folder, from **Users** in the sidebar
 - Multi-selection toolbar actions, responsive UI, dark mode, keyboard shortcuts, and no external analytics or storage services
@@ -226,6 +227,23 @@ copy and revoke buttons.
   anyone on the network path; use HTTPS for anything sensitive.
 - Set `FILEDUDE_SHARING_ENABLED=false` to turn sharing off entirely.
 
+## Duplicate files
+
+The owner can open **Duplicates** in the sidebar, choose a folder (or everything) and a
+minimum size, and scan for files with identical contents.
+
+- Files are grouped by size, then narrowed by comparing a few blocks of each, and only
+  files that still match are read in full and compared by SHA-256, so every set shown is
+  an exact byte-for-byte match. Files are read one at a time, so a large tree takes a
+  while; the scan runs in the background and can be cancelled.
+- Hard links to the same file are the same data, not duplicates; they're marked
+  "hard-linked" and count once.
+- Sets are listed by the space their extra copies take. Pick copies by hand or with "All
+  but the oldest" / "All but the newest", then move them to the trash. At least one copy
+  of each set is always kept, and nothing is deleted outright (protected trash must be
+  on), so a mistake can be restored from the trash.
+- Removing a copy that a torrent client is still seeding breaks that torrent.
+
 ## Snapshots (ZFS)
 
 When `FILEDUDE_ROOT` is on a ZFS dataset (such as a Proxmox container's
@@ -350,7 +368,8 @@ Shortcuts are ignored while you are typing in a field such as search.
 The safest default set is already included. These are strong next additions when you need them:
 
 - OIDC single sign-on, and passkeys for installations served over HTTPS
-- Duplicate detection, video thumbnails, media metadata, and an index for searching file contents on very large trees
+- Video thumbnails, media metadata, and an index for searching file contents on very large trees
+- Replacing duplicate files with hard links (keeping every path, freeing the space)
 - Antivirus scanning and upload quarantine for environments with untrusted uploaders
 - SFTP/SMB/NFS connection profiles for managing remote roots without mounting them into the app container
 

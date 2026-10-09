@@ -28,6 +28,8 @@ import { GET as jobsStatus, POST as jobsAction } from "../app/api/fs/jobs/route"
 import { GET as snapshotsInfo, POST as snapshotsAction } from "../app/api/fs/snapshots/route";
 import { GET as snapshotDownload } from "../app/api/fs/snapshots/download/route";
 import { setZfsRunner } from "../lib/snapshots";
+import { GET as duplicatesInfo, POST as duplicatesAction } from "../app/api/fs/duplicates/route";
+import { waitForDuplicateScan } from "../lib/duplicates";
 import { GET as sharesList } from "../app/api/shares/route";
 import { GET as usersList, POST as usersAction } from "../app/api/users/route";
 
@@ -544,6 +546,26 @@ test("snapshots: everyone browses inside their folder, editors restore, only the
     } finally {
       setZfsRunner(undefined as never);
     }
+  });
+});
+
+test("only the owner scans for duplicates, and removing them moves copies to the trash", async () => {
+  await withAccounts(async ({ root, owner, bob }) => {
+    const content = Buffer.alloc(2 * 1024 * 1024, 7);
+    await fs.writeFile(path.join(root, "shared", "one.bin"), content);
+    await fs.writeFile(path.join(root, "home", "bob", "two.bin"), content);
+    assert.equal(await status(call(duplicatesInfo, "/api/fs/duplicates", bob)), 403);
+    assert.equal(await status(call(duplicatesAction, "/api/fs/duplicates", bob, { action: "scan", path: "home/bob" })), 403);
+    assert.equal(await status(call(duplicatesAction, "/api/fs/duplicates", owner, { action: "scan", path: "", minBytes: 1024 * 1024 })), 200);
+    await waitForDuplicateScan();
+    const report = (await (await call(duplicatesInfo, "/api/fs/duplicates", owner)).json()).report;
+    assert.equal(report.totalGroups, 1);
+    assert.equal(await status(call(duplicatesAction, "/api/fs/duplicates", owner, { action: "trash", paths: ["shared/one.bin", "home/bob/two.bin"] })), 400);
+    const trashed = await (await call(duplicatesAction, "/api/fs/duplicates", owner, { action: "trash", paths: ["home/bob/two.bin"] })).json();
+    assert.equal(trashed.result.trashed.length, 1);
+    assert.equal(trashed.report.totalGroups, 0);
+    await assert.rejects(fs.lstat(path.join(root, "home", "bob", "two.bin")));
+    assert.equal((await (await call(trashList, "/api/fs/trash", owner)).json()).items[0].name, "two.bin");
   });
 });
 
