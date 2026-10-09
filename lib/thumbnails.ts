@@ -20,7 +20,7 @@ sharp.concurrency(1);
  * renamed to .png never reaches its decoder.
  */
 export const THUMBNAIL_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp", "image/avif"]);
-const DECODED_FORMATS = new Set(["jpeg", "png", "gif", "webp", "heif"]);
+export const DECODED_FORMATS = new Set(["jpeg", "png", "gif", "webp", "heif"]);
 /** Videos get a thumbnail from one frame, taken in a sandbox (see video-frames.ts), when available. */
 export const VIDEO_THUMBNAIL_TYPES = new Set(["video/mp4", "video/webm", "video/x-matroska", "video/quicktime", "video/x-msvideo"]);
 const DECODE_TIMEOUT_SECONDS = 10;
@@ -37,7 +37,7 @@ const failedVideos = new Map<string, number>();
 
 // A queue allowing a few thumbnails to be made at once. Images and videos have separate queues,
 // so slow videos never hold up images.
-function limiter(maxActive: number, maxWaiting: number) {
+export function limiter(maxActive: number, maxWaiting: number) {
   let active = 0;
   const waiting: Array<() => void> = [];
   return {
@@ -106,7 +106,7 @@ async function usableCacheDirectory() {
 
 // Reads at most the size measured when the file was opened, refusing a file that has since grown,
 // so a sparse file enlarged mid-request can't force a huge allocation.
-async function readExactly(handle: Awaited<ReturnType<typeof fs.open>>, size: number) {
+export async function readExactly(handle: Awaited<ReturnType<typeof fs.open>>, size: number) {
   const buffer = Buffer.alloc(size + 1);
   let offset = 0;
   while (offset < buffer.length) {

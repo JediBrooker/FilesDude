@@ -18,6 +18,7 @@ FilesDude is a secure, self-hosted web file manager designed for a Proxmox host,
 - Inline previews for text, code, JSON, images, PDF, audio, and video; media uses byte-range streaming
 - Image thumbnails in grid view (JPEG, PNG, GIF, WebP, and AVIF up to 64 MB), generated on the server with EXIF rotation applied and all metadata stripped, and cached in the state directory
 - Video thumbnails in grid view (MP4, MKV, MOV, WebM, AVI, of any size) when ffmpeg is installed, taken by ffmpeg in a throwaway, locked-down systemd sandbox
+- Media details in Properties: an image's dimensions, format, colour, frames, and the camera and date taken from EXIF; a video's or audio file's length, resolution, frame rate, codecs, channels, bit rate, and title/artist/album tags (audio and video need ffmpeg, and are read by ffprobe in the same sandbox as video thumbnails)
 - SHA-256 and MD5 checksums in Properties, calculated automatically for files up to 64 MB, with copy buttons and a field to compare against an expected checksum
 - POSIX `chmod` and numeric `chown` for one or many items
 - Bulk rename with find/replace, regular expressions, prefix, suffix, sequential numbering, live conflict detection, and two-phase application
@@ -244,6 +245,11 @@ a time, separately from images, and a video no frame could be taken from isn't t
 again for six hours unless it changes. Set `FILEDUDE_VIDEO_THUMBNAILS=false` to turn this
 off.
 
+The same sandbox runs ffprobe (`/usr/bin/ffprobe`, or set `FILEDUDE_FFPROBE_PATH`) for the
+length, resolution, codecs, and tags shown under **Video** or **Audio** in Properties; set
+`FILEDUDE_MEDIA_INFO=false` to turn that off. Image details are read by sharp from images
+up to 64 MB.
+
 ## Duplicate files
 
 The owner can open **Duplicates** in the sidebar, choose a folder (or everything) and a
@@ -394,7 +400,7 @@ Shortcuts are ignored while you are typing in a field such as search.
 The safest default set is already included. These are strong next additions when you need them:
 
 - OIDC single sign-on, and passkeys for installations served over HTTPS
-- Media metadata (duration, resolution, codecs) and an index for searching file contents on very large trees
+- An index for searching file contents on very large trees
 - Antivirus scanning and upload quarantine for environments with untrusted uploaders
 - SFTP/SMB/NFS connection profiles for managing remote roots without mounting them into the app container
 
