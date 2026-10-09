@@ -9,7 +9,33 @@ export interface StoredPreferences {
   uploadOwnership: UploadOwnershipPreference;
   /** Days trashed items are kept before being deleted forever; null keeps them until removed by hand. */
   trashRetentionDays: number | null;
+  snapshotSchedule: SnapshotSchedule;
+  /** Which accounts besides the owner may browse, download from, and restore from snapshots. */
+  snapshotAccess: SnapshotAccess;
   updatedAt?: string;
+}
+
+export type SnapshotAccess = "owner" | "editors" | "everyone";
+
+export function parseSnapshotAccess(value: unknown): SnapshotAccess {
+  if (value === "owner" || value === "editors" || value === "everyone") return value;
+  throw new AppError("Choose who can see snapshots: only the owner, editors too, or everyone", 400, "INVALID_SNAPSHOT_ACCESS");
+}
+
+/** Automatic ZFS snapshots: how often, and how many of FilesDude's automatic ones to keep. */
+export interface SnapshotSchedule {
+  frequency: "off" | "hourly" | "daily";
+  keep: number;
+}
+
+export const MAX_SNAPSHOTS_KEPT = 1000;
+
+export function parseSnapshotSchedule(value: unknown): SnapshotSchedule {
+  const candidate = value && typeof value === "object" ? value as { frequency?: unknown; keep?: unknown } : {};
+  if ((candidate.frequency === "off" || candidate.frequency === "hourly" || candidate.frequency === "daily") && Number.isInteger(candidate.keep) && Number(candidate.keep) >= 1 && Number(candidate.keep) <= MAX_SNAPSHOTS_KEPT) {
+    return { frequency: candidate.frequency, keep: Number(candidate.keep) };
+  }
+  throw new AppError(`Choose off, hourly, or daily, keeping 1 to ${MAX_SNAPSHOTS_KEPT} snapshots`, 400, "INVALID_SNAPSHOT_SCHEDULE");
 }
 
 export const MAX_TRASH_RETENTION_DAYS = 3650;
@@ -17,7 +43,7 @@ export const MAX_TRASH_RETENTION_DAYS = 3650;
 function preferencesFile() {
   return path.join(config.stateDir, "preferences.json");
 }
-const defaults: StoredPreferences = { uploadOwnership: { mode: "destination" }, trashRetentionDays: null };
+const defaults: StoredPreferences = { uploadOwnership: { mode: "destination" }, trashRetentionDays: null, snapshotSchedule: { frequency: "off", keep: 24 }, snapshotAccess: "owner" };
 
 export function parseTrashRetention(value: unknown): number | null {
   if (value === null) return null;
@@ -41,6 +67,8 @@ export async function getPreferences(): Promise<StoredPreferences> {
     return {
       uploadOwnership: value.uploadOwnership ? parseUploadOwnershipPreference(value.uploadOwnership) : defaults.uploadOwnership,
       trashRetentionDays: value.trashRetentionDays === undefined ? defaults.trashRetentionDays : parseTrashRetention(value.trashRetentionDays),
+      snapshotSchedule: value.snapshotSchedule === undefined ? defaults.snapshotSchedule : parseSnapshotSchedule(value.snapshotSchedule),
+      snapshotAccess: value.snapshotAccess === undefined ? defaults.snapshotAccess : parseSnapshotAccess(value.snapshotAccess),
       updatedAt: typeof value.updatedAt === "string" ? value.updatedAt : undefined,
     };
   } catch (error) {

@@ -116,7 +116,13 @@ export function appendFileAndWait(archive: Archiver, stream: Readable, name: str
  * verifying every opened entry is inside the root and leaving out anything `skip` matches.
  * Children are opened relative to the directory's own descriptor. Takes ownership of `handle`.
  */
-export async function appendDirectory(archive: Archiver, handle: FileHandle, openedPath: string, archivePath: string, skip: (openedPath: string) => boolean, signal?: AbortSignal, storeLinks = true) {
+export type HandleVerifier = (handle: FileHandle, location: string) => Promise<{ openedPath: string; stat: Stats }>;
+
+/**
+ * Adds a folder's contents to an archive through its open handle. `verify` checks each opened child
+ * is where it should be: inside the root by default, or inside a snapshot folder for snapshots.
+ */
+export async function appendDirectory(archive: Archiver, handle: FileHandle, openedPath: string, archivePath: string, skip: (openedPath: string) => boolean, signal?: AbortSignal, storeLinks = true, verify: HandleVerifier = verifyFileHandleWithinRoot) {
   const directoryPath = ON_LINUX ? `/proc/self/fd/${handle.fd}` : openedPath;
   let directory;
   try {
@@ -152,13 +158,13 @@ export async function appendDirectory(archive: Archiver, handle: FileHandle, ope
       }
 
       try {
-        const verified = await verifyFileHandleWithinRoot(childHandle, path.join(openedPath, entry.name));
+        const verified = await verify(childHandle, path.join(openedPath, entry.name));
         if (skip(verified.openedPath)) continue;
         if (verified.stat.isDirectory()) {
           archive.append(Buffer.alloc(0), { name: `${childArchivePath}/`, type: "directory", stats: verified.stat });
           const nested = childHandle;
           childHandle = null;
-          await appendDirectory(archive, nested, verified.openedPath, childArchivePath, skip, signal, storeLinks);
+          await appendDirectory(archive, nested, verified.openedPath, childArchivePath, skip, signal, storeLinks, verify);
         } else if (verified.stat.isFile()) {
           const stream = childHandle.createReadStream();
           childHandle = null;
