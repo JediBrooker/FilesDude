@@ -1,5 +1,5 @@
 import { audit } from "./audit";
-import { purgeExpiredTrash } from "./files";
+import { purgeExpiredTrash, type TrashPurgeResult } from "./files";
 import { getPreferences } from "./preferences";
 import { runUnscoped } from "./scope";
 
@@ -10,17 +10,24 @@ const FIRST_CHECK_MS = 10_000;
 let started = false;
 let running: Promise<number> | null = null;
 
-/** Purges expired trash now, as the service rather than any account. Returns how many items went. */
+const currentRetention = async () => (await getPreferences()).trashRetentionDays;
+
+/**
+ * Purges expired trash now, as the service rather than any account. Returns how many items went.
+ * Whatever was removed is audited, even if the run stopped part-way.
+ */
 export function runTrashRetention(): Promise<number> {
   running ??= runUnscoped(async () => {
+    let outcome: TrashPurgeResult = { removed: [], failed: 0 };
     try {
-      const days = (await getPreferences()).trashRetentionDays;
-      if (!days) return 0;
-      const removed = await purgeExpiredTrash(days);
-      if (removed) await audit("trash.purge", { removed, retentionDays: days });
-      return removed;
+      if (!(await currentRetention())) return 0;
+      outcome = await purgeExpiredTrash(currentRetention);
+      return outcome.removed.length;
     } finally {
       running = null;
+      if (outcome.removed.length || outcome.failed) {
+        await audit("trash.purge", { removed: outcome.removed.length, items: outcome.removed, failed: outcome.failed, retentionDays: await currentRetention().catch(() => null) });
+      }
     }
   });
   return running;

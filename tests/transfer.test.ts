@@ -306,11 +306,51 @@ test("trash retention removes only items deleted longer ago than the setting", a
     await fs.writeFile(path.join(itemsDir, "undated"), "x");
     await fs.writeFile(path.join(infoDir, "undated.json"), "not json");
 
-    assert.equal(await purgeExpiredTrash(30), 3);
+    // An item with no known deletion time is kept however old it is.
+    const old = new Date(Date.now() - 400 * 86_400_000);
+    await fs.utimes(path.join(itemsDir, "undated"), old, old);
+
+    const thirtyDays = async () => 30;
+    const first = await purgeExpiredTrash(thirtyDays);
+    assert.equal(first.removed.length, 3);
+    assert.equal(first.failed, 0);
+    assert.deepEqual(first.removed.map((item) => item.originalPath).sort((a, b) => String(a).localeCompare(String(b))), [null, "old-folder", "old.txt"]);
     const left = (await listTrash()).items.map((item) => item.name).sort();
     assert.deepEqual(left, ["recent.txt", "undated"]);
     assert.ok(!(await fs.readdir(infoDir)).some((name) => trashed.some((item) => item.path !== "recent.txt" && name === `${item.id}.json`)));
-    assert.equal(await purgeExpiredTrash(30), 0);
+    assert.deepEqual(await purgeExpiredTrash(thirtyDays), { removed: [], failed: 0 });
+  });
+});
+
+test("an item that can't be removed doesn't stop the purge, and turning retention off stops a run", async () => {
+  await withTempRoot(async (root) => {
+    const backdate = async (id: string) => {
+      const infoPath = path.join(root, ".filedude", "trash-info", `${id}.json`);
+      const info = JSON.parse(await fs.readFile(infoPath, "utf8"));
+      await fs.writeFile(infoPath, JSON.stringify({ ...info, deletedAt: new Date(Date.now() - 40 * 86_400_000).toISOString() }));
+    };
+    // A folder nested deeper than delete allows, plus ordinary items.
+    let deep = path.join(root, "deep");
+    await fs.mkdir(deep);
+    for (let level = 0; level < 260; level += 1) {
+      deep = path.join(deep, "d");
+      await fs.mkdir(deep);
+    }
+    for (const name of ["a.txt", "b.txt", "c.txt"]) await fs.writeFile(path.join(root, name), name);
+    const { trashed } = await deleteEntries(["deep", "a.txt", "b.txt", "c.txt"]);
+    for (const item of trashed) await backdate(item.id);
+
+    const result = await purgeExpiredTrash(async () => 30);
+    assert.equal(result.failed, 1);
+    assert.deepEqual(result.removed.map((item) => item.originalPath).sort(), ["a.txt", "b.txt", "c.txt"]);
+    assert.deepEqual((await listTrash()).items.map((item) => item.name), ["deep"]);
+
+    // Retention switched off part-way: nothing more is removed.
+    for (const name of ["x.txt", "y.txt"]) await fs.writeFile(path.join(root, name), name);
+    for (const item of (await deleteEntries(["x.txt", "y.txt"])).trashed) await backdate(item.id);
+    let checks = 0;
+    const stopped = await purgeExpiredTrash(async () => (checks++ === 0 ? 30 : null));
+    assert.ok(stopped.removed.length <= 1, `${stopped.removed.length} removed after retention was turned off`);
   });
 });
 
@@ -326,6 +366,9 @@ test("the retention run does nothing until the owner chooses a period", async ()
     await savePreferences({ ...(await getPreferences()), trashRetentionDays: 7 });
     assert.equal(await runTrashRetention(), 1);
     assert.deepEqual((await listTrash()).items, []);
+    const audited = (await fs.readFile(path.join(root, ".filedude", "audit.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    const purge = audited.find((entry) => entry.event === "trash.purge");
+    assert.deepEqual([purge?.removed, purge?.items?.[0]?.originalPath, purge?.failed, purge?.retentionDays], [1, "a.txt", 0, 7]);
   });
 });
 

@@ -913,6 +913,10 @@ async function readTrashInfo(trash: TrashDirectories, id: string): Promise<Trash
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw error;
   }
+  return parseTrashInfo(raw);
+}
+
+function parseTrashInfo(raw: string): TrashInfo | null {
   try {
     const parsed = JSON.parse(raw) as Partial<TrashInfo>;
     if (typeof parsed.originalPath !== "string" || !parsed.originalPath || typeof parsed.deletedAt !== "string") return null;
@@ -1069,37 +1073,90 @@ export async function deleteTrashItems(ids: string[]) {
   return { removed: ids.length };
 }
 
-// When an item went to the trash: from its record, the timestamp in a legacy name, or its change time.
-async function trashDeletedAt(trash: TrashDirectories, id: string) {
-  const info = await readTrashInfo(trash, id).catch(() => null);
-  if (info) return Date.parse(info.deletedAt);
-  const legacy = LEGACY_TRASH_ID.exec(id);
-  if (legacy) return Number(legacy[2]);
-  const stat = await fs.lstat(path.join(trash.items, id)).catch(() => null);
-  return stat ? stat.ctimeMs : Number.NaN;
+// Opens one of FilesDude's trash folders for a whole purge run, refusing it unless it is still the
+// real folder at that location and owned by this service.
+async function openVerifiedTrashFolder(location: string) {
+  const folder = await openTrashFolder(location);
+  try {
+    const opened = await openedHandlePath(folder.handle, location);
+    if (opened !== location || (typeof process.getuid === "function" && folder.stat.uid !== process.getuid())) {
+      throw new AppError("FilesDude's trash folder is not a regular folder inside the root", 500, "TRASH_UNSAFE");
+    }
+    return folder;
+  } catch (error) {
+    await folder.handle.close().catch(() => undefined);
+    throw error;
+  }
 }
 
-/**
- * Permanently removes trash items deleted more than `days` days ago, taking the filesystem lock one
- * item at a time so other work isn't held up. Items with no readable deletion time are kept.
- * Returns how many were removed.
- */
-export async function purgeExpiredTrash(days: number, now = Date.now()) {
-  const trash = await trashDirectories();
-  if (!trash) return 0;
-  const cutoff = now - days * 86_400_000;
-  let removed = 0;
-  for (const id of await fs.readdir(trash.items)) {
-    const deletedAt = await trashDeletedAt(trash, id);
-    if (!Number.isFinite(deletedAt) || deletedAt >= cutoff) continue;
-    await withFilesystemLock(async () => {
-      await withOpen(openTrashFolder(trash.items), (items) => removeEntry(items, id));
-      await fs.rm(path.join(trash.info, `${id}.json`), { force: true });
-      legacyTrashSizes.delete(id);
-    });
-    removed += 1;
+// An item's record, read through the open records folder without following links; null if it is
+// missing or unreadable.
+async function readTrashRecord(info: AnchoredDirectory, id: string) {
+  const handle = await fs.open(inside(info, `${id}.json`), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK).catch(() => null);
+  if (!handle) return null;
+  try {
+    const stat = await handle.stat();
+    return stat.isFile() && stat.size <= 64 * 1024 ? parseTrashInfo(await handle.readFile("utf8")) : null;
+  } catch {
+    return null;
+  } finally {
+    await handle.close().catch(() => undefined);
   }
-  return removed;
+}
+
+// When an item went to the trash, from its record or the timestamp in a legacy name. Anything else
+// has no known deletion time.
+function trashDeletedAt(record: TrashInfo | null, id: string) {
+  if (record) return Date.parse(record.deletedAt);
+  const legacy = LEGACY_TRASH_ID.exec(id);
+  return legacy ? Number(legacy[2]) : Number.NaN;
+}
+
+export type TrashPurgeResult = { removed: Array<{ id: string; originalPath: string | null }>; failed: number };
+
+/**
+ * Permanently removes trash items deleted longer ago than `retentionDays()` allows. The setting is
+ * read again before each removal, so changing it stops a run in progress. The filesystem lock is
+ * taken one item at a time, so other work isn't held up, and an item that can't be removed is
+ * logged and skipped rather than stopping the run. Items with no known deletion time are kept.
+ * Both trash folders are opened once and verified, and everything goes through those handles.
+ */
+export async function purgeExpiredTrash(retentionDays: () => Promise<number | null>, now = () => Date.now()): Promise<TrashPurgeResult> {
+  const result: TrashPurgeResult = { removed: [], failed: 0 };
+  const trash = await trashDirectories();
+  if (!trash) return result;
+  const items = await openVerifiedTrashFolder(trash.items);
+  try {
+    const info = await openVerifiedTrashFolder(trash.info);
+    try {
+      for (const id of await fs.readdir(items.base)) {
+        const record = await readTrashRecord(info, id);
+        const deletedAt = trashDeletedAt(record, id);
+        if (!Number.isFinite(deletedAt)) continue;
+        try {
+          const outcome = await withFilesystemLock(async () => {
+            const days = await retentionDays();
+            if (!days) return "stop";
+            if (deletedAt >= now() - days * 86_400_000) return "keep";
+            await removeEntry(items, id);
+            await fs.unlink(inside(info, `${id}.json`)).catch(() => undefined);
+            legacyTrashSizes.delete(id);
+            result.removed.push({ id, originalPath: record?.originalPath ?? null });
+            return "removed";
+          });
+          if (outcome === "stop") break;
+        } catch (error) {
+          result.failed += 1;
+          console.error(`Could not purge trash item ${id}`, error);
+        }
+      }
+    } finally {
+      await info.handle.close().catch(() => undefined);
+    }
+  } finally {
+    await items.handle.close().catch(() => undefined);
+  }
+  return result;
 }
 
 export async function emptyTrash() {
