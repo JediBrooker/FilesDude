@@ -15,7 +15,7 @@ FilesDude is a secure, self-hosted web file manager designed for a Proxmox host,
 - Direct file downloads and ZIP downloads for folders; select several items (from one folder or from search results) to download them together as one ZIP
 - Share links: let anyone with a private link download a file (or a folder as a ZIP) without signing in, for 1 hour to 30 days and optionally a limited number of downloads; links can be revoked at any time, follow renames and moves, and every download is audited
 - Compress selected items into `.zip` or `.tar.gz` and extract `.zip`, `.tar`, `.tar.gz`, and `.tgz` archives into a new folder, as background jobs with progress and cancel; extraction refuses archives with absolute or `..` paths, never creates links or devices, and stops before filling the disk
-- Inline previews for text, code, JSON, images, PDF, audio, and video; media uses byte-range streaming
+- Inline previews for text, code, JSON, images, PDF, audio, and video; media uses byte-range streaming. Step through a folder's files with the arrow keys, the on-screen arrows, or a swipe on touch screens; neighbouring photos load ahead
 - Image thumbnails in grid view (JPEG, PNG, GIF, WebP, and AVIF up to 64 MB), generated on the server with EXIF rotation applied and all metadata stripped, and cached in the state directory
 - Video thumbnails in grid view (MP4, MKV, MOV, WebM, AVI, of any size) when ffmpeg is installed, taken by ffmpeg in a throwaway, locked-down systemd sandbox
 - Media details in Properties: an image's dimensions, format, colour, frames, and the camera and date taken from EXIF; a video's or audio file's length, resolution, frame rate, codecs, channels, bit rate, and title/artist/album tags (audio and video need ffmpeg, and are read by ffprobe in the same sandbox as video thumbnails)
@@ -394,7 +394,7 @@ The container runs as UID/GID `1001:1001` by default. Give that account access t
 - `Command/Ctrl + X`, `C`, `V`: cut or copy the selection, then paste it into the open folder
 - `Command/Ctrl + Z`: undo the latest rename, move, copy, or delete
 - `F2`: rename the selected item
-- `Space`: preview the selected file
+- `Space`: preview the selected file; in a preview, `←` and `→` step to the previous or next file
 - `Delete`: delete selected items
 
 Shortcuts are ignored while you are typing in a field such as search.

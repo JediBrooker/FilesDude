@@ -9,6 +9,7 @@ import {
   Camera,
   Check,
   ChevronDown,
+  ChevronLeft,
   ChevronRight,
   ChevronsUpDown,
   ChevronUp,
@@ -112,7 +113,8 @@ type DialogState =
   | { kind: "ownership" }
   | { kind: "transfer"; mode: "copy" | "move" }
   | { kind: "bulk" }
-  | { kind: "preview"; entry: FileEntry }
+  // `siblings` are the files previous/next step through (the folder's files, in its order).
+  | { kind: "preview"; entry: FileEntry; siblings?: FileEntry[] }
   | { kind: "edit"; entry: FileEntry }
   | { kind: "preferences" }
   | { kind: "twoFactor" }
@@ -648,9 +650,22 @@ export function FileManager() {
     window.history.go(direction);
   };
 
+  // Files in the listing's order that the preview can step through.
+  const previewSiblings = () => sortedEntries.filter((item) => item.type === "file" && !item.symlinkBlocked);
+
   const openEntry = (entry: FileEntry) => {
     if (entry.type === "directory") navigate(entry.path);
-    else if (!entry.symlinkBlocked) setDialog({ kind: "preview", entry });
+    else if (!entry.symlinkBlocked) setDialog({ kind: "preview", entry, siblings: previewSiblings() });
+  };
+
+  // Stepping through a preview moves the selection along, so closing it leaves you on that file.
+  const showPreview = (entry: FileEntry, siblings?: FileEntry[]) => {
+    setDialog({ kind: "preview", entry, siblings });
+    if (siblings) {
+      setSelected(new Set([entry.path]));
+      setCursor(entry.path);
+      anchorRef.current = entry.path;
+    }
   };
 
   const selectEntry = (entry: FileEntry, { additive = false, range = false }: SelectOptions = {}) => {
@@ -1184,7 +1199,7 @@ export function FileManager() {
       }
       if (event.key === " " && single?.type === "file") {
         event.preventDefault();
-        setDialog({ kind: "preview", entry: single });
+        setDialog({ kind: "preview", entry: single, siblings: previewSiblings() });
       }
     }
     window.addEventListener("keydown", onKeyDown);
@@ -1424,7 +1439,7 @@ export function FileManager() {
           onCredentialsUpdated={async () => { setDialog(null); await refreshAuth(); notify("Account preferences updated"); }}
           onTwoFactor={() => setDialog({ kind: "twoFactor" })}
           onReveal={(entry) => { setDialog(null); navigate(entry.path.split("/").slice(0, -1).join("/")); }}
-          onPreview={(entry) => setDialog({ kind: "preview", entry })}
+          onPreview={showPreview}
         />
       )}
       {menu && createPortal(menu.kind === "entry"
@@ -1789,7 +1804,7 @@ function DialogHost({ dialog, selected, currentPath, username, role, home, onClo
   onCredentialsUpdated: () => Promise<void>;
   onTwoFactor: () => void;
   onReveal: (entry: FileEntry) => void;
-  onPreview: (entry: FileEntry) => void;
+  onPreview: (entry: FileEntry, siblings?: FileEntry[]) => void;
 }) {
   if (dialog.kind === "upload") return <UploadDialog files={dialog.files} currentPath={currentPath} chooseOwnership={role === "owner"} onClose={onClose} notify={notify} onComplete={onRefresh} />;
   if (dialog.kind === "users") return <UsersDialog onClose={onClose} notify={notify} />;
@@ -1806,7 +1821,10 @@ function DialogHost({ dialog, selected, currentPath, username, role, home, onClo
   if (dialog.kind === "ownership") return <OwnershipDialog entries={selected} onClose={onClose} onRun={onRun} />;
   if (dialog.kind === "transfer") return <TransferDialog mode={dialog.mode} entries={selected} startPath={currentPath} home={home} onClose={onClose} onTransfer={onTransfer} />;
   if (dialog.kind === "bulk") return <BulkRenameDialog entries={selected} onClose={onClose} notify={notify} onRefresh={onRefresh} />;
-  if (dialog.kind === "preview") return <PreviewDialog entry={dialog.entry} onClose={onClose} />;
+  if (dialog.kind === "preview") {
+    const { siblings } = dialog;
+    return <PreviewDialog key={dialog.entry.path} entry={dialog.entry} siblings={siblings} onStep={(entry) => onPreview(entry, siblings)} onClose={onClose} />;
+  }
   if (dialog.kind === "edit") return <EditDialog entry={dialog.entry} onClose={onClose} onRun={onRun} />;
   if (dialog.kind === "twoFactor") return <TwoFactorDialog onClose={onClose} notify={notify} />;
   if (dialog.kind === "snapshots") return <SnapshotsDialog isOwner={role === "owner"} canWrite={canWrite} home={home} onClose={onClose} notify={notify} onJob={onJob} />;
@@ -3195,10 +3213,55 @@ function UsersDialog({ onClose, notify }: { onClose: () => void; notify: (messag
   );
 }
 
-function PreviewDialog({ entry, onClose }: { entry: FileEntry; onClose: () => void }) {
+// Neighbouring images up to this size are fetched ahead, so stepping through photos is instant.
+const PRELOAD_IMAGE_BYTES = 32 * 1024 * 1024;
+
+function PreviewDialog({ entry, siblings = [], onStep, onClose }: { entry: FileEntry; siblings?: FileEntry[]; onStep: (entry: FileEntry) => void; onClose: () => void }) {
   const [text, setText] = useState<string | null>(null);
   const [error, setError] = useState("");
+  const touchStart = useRef<{ x: number; y: number } | null>(null);
   const url = `/api/fs/stream?path=${encodePath(entry.path)}`;
+  const index = siblings.findIndex((item) => item.path === entry.path);
+  const previous = index > 0 ? siblings[index - 1] : null;
+  const next = index >= 0 && index < siblings.length - 1 ? siblings[index + 1] : null;
+
+  // Left and right arrows step through the folder, except while a control (like a playing video's
+  // seek bar) has the keyboard.
+  useEffect(() => {
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+      if ((event.target as HTMLElement | null)?.closest?.("input, textarea, select, video, audio, [contenteditable]")) return;
+      const target = event.key === "ArrowLeft" ? previous : event.key === "ArrowRight" ? next : null;
+      if (!target) return;
+      event.preventDefault();
+      onStep(target);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [previous, next, onStep]);
+
+  useEffect(() => {
+    for (const item of [next, previous]) {
+      if (item && item.mime.startsWith("image/") && item.mime !== "image/svg+xml" && item.size <= PRELOAD_IMAGE_BYTES) new Image().src = `/api/fs/stream?path=${encodePath(item.path)}`;
+    }
+  }, [next, previous]);
+
+  // A horizontal swipe steps on touch screens, over pictures and messages (not over videos, PDFs,
+  // or text, which have their own gestures).
+  const onTouchStart = (event: React.TouchEvent) => {
+    const touch = event.touches[0];
+    touchStart.current = event.touches.length === 1 && (event.target as HTMLElement).closest(".image-preview, .preview-message, .audio-preview") ? { x: touch.clientX, y: touch.clientY } : null;
+  };
+  const onTouchEnd = (event: React.TouchEvent) => {
+    const start = touchStart.current;
+    touchStart.current = null;
+    const touch = event.changedTouches[0];
+    if (!start || !touch) return;
+    const dx = touch.clientX - start.x;
+    if (Math.abs(dx) < 60 || Math.abs(touch.clientY - start.y) > 50) return;
+    const target = dx > 0 ? previous : next;
+    if (target) onStep(target);
+  };
   const isText = entry.mime.startsWith("text/") || entry.mime.includes("json") || entry.mime.includes("javascript") || entry.mime.includes("typescript");
   useEffect(() => { if (isText) fetch(url).then((response) => { if (!response.ok) throw new Error("Unable to preview file"); return response.text(); }).then((value) => setText(value.slice(0, 2_000_000))).catch((caught) => setError(caught.message)); }, [isText, url]);
   let preview: ReactNode;
@@ -3209,7 +3272,7 @@ function PreviewDialog({ entry, onClose }: { entry: FileEntry; onClose: () => vo
   else if (entry.mime.startsWith("audio/")) preview = <div className="audio-preview"><FileAudio size={54} /><strong>{entry.name}</strong><audio src={url} controls autoPlay /></div>;
   else if (entry.mime === "application/pdf") preview = <iframe src={url} title={`Preview of ${entry.name}`} />;
   else preview = <div className="preview-message"><File size={42} /><h3>Preview unavailable</h3><p>This file type can still be downloaded.</p></div>;
-  return <div className="preview-overlay"><section className="preview-modal" role="dialog" aria-modal="true" aria-label={`Preview ${entry.name}`}><header><div><span className={`file-icon ${entry.type}`}>{fileIcon(entry)}</span><div><strong>{entry.name}</strong><span>{extension(entry.name)} · {formatBytes(entry.size)}</span></div></div><div><a className="button secondary" href={`/api/fs/download?path=${encodePath(entry.path)}`}><ArrowDownToLine size={16} /> Download</a><button className="icon-button" aria-label="Close preview" onClick={onClose}><X size={19} /></button></div></header><div className="preview-body">{preview}</div></section></div>;
+  return <div className="preview-overlay"><section className="preview-modal" role="dialog" aria-modal="true" aria-label={`Preview ${entry.name}`}><header><div><span className={`file-icon ${entry.type}`}>{fileIcon(entry)}</span><div><strong>{entry.name}</strong><span>{extension(entry.name)} · {formatBytes(entry.size)}{index >= 0 && siblings.length > 1 ? ` · ${index + 1} of ${siblings.length}` : ""}</span></div></div><div><a className="button secondary" href={`/api/fs/download?path=${encodePath(entry.path)}`}><ArrowDownToLine size={16} /> Download</a><button className="icon-button" aria-label="Close preview" onClick={onClose}><X size={19} /></button></div></header><div className="preview-stage" onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}><div className="preview-body">{preview}</div>{previous && <button type="button" className="preview-nav previous" aria-label={`Previous: ${previous.name}`} title={`${previous.name} (←)`} onClick={() => onStep(previous)}><ChevronLeft size={22} /></button>}{next && <button type="button" className="preview-nav next" aria-label={`Next: ${next.name}`} title={`${next.name} (→)`} onClick={() => onStep(next)}><ChevronRight size={22} /></button>}</div></section></div>;
 }
 
 type Checksums = { sha256: string; md5: string };
