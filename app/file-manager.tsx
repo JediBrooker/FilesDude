@@ -34,6 +34,7 @@ import {
   FolderInput,
   FolderOpen,
   FolderPlus,
+  FolderUp,
   HardDrive,
   Home,
   Info,
@@ -101,7 +102,9 @@ type TwoFactorStatus = { enabled: boolean; enabledAt: string | null; recoveryCod
 const ROLE_LABELS: Record<Role, string> = { owner: "Owner", editor: "Editor", viewer: "Viewer" };
 
 type DialogState =
-  | { kind: "upload"; files: File[] }
+  // `folder` is where a file goes inside the destination when a folder is uploaded ("Photos/2024");
+  // `folders` lists every folder in the upload, so empty ones are made too.
+  | { kind: "upload"; items: UploadItem[]; folders: string[] }
   | { kind: "storage" }
   | { kind: "trash" }
   | { kind: "compress" }
@@ -140,7 +143,63 @@ type FavoriteLocation = { path: string; name: string; createdAt: string };
 type SelectOptions = { additive?: boolean; range?: boolean };
 type MenuPosition = { top: number; left: number };
 type MenuState = ({ kind: "entry"; entry: FileEntry } | { kind: "background" }) & MenuPosition;
-type BackgroundChoice = "new" | "upload" | "paste" | "selectAll" | "refresh";
+type BackgroundChoice = "new" | "upload" | "uploadFolder" | "paste" | "selectAll" | "refresh";
+type UploadItem = { file: File; folder: string };
+
+// System clutter left out of folder uploads.
+const SKIPPED_UPLOAD_NAMES = new Set([".DS_Store", "Thumbs.db", "desktop.ini"]);
+// Mirror the server's limits, so a folder that can't be uploaded is refused before anything is sent.
+const MAX_UPLOAD_ITEMS = 10_000;
+const MAX_UPLOAD_DEPTH = 32;
+
+// Every folder on the way to each of `paths`: "a/b" gives "a" and "a/b".
+function foldersOf(paths: string[]) {
+  const folders = new Set<string>();
+  for (const folder of paths) {
+    const parts = folder.split("/").filter(Boolean);
+    for (let depth = 1; depth <= parts.length; depth += 1) folders.add(parts.slice(0, depth).join("/"));
+  }
+  return [...folders];
+}
+
+/** Files chosen with the picker; a folder chosen with the folder picker brings each file's path within it. */
+function uploadItemsFromFiles(files: FileList | File[]) {
+  const items = Array.from(files)
+    .map((file) => ({ file, folder: file.webkitRelativePath ? file.webkitRelativePath.split("/").slice(0, -1).join("/") : "" }))
+    .filter((item) => !(item.folder && SKIPPED_UPLOAD_NAMES.has(item.file.name)));
+  return { items, folders: foldersOf(items.map((item) => item.folder)) };
+}
+
+/**
+ * What was dropped: plain files, or folders walked for every file and subfolder (empty ones too).
+ * Must be called straight from the drop event, before the browser clears what was dropped.
+ */
+async function uploadItemsFromDrop(transfer: DataTransfer) {
+  const entries = Array.from(transfer.items).filter((item) => item.kind === "file").map((item) => item.webkitGetAsEntry?.()).filter((entry): entry is FileSystemEntry => Boolean(entry));
+  if (!entries.some((entry) => entry.isDirectory)) return uploadItemsFromFiles(transfer.files);
+  const items: UploadItem[] = [];
+  const folders: string[] = [];
+  // A folder's entries come in batches; reading continues until an empty one.
+  const readAll = (reader: FileSystemDirectoryReader) => new Promise<FileSystemEntry[]>((resolve, reject) => {
+    const found: FileSystemEntry[] = [];
+    const next = () => reader.readEntries((batch) => { if (!batch.length) resolve(found); else { found.push(...batch); next(); } }, reject);
+    next();
+  });
+  const walk = async (entry: FileSystemEntry, folder: string): Promise<void> => {
+    if (items.length >= MAX_UPLOAD_ITEMS || folders.length >= MAX_UPLOAD_ITEMS) throw new Error(`Upload at most ${MAX_UPLOAD_ITEMS.toLocaleString()} files and folders at once`);
+    if (folder.split("/").length >= MAX_UPLOAD_DEPTH) throw new Error(`Folders nested more than ${MAX_UPLOAD_DEPTH} levels deep can't be uploaded`);
+    if (entry.isFile) {
+      if (!(folder && SKIPPED_UPLOAD_NAMES.has(entry.name))) items.push({ file: await new Promise<File>((resolve, reject) => (entry as FileSystemFileEntry).file(resolve, reject)), folder });
+      return;
+    }
+    if (!entry.isDirectory) return;
+    const inner = folder ? `${folder}/${entry.name}` : entry.name;
+    folders.push(inner);
+    for (const child of await readAll((entry as FileSystemDirectoryEntry).createReader())) await walk(child, inner);
+  };
+  for (const entry of entries) await walk(entry, "");
+  return { items, folders };
+}
 type UndoAction = { done: string; run: () => Promise<void> };
 type ClipboardState = { mode: "cut" | "copy"; paths: string[] };
 // Drop targets carry their destination folder in data-drop-path and share these handlers.
@@ -457,6 +516,9 @@ export function FileManager() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [theme, setTheme] = useState<"light" | "dark">("light");
   const uploadRef = useRef<HTMLInputElement>(null);
+  const folderUploadRef = useRef<HTMLInputElement>(null);
+  // React has no prop for choosing a folder, so the attribute is set directly.
+  useEffect(() => { folderUploadRef.current?.setAttribute("webkitdirectory", ""); });
   const searchRef = useRef<HTMLInputElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const toastTimerRef = useRef<number | undefined>(undefined);
@@ -1002,6 +1064,7 @@ export function FileManager() {
     setMenu(null);
     if (choice === "new") setDialog({ kind: "new" });
     if (choice === "upload") uploadRef.current?.click();
+    if (choice === "uploadFolder") folderUploadRef.current?.click();
     if (choice === "paste") void pasteInto(currentPath);
     if (choice === "selectAll") setSelected(new Set(sortedEntries.map((entry) => entry.path)));
     if (choice === "refresh") void loadDirectory();
@@ -1024,11 +1087,17 @@ export function FileManager() {
     onDragEnd: endDrag,
   };
 
-  const queueUpload = (files: FileList | File[]) => {
-    const queued = Array.from(files);
-    if (!queued.length) return;
-    setDialog({ kind: "upload", files: queued });
+  const queueUpload = ({ items, folders }: { items: UploadItem[]; folders: string[] }) => {
     if (uploadRef.current) uploadRef.current.value = "";
+    if (folderUploadRef.current) folderUploadRef.current.value = "";
+    if (!items.length && !folders.length) return;
+    if (items.length > MAX_UPLOAD_ITEMS || folders.length > MAX_UPLOAD_ITEMS) return notify(`Upload at most ${MAX_UPLOAD_ITEMS.toLocaleString()} files and folders at once`, "error");
+    if (folders.some((folder) => folder.split("/").length > MAX_UPLOAD_DEPTH)) return notify(`Folders nested more than ${MAX_UPLOAD_DEPTH} levels deep can't be uploaded`, "error");
+    setDialog({ kind: "upload", items, folders });
+  };
+
+  const queueDrop = (transfer: DataTransfer) => {
+    uploadItemsFromDrop(transfer).then(queueUpload).catch((error: Error) => notify(error.message, "error"));
   };
 
   // One item downloads as itself (a folder as a ZIP); several download together as one ZIP.
@@ -1247,7 +1316,7 @@ export function FileManager() {
   if (!auth.authenticated) return <LoginScreen auth={auth} onSuccess={refreshAuth} theme={theme} onToggleTheme={toggleTheme} />;
 
   return (
-    <div className="app-shell" onDragOver={(event) => { event.preventDefault(); if (event.dataTransfer.types.includes(DRAG_TYPE)) event.dataTransfer.dropEffect = "none"; }} onDrop={(event) => { event.preventDefault(); if (canWrite && !event.dataTransfer.types.includes(DRAG_TYPE)) queueUpload(event.dataTransfer.files); }}>
+    <div className="app-shell" onDragOver={(event) => { event.preventDefault(); if (event.dataTransfer.types.includes(DRAG_TYPE)) event.dataTransfer.dropEffect = "none"; }} onDrop={(event) => { event.preventDefault(); if (canWrite && !event.dataTransfer.types.includes(DRAG_TYPE)) queueDrop(event.dataTransfer); }}>
       <aside className={`sidebar ${sidebarOpen ? "sidebar-open" : ""}`}>
         <div className="brand-row">
           <div className="brand-mark"><FolderOpen size={21} /></div>
@@ -1333,10 +1402,12 @@ export function FileManager() {
               <p>{activeSearch && searchMode === "contents" ? (contentSearch?.result ? `${itemCount(contentSearch.result.hits.length).replace("item", "file")} containing “${contentSearch.result.query}”` : "Searching file contents…") : activeSearch ? `${entries.length} search results` : `${entries.length} ${entries.length === 1 ? "item" : "items"}`}{showHidden ? " · hidden files shown" : ""}</p>
             </div>
             <div className="primary-actions">
-              <input ref={uploadRef} className="visually-hidden" type="file" multiple onChange={(event) => event.target.files && queueUpload(event.target.files)} />
+              <input ref={uploadRef} className="visually-hidden" type="file" multiple onChange={(event) => event.target.files && queueUpload(uploadItemsFromFiles(event.target.files))} />
+              <input ref={folderUploadRef} className="visually-hidden" type="file" multiple onChange={(event) => event.target.files && queueUpload(uploadItemsFromFiles(event.target.files))} />
               {currentPath && <button className={`button secondary favorite-location ${favoritePaths.has(currentPath) ? "active" : ""}`} title={favoritePaths.has(currentPath) ? "Remove this folder from favourites" : "Add this folder to favourites"} onClick={() => void toggleFavorite(currentPath)}><Star size={16} fill={favoritePaths.has(currentPath) ? "currentColor" : "none"} /> <span>{favoritePaths.has(currentPath) ? "Favourited" : "Favourite"}</span></button>}
               {canWrite && clipboard && <div className="clipboard-chip"><button className="button secondary" title={`Paste into ${folderLabel(currentPath)} (${modifierLabel()}V)`} onClick={() => void pasteInto(currentPath)}><ClipboardPaste size={16} /> <span>Paste {itemCount(clipboard.paths.length)}</span></button><button className="icon-button" aria-label="Clear clipboard" title="Clear clipboard" onClick={() => setClipboard(null)}><X size={15} /></button></div>}
               {canWrite && <button className="button secondary" onClick={() => uploadRef.current?.click()}><Upload size={17} /> Upload</button>}
+              {canWrite && <button className="button secondary icon-only" aria-label="Upload a folder" title="Upload a folder" onClick={() => folderUploadRef.current?.click()}><FolderUp size={17} /></button>}
               {canWrite && <button className="button primary" onClick={() => setDialog({ kind: "new" })}><Plus size={17} /> New <ChevronDown size={14} /></button>}
             </div>
           </div>
@@ -1667,6 +1738,7 @@ function BackgroundMenu({ canWrite, position, menuRef, folder, clipboardCount, c
       {canWrite && <div className="file-menu-section">
         {item("new", "New folder or file", <FolderPlus size={16} />)}
         {item("upload", "Upload files", <Upload size={16} />)}
+        {item("uploadFolder", "Upload a folder", <FolderUp size={16} />)}
         {item("paste", clipboardCount ? `Paste ${itemCount(clipboardCount)}` : "Paste", <ClipboardPaste size={16} />, !clipboardCount)}
       </div>}
       <div className="file-menu-section">
@@ -1810,7 +1882,7 @@ function DialogHost({ dialog, selected, currentPath, username, role, home, onClo
   onReveal: (entry: FileEntry) => void;
   onPreview: (entry: FileEntry, siblings?: FileEntry[]) => void;
 }) {
-  if (dialog.kind === "upload") return <UploadDialog files={dialog.files} currentPath={currentPath} chooseOwnership={role === "owner"} onClose={onClose} notify={notify} onComplete={onRefresh} />;
+  if (dialog.kind === "upload") return <UploadDialog items={dialog.items} folders={dialog.folders} currentPath={currentPath} chooseOwnership={role === "owner"} onClose={onClose} notify={notify} onComplete={onRefresh} />;
   if (dialog.kind === "users") return <UsersDialog onClose={onClose} notify={notify} />;
   if (dialog.kind === "duplicates") return <DuplicatesDialog startPath={currentPath} onClose={onClose} notify={notify} onRefresh={onRefresh} onReveal={onReveal} />;
   if (dialog.kind === "storage") return <StorageDialog onClose={onClose} onReveal={onReveal} onPreview={onPreview} notify={notify} />;
@@ -2722,7 +2794,12 @@ function TrashDialog({ onClose, notify, onRefresh }: { onClose: () => void; noti
 }
 
 // Only the owner picks upload ownership; other accounts' uploads take the destination folder's owner.
-function UploadDialog({ files, currentPath, chooseOwnership, onClose, notify, onComplete }: { files: File[]; currentPath: string; chooseOwnership: boolean; onClose: () => void; notify: (message: string, tone?: "error") => void; onComplete: () => Promise<void> }) {
+function UploadDialog({ items, folders, currentPath, chooseOwnership, onClose, notify, onComplete }: { items: UploadItem[]; folders: string[]; currentPath: string; chooseOwnership: boolean; onClose: () => void; notify: (message: string, tone?: "error") => void; onComplete: () => Promise<void> }) {
+  const files = useMemo(() => items.map((item) => item.file), [items]);
+  // The names the uploaded top folders got ("Photos (1)" if "Photos" was taken), and which empty
+  // folders exist already, kept so trying again after a failure carries on in the same folders.
+  const topFoldersRef = useRef(new Map<string, string>());
+  const madeFoldersRef = useRef(new Set<string>());
   const [options, setOptions] = useState<UploadOwnershipOptions | null>(null);
   const [selectedOwnership, setSelectedOwnership] = useState("service");
   const [error, setError] = useState("");
@@ -2795,14 +2872,33 @@ function UploadDialog({ files, currentPath, chooseOwnership, onClose, notify, on
       const elapsed = (time - samples[0].time) / 1000;
       setProgress({ index, loaded, bytesPerSecond: elapsed >= 0.5 ? (bytes - samples[0].bytes) / elapsed : 0 });
     };
+    const folderParams = (folder: string, extra: Record<string, string> = {}) => {
+      const [top, ...rest] = folder.split("/");
+      const next = new URLSearchParams(params);
+      next.set("folder", [topFoldersRef.current.get(top) ?? top, ...rest].join("/"));
+      for (const [key, value] of Object.entries(extra)) next.set(key, value);
+      return next;
+    };
     try {
+      // Each uploaded folder is made first, under a name nothing has yet; then any empty folders.
+      for (const top of new Set(folders.map((folder) => folder.split("/")[0]))) {
+        if (topFoldersRef.current.has(top)) continue;
+        const made = await requestJson<{ folder: string }>(`/api/fs/upload?${folderParams(top, { createFolder: "1", unique: "1" })}`, { method: "POST", body: "{}", signal: controller.signal });
+        topFoldersRef.current.set(top, made.folder.split("/").at(-1) ?? top);
+      }
+      for (const folder of folders) {
+        if (!folder.includes("/") || madeFoldersRef.current.has(folder) || items.some((item) => item.folder === folder || item.folder.startsWith(`${folder}/`))) continue;
+        await requestJson(`/api/fs/upload?${folderParams(folder, { createFolder: "1" })}`, { method: "POST", body: "{}", signal: controller.signal });
+        madeFoldersRef.current.add(folder);
+      }
       for (let index = uploadedCount; index < files.length; index += 1) {
         report(index, 0);
-        await uploadFile<{ uploaded: string[] }>(`/api/fs/upload?${params}`, files[index], (loaded) => report(index, loaded), controller.signal);
+        const destination = items[index].folder ? folderParams(items[index].folder) : params;
+        await uploadFile<{ uploaded: string[] }>(`/api/fs/upload?${destination}`, files[index], (loaded) => report(index, loaded), controller.signal);
         completedCount = index + 1;
         setUploadedCount(completedCount);
       }
-      notify(`${files.length} ${files.length === 1 ? "file" : "files"} uploaded`);
+      notify(`${files.length} ${files.length === 1 ? "file" : "files"} uploaded${topFoldersRef.current.size ? ` into ${[...topFoldersRef.current.values()].join(", ")}` : ""}`);
       onClose();
       await onComplete();
     } catch (caught) {
@@ -2821,9 +2917,11 @@ function UploadDialog({ files, currentPath, chooseOwnership, onClose, notify, on
   const sentBytes = progress ? files.slice(0, progress.index).reduce((total, file) => total + file.size, 0) + progress.loaded : 0;
   const percent = progress ? (totalBytes ? Math.min(100, Math.round((sentBytes / totalBytes) * 100)) : 100) : 0;
   const currentFile = progress ? files[progress.index] : null;
-  const progressPanel = progress && currentFile && <div className="upload-progress" role="status" aria-live="polite"><div className="upload-progress-head"><strong title={currentFile.name}>{progress.loaded >= currentFile.size ? "Finishing" : "Uploading"} {currentFile.name}</strong><span>File {progress.index + 1} of {files.length}</span></div><div className="upload-progress-track" role="progressbar" aria-label="Upload progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent}><span style={{ width: `${percent}%` }} /></div><div className="upload-progress-meta"><span>{formatBytes(sentBytes)} of {formatBytes(totalBytes)} · {percent}%</span><span>{progress.bytesPerSecond > 0 ? `${formatBytes(progress.bytesPerSecond)}/s · ${formatRemaining((totalBytes - sentBytes) / progress.bytesPerSecond) || "almost done"}` : "Measuring speed…"}</span></div></div>;
+  const currentPathLabel = progress && currentFile ? [items[progress.index].folder, currentFile.name].filter(Boolean).join("/") : "";
+  const folderCount = new Set(folders.map((folder) => folder.split("/")[0])).size;
+  const progressPanel = progress && currentFile && <div className="upload-progress" role="status" aria-live="polite"><div className="upload-progress-head"><strong title={currentPathLabel}>{progress.loaded >= currentFile.size ? "Finishing" : "Uploading"} {currentPathLabel}</strong><span>File {progress.index + 1} of {files.length}</span></div><div className="upload-progress-track" role="progressbar" aria-label="Upload progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent}><span style={{ width: `${percent}%` }} /></div><div className="upload-progress-meta"><span>{formatBytes(sentBytes)} of {formatBytes(totalBytes)} · {percent}%</span><span>{progress.bytesPerSecond > 0 ? `${formatBytes(progress.bytesPerSecond)}/s · ${formatRemaining((totalBytes - sentBytes) / progress.bytesPerSecond) || "almost done"}` : "Measuring speed…"}</span></div></div>;
 
-  return <Modal title={`Upload ${files.length} ${files.length === 1 ? "file" : "files"}`} subtitle={`Choose ownership before uploading to /${currentPath}`} icon={<Upload size={19} />} onClose={onClose}><form className="upload-form" onSubmit={submit}><div className="upload-file-summary"><div><Upload size={18} /><span><strong>{files.length} {files.length === 1 ? "file" : "files"}</strong><small>{formatBytes(files.reduce((total, file) => total + file.size, 0))} total{uploadedCount ? ` · ${uploadedCount} uploaded` : ""}</small></span></div><div className="upload-file-list">{files.slice(0, 4).map((file) => <span key={`${file.name}-${file.size}`}>{file.name}</span>)}{files.length > 4 && <span>and {files.length - 4} more…</span>}</div></div>{progressPanel}{chooseOwnership && <><div className="ownership-heading"><div><UserRoundCog size={17} /><span><strong>Owner and group</strong><small>Detected from this folder and its contents</small></span></div>{options?.truncated && <small>Based on the first 2,000 items</small>}</div>{!options && !error ? <div className="ownership-loading"><LoaderCircle className="spin" size={18} /> Detecting ownership…</div> : options && <div className="ownership-options"><label className={`ownership-option ${selectedOwnership === "service" ? "active" : ""}`}><input type="radio" name="upload-ownership" value="service" checked={selectedOwnership === "service"} onChange={(event) => setSelectedOwnership(event.target.value)} /><span className="ownership-radio" /><span><strong>Keep FilesDude service ownership</strong><small>{options.service.owner}:{options.service.group} · {options.service.uid}:{options.service.gid}</small></span>{preferredKey === "service" && <em>Default</em>}</label>{ownershipPairs.map((pair) => { const key = ownershipKey(pair); const destination = key === ownershipKey(options.destination); return <label key={key} className={`ownership-option ${selectedOwnership === key ? "active" : ""} ${!options.canChangeOwnership ? "disabled" : ""}`}><input type="radio" name="upload-ownership" value={key} checked={selectedOwnership === key} disabled={!options.canChangeOwnership} onChange={(event) => setSelectedOwnership(event.target.value)} /><span className="ownership-radio" /><span><strong>{pair.owner}:{pair.group}</strong><small>{pair.uid}:{pair.gid}{destination ? " · destination folder" : pair.source === "default" ? " · saved default" : ` · ${pair.count || 0} existing ${pair.count === 1 ? "item" : "items"}`}</small></span>{preferredKey === key && <em>Default</em>}</label>; })}</div>}{options && !options.canChangeOwnership && <div className="warning-box"><CircleAlert size={17} /> Ownership changes require FilesDude&apos;s systemd service to run as root. This upload will keep <code>{options.service.uid}:{options.service.gid}</code>.</div>}</>}<div className="info-box"><Info size={17} /> Uploaded files use mode <code>640</code>. Owner/group selection does not change those read and write permissions.</div>{error && <div className="form-error"><CircleAlert size={16} />{error}</div>}{busy ? <div className="modal-actions"><button type="button" className="button danger" onClick={() => controllerRef.current?.abort()}><X size={16} /> Cancel upload</button></div> : <ModalActions onClose={onClose} submitLabel={uploadedCount ? "Upload remaining files" : `Upload ${files.length === 1 ? "file" : "files"}`} busy={chooseOwnership && !options} />}</form></Modal>;
+  return <Modal title={folderCount ? `Upload ${folderCount === 1 ? `the folder “${folders[0].split("/")[0]}”` : `${folderCount} folders`}` : `Upload ${files.length} ${files.length === 1 ? "file" : "files"}`} subtitle={`${folderCount ? `${files.length.toLocaleString()} ${files.length === 1 ? "file" : "files"} in ${folders.length.toLocaleString()} ${folders.length === 1 ? "folder" : "folders"}, with the same structure. ` : ""}Choose ownership before uploading to /${currentPath}`} icon={<Upload size={19} />} onClose={onClose}><form className="upload-form" onSubmit={submit}><div className="upload-file-summary"><div><Upload size={18} /><span><strong>{files.length} {files.length === 1 ? "file" : "files"}</strong><small>{formatBytes(files.reduce((total, file) => total + file.size, 0))} total{uploadedCount ? ` · ${uploadedCount} uploaded` : ""}</small></span></div><div className="upload-file-list">{items.slice(0, 4).map((item, index) => <span key={`${index}-${item.file.name}`}>{[item.folder, item.file.name].filter(Boolean).join("/")}</span>)}{files.length > 4 && <span>and {files.length - 4} more…</span>}</div></div>{progressPanel}{chooseOwnership && <><div className="ownership-heading"><div><UserRoundCog size={17} /><span><strong>Owner and group</strong><small>Detected from this folder and its contents</small></span></div>{options?.truncated && <small>Based on the first 2,000 items</small>}</div>{!options && !error ? <div className="ownership-loading"><LoaderCircle className="spin" size={18} /> Detecting ownership…</div> : options && <div className="ownership-options"><label className={`ownership-option ${selectedOwnership === "service" ? "active" : ""}`}><input type="radio" name="upload-ownership" value="service" checked={selectedOwnership === "service"} onChange={(event) => setSelectedOwnership(event.target.value)} /><span className="ownership-radio" /><span><strong>Keep FilesDude service ownership</strong><small>{options.service.owner}:{options.service.group} · {options.service.uid}:{options.service.gid}</small></span>{preferredKey === "service" && <em>Default</em>}</label>{ownershipPairs.map((pair) => { const key = ownershipKey(pair); const destination = key === ownershipKey(options.destination); return <label key={key} className={`ownership-option ${selectedOwnership === key ? "active" : ""} ${!options.canChangeOwnership ? "disabled" : ""}`}><input type="radio" name="upload-ownership" value={key} checked={selectedOwnership === key} disabled={!options.canChangeOwnership} onChange={(event) => setSelectedOwnership(event.target.value)} /><span className="ownership-radio" /><span><strong>{pair.owner}:{pair.group}</strong><small>{pair.uid}:{pair.gid}{destination ? " · destination folder" : pair.source === "default" ? " · saved default" : ` · ${pair.count || 0} existing ${pair.count === 1 ? "item" : "items"}`}</small></span>{preferredKey === key && <em>Default</em>}</label>; })}</div>}{options && !options.canChangeOwnership && <div className="warning-box"><CircleAlert size={17} /> Ownership changes require FilesDude&apos;s systemd service to run as root. This upload will keep <code>{options.service.uid}:{options.service.gid}</code>.</div>}</>}<div className="info-box"><Info size={17} /> Uploaded files use mode <code>640</code>. Owner/group selection does not change those read and write permissions.</div>{error && <div className="form-error"><CircleAlert size={16} />{error}</div>}{busy ? <div className="modal-actions"><button type="button" className="button danger" onClick={() => controllerRef.current?.abort()}><X size={16} /> Cancel upload</button></div> : <ModalActions onClose={onClose} submitLabel={uploadedCount ? "Upload remaining files" : `Upload ${files.length === 1 ? "file" : "files"}`} busy={chooseOwnership && !options} />}</form></Modal>;
 }
 
 function CompressDialog({ entries, currentPath, onClose, onStart }: { entries: FileEntry[]; currentPath: string; onClose: () => void; onStart: (body: Record<string, unknown>) => Promise<boolean> }) {
