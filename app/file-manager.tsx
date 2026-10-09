@@ -1406,8 +1406,7 @@ export function FileManager() {
               <input ref={folderUploadRef} className="visually-hidden" type="file" multiple onChange={(event) => event.target.files && queueUpload(uploadItemsFromFiles(event.target.files))} />
               {currentPath && <button className={`button secondary favorite-location ${favoritePaths.has(currentPath) ? "active" : ""}`} title={favoritePaths.has(currentPath) ? "Remove this folder from favourites" : "Add this folder to favourites"} onClick={() => void toggleFavorite(currentPath)}><Star size={16} fill={favoritePaths.has(currentPath) ? "currentColor" : "none"} /> <span>{favoritePaths.has(currentPath) ? "Favourited" : "Favourite"}</span></button>}
               {canWrite && clipboard && <div className="clipboard-chip"><button className="button secondary" title={`Paste into ${folderLabel(currentPath)} (${modifierLabel()}V)`} onClick={() => void pasteInto(currentPath)}><ClipboardPaste size={16} /> <span>Paste {itemCount(clipboard.paths.length)}</span></button><button className="icon-button" aria-label="Clear clipboard" title="Clear clipboard" onClick={() => setClipboard(null)}><X size={15} /></button></div>}
-              {canWrite && <button className="button secondary" onClick={() => uploadRef.current?.click()}><Upload size={17} /> Upload</button>}
-              {canWrite && <button className="button secondary icon-only" aria-label="Upload a folder" title="Upload a folder" onClick={() => folderUploadRef.current?.click()}><FolderUp size={17} /></button>}
+              {canWrite && <UploadButton onFiles={() => uploadRef.current?.click()} onFolder={() => folderUploadRef.current?.click()} />}
               {canWrite && <button className="button primary" onClick={() => setDialog({ kind: "new" })}><Plus size={17} /> New <ChevronDown size={14} /></button>}
             </div>
           </div>
@@ -1523,6 +1522,43 @@ export function FileManager() {
       document.body)}
       {jobs.length > 0 && <div className="job-panels">{jobs.map((job) => <JobPanel key={job.id} job={job} onCancel={() => void cancelJob(job)} />)}</div>}
       {toast && <div className={`toast ${toast.tone === "error" ? "toast-error" : ""}`} role="status">{toast.tone === "error" ? <CircleAlert size={18} /> : <Check size={18} />}<span>{toast.message}</span>{toast.undo && <button className="toast-action" onClick={() => void runUndo(toast.undo!)}><Undo2 size={14} /> Undo</button>}</div>}
+    </div>
+  );
+}
+
+// Upload, with a menu for choosing a folder instead: a browser's picker chooses files or a folder,
+// never both, so the main button picks files and the arrow offers either.
+function UploadButton({ onFiles, onFolder }: { onFiles: () => void; onFolder: () => void }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const close = (event: MouseEvent | globalThis.KeyboardEvent) => {
+      if (event instanceof MouseEvent ? !ref.current?.contains(event.target as Node) : event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", close);
+    document.addEventListener("keydown", close);
+    return () => {
+      document.removeEventListener("mousedown", close);
+      document.removeEventListener("keydown", close);
+    };
+  }, [open]);
+  const choose = (pick: () => void) => {
+    setOpen(false);
+    pick();
+  };
+  return (
+    <div className="split-button" ref={ref}>
+      <button className="button secondary split-main" onClick={onFiles}><Upload size={17} /> Upload</button>
+      <button className="button secondary split-toggle" aria-label="Upload options" aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen((value) => !value)}><ChevronDown size={14} /></button>
+      {open && (
+        <div className="file-action-menu split-menu" role="menu" aria-label="Upload">
+          <div className="file-menu-section">
+            <button role="menuitem" onClick={() => choose(onFiles)}><Upload size={16} /><span>Files…</span></button>
+            <button role="menuitem" onClick={() => choose(onFolder)}><FolderUp size={16} /><span>Folder…</span></button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
