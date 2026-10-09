@@ -12,7 +12,7 @@ FilesDude is a secure, self-hosted web file manager designed for a Proxmox host,
 - Pin durable favourite folder locations to the sidebar from a folder menu, selection toolbar, or the current-location button
 - Create files and folders; edit text/code files up to 2 MB; rename, copy, move, soft-delete, and permanently delete, with a breadcrumb folder browser and autofill suggestions for picking a copy/move destination
 - Multi-file drag-and-drop upload with live progress, transfer speed, time remaining, and cancel (cancelled or interrupted files are discarded and can be resumed), collision-safe names, a configurable size limit, and owner/group confirmation based on the destination folder and its existing contents
-- Direct file downloads and ZIP downloads for folders
+- Direct file downloads and ZIP downloads for folders; select several items (from one folder or from search results) to download them together as one ZIP
 - Share links: let anyone with a private link download a file (or a folder as a ZIP) without signing in, for 1 hour to 30 days and optionally a limited number of downloads; links can be revoked at any time, follow renames and moves, and every download is audited
 - Compress selected items into `.zip` or `.tar.gz` and extract `.zip`, `.tar`, `.tar.gz`, and `.tgz` archives into a new folder, as background jobs with progress and cancel; extraction refuses archives with absolute or `..` paths, never creates links or devices, and stops before filling the disk
 - Inline previews for text, code, JSON, images, PDF, audio, and video; media uses byte-range streaming

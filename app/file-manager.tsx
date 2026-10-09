@@ -156,7 +156,7 @@ type EntryInteractions = {
 
 const DRAG_TYPE = "application/x-filesdude-paths";
 const MENU_WIDTH = 224;
-const MULTI_ITEM_ACTIONS: EntryAction[] = ["cut", "clipboard", "copy", "move", "compress", "permissions", "ownership", "delete"];
+const MULTI_ITEM_ACTIONS: EntryAction[] = ["download", "cut", "clipboard", "copy", "move", "compress", "permissions", "ownership", "delete"];
 const ARCHIVE_NAME = /\.(zip|tar\.gz|tgz|tar)$/i;
 // Mirrors lib/thumbnails.ts: which images the server makes thumbnails for.
 const THUMBNAIL_MIME = new Set(["image/jpeg", "image/png", "image/gif", "image/webp", "image/avif"]);
@@ -1013,11 +1013,20 @@ export function FileManager() {
     if (uploadRef.current) uploadRef.current.value = "";
   };
 
-  const downloadSelected = () => {
-    const chosen = entries.filter((entry) => selected.has(entry.path));
-    if (chosen.length !== 1) return;
-    startDownload(chosen[0].path);
+  // One item downloads as itself (a folder as a ZIP); several download together as one ZIP.
+  const downloadEntries = async (chosen: FileEntry[]) => {
+    if (chosen.length === 1) return startDownload(chosen[0].path);
+    if (!chosen.length) return;
+    try {
+      const { url } = await requestJson<{ url: string }>("/api/fs/download", { method: "POST", body: JSON.stringify({ paths: chosen.map((entry) => entry.path) }) });
+      downloadFrom(url);
+      notify(`Downloading ${itemCount(chosen.length)} as one ZIP`);
+    } catch (error) {
+      notify((error as Error).message, "error");
+    }
   };
+
+  const downloadSelected = () => void downloadEntries(entries.filter((entry) => selected.has(entry.path)));
 
   const toggleFavorite = async (folderPath: string) => {
     const active = favorites.some((favorite) => favorite.path === folderPath);
@@ -1048,7 +1057,7 @@ export function FileManager() {
         setDialog({ kind: "edit", entry });
         break;
       case "download":
-        startDownload(entry.path);
+        void downloadEntries(targets);
         break;
       case "favorite":
         void toggleFavorite(entry.path);
@@ -1345,7 +1354,7 @@ export function FileManager() {
               <div className="selection-actions">
                 {selected.size === 1 && <button onClick={() => openEntry(selectedEntries[0])}><Eye size={16} /> Open</button>}
                 {canWrite && selected.size === 1 && isEditable(selectedEntries[0]) && <button onClick={() => setDialog({ kind: "edit", entry: selectedEntries[0] })}><FilePenLine size={16} /> Edit</button>}
-                {selected.size === 1 && <button onClick={downloadSelected}><Download size={16} /> Download</button>}
+                {selected.size > 0 && <button onClick={downloadSelected}><Download size={16} /> Download</button>}
                 {selected.size === 1 && selectedEntries[0].type === "directory" && <button onClick={() => void toggleFavorite(selectedEntries[0].path)}><Star size={16} fill={favoritePaths.has(selectedEntries[0].path) ? "currentColor" : "none"} /> {favoritePaths.has(selectedEntries[0].path) ? "Unfavourite" : "Favourite"}</button>}
                 {canWrite && selected.size === 1 && <button onClick={() => setDialog({ kind: "rename", entry: selectedEntries[0] })}><Pencil size={16} /> Rename</button>}
                 {canWrite && <button onClick={() => setDialog({ kind: "transfer", mode: "copy" })}><Copy size={16} /> Copy</button>}
@@ -1593,6 +1602,7 @@ function FileActionMenu({ entry, targets, position, menuRef, favoritePaths, canW
         {canWrite && entry.type === "file" && item("edit", "Edit", <FilePenLine size={16} />, { disabled: !isEditable(entry) })}
         {item("download", "Download", <Download size={16} />)}
       </div>}
+      {multiple && <div className="file-menu-section">{item("download", "Download as ZIP", <Download size={16} />)}</div>}
       <div className="file-menu-section">
         {canWrite && !multiple && item("rename", "Rename", <Pencil size={16} />)}
         {!multiple && entry.type === "directory" && item("favorite", favoritePaths.has(entry.path) ? "Remove from favourites" : "Add to favourites", <Star size={16} fill={favoritePaths.has(entry.path) ? "currentColor" : "none"} />)}

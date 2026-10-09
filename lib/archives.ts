@@ -86,6 +86,25 @@ async function removeIfSame(directory: AnchoredDirectory, name: string, created:
   if (current && current.ino === created.ino && current.dev === created.dev) await remove(inside(directory, name)).catch(() => undefined);
 }
 
+/**
+ * A file or folder name as an archive entry: a backslash, which some tools take as a separator
+ * (turning `a\..\b` into a path that climbs out), becomes an underscore.
+ */
+export function archiveEntryName(name: string) {
+  return name.toWellFormed().replaceAll("\\", "_");
+}
+
+// A link is kept in an archive only when it points within the archive itself: relative, and not
+// climbing above the archive's top. Anything else would reveal or reach paths on this server.
+function containedLink(entryPath: string, target: string) {
+  if (!target || target.startsWith("/") || /[\\\0]/.test(target) || /^[A-Za-z]:/.test(target)) return false;
+  const resolved = path.posix.normalize(path.posix.join(path.posix.dirname(entryPath), target));
+  return resolved !== ".." && !resolved.startsWith("../") && resolved !== ".";
+}
+
+// Already-compressed formats are stored rather than compressed again, which saves CPU for nothing.
+const STORED = /\.(zip|gz|tgz|bz2|xz|zst|7z|rar|jpe?g|png|gif|webp|avif|heic|mp4|m4v|mkv|mov|avi|webm|mp3|m4a|aac|ogg|opus|flac)$/i;
+
 export function appendFileAndWait(archive: Archiver, stream: Readable, name: string, stats: Stats, signal?: AbortSignal) {
   return new Promise<void>((resolve, reject) => {
     const cleanup = () => {
@@ -103,7 +122,7 @@ export function appendFileAndWait(archive: Archiver, stream: Readable, name: str
     stream.once("close", onClose);
     signal?.addEventListener("abort", onAbort, { once: true });
     try {
-      archive.append(stream, { name, stats });
+      archive.append(stream, { name, stats, store: STORED.test(name) } as Parameters<Archiver["append"]>[1]);
     } catch (error) {
       cleanup();
       reject(error);
@@ -136,12 +155,13 @@ export async function appendDirectory(archive: Archiver, handle: FileHandle, ope
       if (signal?.aborted) throw cancelled();
       if (INTERNAL_NAMES.has(entry.name)) continue;
       const childPath = path.join(directoryPath, entry.name);
-      const childArchivePath = path.posix.join(archivePath, entry.name);
+      const childArchivePath = path.posix.join(archivePath, archiveEntryName(entry.name));
 
       if (entry.isSymbolicLink()) {
         if (!storeLinks) continue;
         try {
-          archive.symlink(childArchivePath, await fsp.readlink(childPath));
+          const target = await fsp.readlink(childPath);
+          if (containedLink(childArchivePath, target)) archive.symlink(childArchivePath, target);
         } catch {
           // The entry changed while the archive was being created; omit it.
         }
