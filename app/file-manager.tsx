@@ -61,6 +61,7 @@ import {
   Settings2,
   ShieldCheck,
   Smartphone,
+  SlidersHorizontal,
   Sparkles,
   Star,
   Sun,
@@ -144,6 +145,11 @@ type SelectOptions = { additive?: boolean; range?: boolean };
 type MenuPosition = { top: number; left: number };
 type MenuState = ({ kind: "entry"; entry: FileEntry } | { kind: "background" }) & MenuPosition;
 type BackgroundChoice = "new" | "upload" | "uploadFolder" | "paste" | "selectAll" | "refresh";
+type SearchFilters = { kind: string; modifiedDays: number; minBytes: number };
+const NO_FILTERS: SearchFilters = { kind: "any", modifiedDays: 0, minBytes: 0 };
+const SEARCH_KIND_OPTIONS = [["any", "Any kind"], ["folders", "Folders"], ["images", "Images"], ["videos", "Videos"], ["audio", "Audio"], ["documents", "Documents"], ["archives", "Archives and disk images"]] as const;
+const MODIFIED_OPTIONS = [[0, "Any time"], [1, "In the past day"], [7, "In the past week"], [30, "In the past month"], [365, "In the past year"]] as const;
+const SIZE_OPTIONS = [[0, "Any size"], [10 * 1024 ** 2, "Over 10 MB"], [100 * 1024 ** 2, "Over 100 MB"], [1024 ** 3, "Over 1 GB"], [10 * 1024 ** 3, "Over 10 GB"]] as const;
 type UploadItem = { file: File; folder: string };
 
 // System clutter left out of folder uploads.
@@ -492,6 +498,14 @@ export function FileManager() {
   const [search, setSearch] = useState("");
   const [activeSearch, setActiveSearch] = useState("");
   const [searchMode, setSearchMode] = useState<"names" | "contents">("names");
+  // Name search filters; with any set, the folder and everything inside it are searched even
+  // without a name.
+  const [filters, setFilters] = useState<SearchFilters>(NO_FILTERS);
+  const [filtersOpen, setFiltersOpen] = useState(false);
+  const [searchInfo, setSearchInfo] = useState<{ truncated?: boolean; stoppedBy?: string } | null>(null);
+  const filterCount = (filters.kind !== "any" ? 1 : 0) + (filters.modifiedDays ? 1 : 0) + (filters.minBytes ? 1 : 0);
+  const filtersActive = searchMode === "names" && filterCount > 0;
+  const nameSearching = searchMode === "names" && (Boolean(activeSearch) || filtersActive);
   const [matchCase, setMatchCase] = useState(false);
   // Bumped on every search submit, so pressing Enter again re-runs the same content search.
   const [searchRun, setSearchRun] = useState(0);
@@ -596,9 +610,15 @@ export function FileManager() {
     try {
       const params = new URLSearchParams({ path: pathValue, hidden: String(showHidden) });
       // A content search shows its own results; the folder listing underneath stays unfiltered.
-      if (query && searchMode === "names") params.set("search", query);
-      const result = await requestJson<{ entries: FileEntry[]; path: string; disk: DiskInfo }>(`/api/fs?${params}`);
+      if (searchMode === "names") {
+        if (query) params.set("search", query);
+        if (filters.kind !== "any") params.set("kind", filters.kind);
+        if (filters.modifiedDays) params.set("modifiedDays", String(filters.modifiedDays));
+        if (filters.minBytes) params.set("minBytes", String(filters.minBytes));
+      }
+      const result = await requestJson<{ entries: FileEntry[]; path: string; disk: DiskInfo; truncated?: boolean; stoppedBy?: string }>(`/api/fs?${params}`);
       setEntries(result.entries);
+      setSearchInfo(params.has("search") || params.has("kind") || params.has("modifiedDays") || params.has("minBytes") ? { truncated: result.truncated, stoppedBy: result.stoppedBy } : null);
       setDisk(result.disk);
       setSelected(new Set());
       setCursor(null);
@@ -610,7 +630,7 @@ export function FileManager() {
     } finally {
       setLoading(false);
     }
-  }, [activeSearch, auth.authenticated, currentPath, notify, refreshAuth, searchMode, showHidden]);
+  }, [activeSearch, auth.authenticated, currentPath, filters, notify, refreshAuth, searchMode, showHidden]);
 
   // Runs a content search whenever its inputs change, cancelling any search still in progress.
   useEffect(() => {
@@ -658,7 +678,7 @@ export function FileManager() {
       if (auth.authenticated && withinHome(currentPath)) void loadDirectory(currentPath, activeSearch);
     }, 0);
     return () => window.clearTimeout(timer);
-  }, [auth.authenticated, activeSearch, currentPath, showHidden, searchMode]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [auth.authenticated, activeSearch, currentPath, showHidden, searchMode, filters]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // An account confined to a folder starts there and can't wander above it.
   useEffect(() => {
@@ -1399,7 +1419,7 @@ export function FileManager() {
             <div>
               <div className="heading-kicker"><span className="status-dot" /> LIVE FILESYSTEM</div>
               <h1>{currentPath ? currentPath.split("/").at(-1) : "All files"}</h1>
-              <p>{activeSearch && searchMode === "contents" ? (contentSearch?.result ? `${itemCount(contentSearch.result.hits.length).replace("item", "file")} containing “${contentSearch.result.query}”` : "Searching file contents…") : activeSearch ? `${entries.length} search results` : `${entries.length} ${entries.length === 1 ? "item" : "items"}`}{showHidden ? " · hidden files shown" : ""}</p>
+              <p>{activeSearch && searchMode === "contents" ? (contentSearch?.result ? `${itemCount(contentSearch.result.hits.length).replace("item", "file")} containing “${contentSearch.result.query}”` : "Searching file contents…") : nameSearching ? `${entries.length.toLocaleString()} ${entries.length === 1 ? "result" : "results"}${searchInfo?.truncated ? " (the first 500)" : searchInfo?.stoppedBy === "time" ? " (stopped after 20 seconds)" : searchInfo?.stoppedBy === "limit" ? " (stopped at 2 million items)" : ""}` : `${entries.length} ${entries.length === 1 ? "item" : "items"}`}{showHidden ? " · hidden files shown" : ""}</p>
             </div>
             <div className="primary-actions">
               <input ref={uploadRef} className="visually-hidden" type="file" multiple onChange={(event) => event.target.files && queueUpload(uploadItemsFromFiles(event.target.files))} />
@@ -1423,6 +1443,7 @@ export function FileManager() {
               <button type="button" className={searchMode === "contents" ? "active" : ""} aria-pressed={searchMode === "contents"} onClick={() => setSearchMode("contents")}>Contents</button>
               {searchMode === "contents" && <button type="button" className={`match-case ${matchCase ? "active" : ""}`} aria-pressed={matchCase} title="Match case" aria-label="Match case" onClick={() => setMatchCase(!matchCase)}>Aa</button>}
             </div>
+            {searchMode === "names" && <button type="button" className={`toolbar-button ${filtersOpen || filtersActive ? "active" : ""}`} aria-expanded={filtersOpen} onClick={() => setFiltersOpen(!filtersOpen)}><SlidersHorizontal size={16} /> Filters{filterCount ? <em className="nav-count">{filterCount}</em> : null}</button>}
             <div className="toolbar-spacer" />
             <div className={`sort-control ${view === "grid" ? "grid-mode" : ""}`}>
               <select aria-label="Sort by" value={sort.key} onChange={(event) => { const key = event.target.value as SortKey; applySort({ key, direction: INITIAL_DIRECTION[key] }); }}>
@@ -1436,6 +1457,16 @@ export function FileManager() {
               <button className={view === "grid" ? "active" : ""} aria-label="Grid view" onClick={() => setView("grid")}><LayoutGrid size={17} /></button>
             </div>
           </div>
+
+          {searchMode === "names" && filtersOpen && (
+            <div className="search-filters">
+              <label><span>Kind</span><select value={filters.kind} onChange={(event) => setFilters({ ...filters, kind: event.target.value })}>{SEARCH_KIND_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+              <label><span>Modified</span><select value={filters.modifiedDays} onChange={(event) => setFilters({ ...filters, modifiedDays: Number(event.target.value) })}>{MODIFIED_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+              <label><span>Size</span><select value={filters.minBytes} onChange={(event) => setFilters({ ...filters, minBytes: Number(event.target.value) })}>{SIZE_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+              {filterCount > 0 && <button type="button" className="text-button" onClick={() => setFilters(NO_FILTERS)}>Clear filters</button>}
+              <small>Filters look through {currentPath ? "this folder" : "every folder"} and everything inside it, with or without a name.</small>
+            </div>
+          )}
 
           {selected.size > 0 && (
             <div className="selection-bar">
@@ -1470,9 +1501,10 @@ export function FileManager() {
                 onReveal={(hit) => navigate(parentOf(hit.path))}
               />
             ) : loading && !entries.length ? <FileSkeleton /> : entries.length === 0 ? (
-              <EmptyState searching={Boolean(activeSearch)} onUpload={() => uploadRef.current?.click()} onNew={() => setDialog({ kind: "new" })} />
+              <EmptyState searching={Boolean(activeSearch) || nameSearching} onUpload={() => uploadRef.current?.click()} onNew={() => setDialog({ kind: "new" })} />
             ) : view === "list" ? (
               <FileTable
+                folder={currentPath}
                 entries={sortedEntries}
                 sort={sort}
                 onSort={(key) => applySort(nextSort(sort, key))}
@@ -1652,7 +1684,9 @@ function entryStateClasses(entry: FileEntry, interactions: EntryInteractions) {
   return `${interactions.cutPaths.has(entry.path) ? "cut" : ""} ${interactions.dropTarget === entry.path ? "drop-target" : ""}`;
 }
 
-function FileTable({ entries, sort, onSort, selected, cursor, interactions, allSelected, onToggleAll, onToggle, onOpen }: {
+function FileTable({ entries, sort, onSort, selected, cursor, interactions, allSelected, onToggleAll, onToggle, onOpen, folder }: {
+  /** The folder being shown; search results from elsewhere say where they are. */
+  folder?: string;
   entries: FileEntry[];
   sort: SortState;
   onSort: (key: SortKey) => void;
@@ -1687,7 +1721,7 @@ function FileTable({ entries, sort, onSort, selected, cursor, interactions, allS
         return (
           <div key={entry.path} data-path={entry.path} aria-selected={isSelected} className={`file-row ${isSelected ? "selected" : ""} ${cursor === entry.path ? "cursor" : ""} ${entryStateClasses(entry, interactions)}`} role="row" {...entryItemProps(entry, interactions)} onMouseDown={(event) => { if (event.shiftKey) event.preventDefault(); }} onDoubleClick={(event) => { if (!(event.target as HTMLElement).closest("button,input,label")) onOpen(entry); }} onClick={(event) => { if ((event.target as HTMLElement).closest("button,input,label")) return; onToggle(entry, { additive: event.metaKey || event.ctrlKey, range: event.shiftKey }); }}>
             <div role="cell"><CheckBox checked={isSelected} onChange={(event) => onToggle(entry, { additive: true, range: event.shiftKey })} label={`Select ${entry.name}`} /></div>
-            <div className="file-name-cell" role="cell"><span className={`file-icon ${entry.type}`}>{fileIcon(entry)}</span><button className="file-name" onClick={() => onOpen(entry)}>{entry.name}</button>{interactions.sharedPaths.has(entry.path) && <span className="shared-badge" title="Shared by link"><Link2 size={13} /></span>}{entry.symlinkBlocked && <span className="warning-badge" title="This link points outside the allowed root"><CircleAlert size={13} /></span>}</div>
+            <div className="file-name-cell" role="cell"><span className={`file-icon ${entry.type}`}>{fileIcon(entry)}</span>{folder !== undefined && parentOf(entry.path) !== folder ? <div className="file-name-stack"><button className="file-name" onClick={() => onOpen(entry)}>{entry.name}</button><small title={`/${entry.path}`}>{folderLabel(parentOf(entry.path))}</small></div> : <button className="file-name" onClick={() => onOpen(entry)}>{entry.name}</button>}{interactions.sharedPaths.has(entry.path) && <span className="shared-badge" title="Shared by link"><Link2 size={13} /></span>}{entry.symlinkBlocked && <span className="warning-badge" title="This link points outside the allowed root"><CircleAlert size={13} /></span>}</div>
             <div className="muted" role="cell">{entry.type === "directory" ? "—" : formatBytes(entry.size)}</div>
             <div className="owner-cell" role="cell"><span className="mini-avatar">{entry.owner.slice(0, 1).toUpperCase()}</span><span>{entry.owner}:{entry.group}</span></div>
             <div role="cell"><code className="mode-chip">{entry.mode}</code></div>
