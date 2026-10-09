@@ -322,7 +322,12 @@ export async function trashDuplicates(paths: string[]) {
   return { trashed, changed };
 }
 
-export type LinkSkip = { path: string; reason: Exclude<LinkOutcome, { linked: true }>["reason"] };
+export type LinkSkip = { path: string; reason: Exclude<LinkOutcome, { linked: true }>["reason"]; trashId?: string };
+
+/** Whether a scan is running (removals and links wait for it, as it replaces the report). */
+export function isDuplicateScanRunning() {
+  return Boolean(scan || starting);
+}
 
 /**
  * Replaces chosen copies with hard links to a kept copy of the same set: the oldest copy not
@@ -349,26 +354,40 @@ export async function linkDuplicates(paths: string[]) {
   }
   const linked: Array<{ path: string; target: string; trashId: string }> = [];
   const skipped: LinkSkip[] = [];
-  for (const plan of plans) {
-    const targetIdentity = reportFiles.get(plan.target.path)!;
-    for (const copy of plan.copies) {
-      // A copy already linked to the kept file shares its data, so there is nothing to do.
-      if (copy.inode === plan.target.inode) continue;
-      const outcome = await replaceWithLink(copy.path, reportFiles.get(copy.path)!, plan.target.path, targetIdentity);
-      if (outcome.linked) {
-        linked.push({ path: copy.path, target: plan.target.path, trashId: outcome.trashId });
-        Object.assign(copy, { inode: plan.target.inode, modified: plan.target.modified, links: plan.target.links + 1 });
-        reportFiles.set(copy.path, targetIdentity);
-      } else {
-        skipped.push({ path: copy.path, reason: outcome.reason });
+  try {
+    for (const plan of plans) {
+      const targetIdentity = reportFiles.get(plan.target.path);
+      for (const copy of plan.copies) {
+        // A copy already linked to the kept file shares its data, so there is nothing to do.
+        if (copy.inode === plan.target.inode) continue;
+        const identity = reportFiles.get(copy.path);
+        if (!targetIdentity || !identity) {
+          skipped.push({ path: copy.path, reason: "changed" });
+          continue;
+        }
+        // Each copy on its own: one that fails doesn't stop the rest, or lose what was done.
+        const outcome = await replaceWithLink(copy.path, identity, plan.target.path, targetIdentity).catch((error: unknown): LinkOutcome => {
+          console.error("Could not replace a duplicate with a hard link", error);
+          return { linked: false, reason: "failed" };
+        });
+        if (outcome.linked) {
+          linked.push({ path: copy.path, target: plan.target.path, trashId: outcome.trashId });
+          Object.assign(copy, { inode: plan.target.inode, modified: plan.target.modified, links: plan.target.links + 1 });
+          reportFiles.set(copy.path, targetIdentity);
+        } else {
+          skipped.push({ path: copy.path, reason: outcome.reason, ...(outcome.trashId ? { trashId: outcome.trashId } : {}) });
+          // A copy whose name was taken is in the trash; it is no longer a copy here.
+          if (outcome.reason === "taken") forgetDuplicatePaths([copy.path]);
+        }
       }
     }
+  } finally {
+    // Linked copies share the kept file's data now; sets left without an extra copy drop out.
+    const groups = lastReport!.groups
+      .map((group) => ({ ...group, wastedBytes: group.size * Math.max(0, new Set(group.copies.map((copy) => copy.inode)).size - 1) }))
+      .filter((group) => group.wastedBytes > 0);
+    lastReport = { ...lastReport!, groups, wastedBytes: groups.reduce((total, group) => total + group.wastedBytes, 0) };
   }
-  // Linked copies share the kept file's data now; sets left without an extra copy drop out.
-  const groups = lastReport!.groups
-    .map((group) => ({ ...group, wastedBytes: group.size * Math.max(0, new Set(group.copies.map((copy) => copy.inode)).size - 1) }))
-    .filter((group) => group.wastedBytes > 0);
-  lastReport = { ...lastReport!, groups, wastedBytes: groups.reduce((total, group) => total + group.wastedBytes, 0) };
   return { linked, skipped };
 }
 

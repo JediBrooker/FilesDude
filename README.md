@@ -248,7 +248,8 @@ minimum size, and scan for files with identical contents.
   goes to the trash, so the space comes back once the trash is emptied, and until then
   it can be restored. A copy is only linked if it is still exactly the scanned file and
   has the same owner, group, and permissions as the kept copy (a hard link shares
-  them); others are left alone and listed.
+  them), and isn't executable or writable by its group or others (so linking can't widen
+  who may change it); others are left alone and listed.
 - Removing a copy that a torrent client is still seeding breaks that torrent; replacing
   it with a hard link doesn't.
 

@@ -2329,7 +2329,7 @@ function DuplicatesDialog({ startPath, onClose, notify, onRefresh, onReveal }: {
       }
       const reasons = new Map<string, number>();
       for (const item of skipped) reasons.set(item.reason, (reasons.get(item.reason) ?? 0) + 1);
-      const why = [...reasons].map(([reason, count]) => `${count} ${({ "different-owner": "with a different owner or permissions", changed: "changed since the scan", "other-filesystem": "on another filesystem", taken: "whose name was taken meanwhile" } as Record<string, string>)[reason] ?? reason}`).join(", ");
+      const why = [...reasons].map(([reason, count]) => `${count} ${({ "different-owner": "with a different owner or permissions", permissions: "executable or writable by others", changed: "changed since the scan", "other-filesystem": "on another filesystem", taken: "whose name was taken meanwhile (the original is in the trash)", failed: "that couldn't be replaced" } as Record<string, string>)[reason] ?? reason}`).join(", ");
       notify(`${itemCount(linked)} replaced with hard links (originals in the trash)${skipped.length ? ` · left alone: ${why}` : ""}`, skipped.length ? "error" : undefined);
       setSelected(new Set());
       await onRefresh();

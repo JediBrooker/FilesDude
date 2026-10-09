@@ -129,6 +129,82 @@ test("copies can be replaced with hard links, keeping every path and sending ori
   });
 });
 
+test("hard links are only made to the exact kept file, and never for executable or shared-writable files", async () => {
+  await withRoot(async (root) => {
+    for (const folder of ["keep", "dup", "exec-keep", "exec-dup", "open-keep", "open-dup"]) await fs.mkdir(path.join(root, folder));
+    const write = async (file: string, seed: number, mode = 0o644) => {
+      await fs.writeFile(path.join(root, file), pattern(MB, seed));
+      await fs.chmod(path.join(root, file), mode);
+    };
+    await write("keep/a.bin", 30);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await write("dup/a.bin", 30);
+    await write("exec-keep/tool", 31, 0o755);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await write("exec-dup/tool", 31, 0o755);
+    await write("open-keep/notes.bin", 32, 0o664);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await write("open-dup/notes.bin", 32, 0o664);
+    await startDuplicateScan("", MB);
+    await waitForDuplicateScan();
+
+    // The kept file's name is swapped for another file just as the link is made.
+    const original = fs.link;
+    let swapped = false;
+    Object.assign(fs, {
+      link: async (from: string, to: string) => {
+        if (!swapped && String(to).includes(".filedude-link-")) {
+          swapped = true;
+          await fs.writeFile(path.join(root, "keep", "evil.bin"), pattern(MB, 99));
+          await fs.rename(path.join(root, "keep", "evil.bin"), path.join(root, "keep", "a.bin"));
+        }
+        return original(from, to);
+      },
+    });
+    let outcome;
+    try {
+      outcome = await withFilesystemLock(() => linkDuplicates(["dup/a.bin", "exec-dup/tool", "open-dup/notes.bin"]));
+    } finally {
+      Object.assign(fs, { link: original });
+    }
+    assert.ok(swapped);
+    assert.deepEqual(outcome.linked, []);
+    assert.deepEqual(outcome.skipped.map((item) => [item.path, item.reason]).sort(), [["dup/a.bin", "changed"], ["exec-dup/tool", "permissions"], ["open-dup/notes.bin", "permissions"]]);
+    // Nothing was replaced or trashed, and no temporary link was left behind.
+    assert.deepEqual(await fs.readFile(path.join(root, "dup", "a.bin")), pattern(MB, 30));
+    assert.deepEqual((await listTrash()).items, []);
+    assert.deepEqual(await fs.readdir(path.join(root, "dup")), ["a.bin"]);
+  });
+});
+
+test("if the final link fails, the replaced copy is put back from the trash", async () => {
+  await withRoot(async (root) => {
+    for (const name of ["a.bin", "b.bin"]) {
+      await fs.writeFile(path.join(root, name), pattern(MB, 40));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    await startDuplicateScan("", MB);
+    await waitForDuplicateScan();
+    const original = fs.link;
+    Object.assign(fs, {
+      link: async (from: string, to: string) => {
+        if (String(from).includes(".filedude-link-")) throw Object.assign(new Error("disk full"), { code: "ENOSPC" });
+        return original(from, to);
+      },
+    });
+    let outcome;
+    try {
+      outcome = await withFilesystemLock(() => linkDuplicates(["b.bin"]));
+    } finally {
+      Object.assign(fs, { link: original });
+    }
+    assert.deepEqual(outcome.skipped.map((item) => item.reason), ["failed"]);
+    assert.deepEqual(await fs.readFile(path.join(root, "b.bin")), pattern(MB, 40));
+    assert.deepEqual((await listTrash()).items, []);
+    assert.deepEqual((await fs.readdir(root)).filter((name) => !name.startsWith(".")).sort(), ["a.bin", "b.bin"]);
+  });
+});
+
 test("a set must keep a copy that is still unchanged on disk", async () => {
   await withRoot(async (root) => {
     for (const name of ["a.bin", "b.bin"]) await fs.writeFile(path.join(root, name), pattern(MB, 11));
