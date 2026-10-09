@@ -91,7 +91,9 @@ export async function POST(request: Request) {
     const updatedAt = new Date().toISOString();
     let credentialVersion = current.version;
     if (credentialsChanged) {
+      // Spread so two-factor sign-in (and anything else stored with the credentials) is kept.
       const updated = {
+        ...current,
         username,
         passwordHash: body.newPassword ? await hashPassword(body.newPassword as string) : current.passwordHash,
         version: current.version + 1,

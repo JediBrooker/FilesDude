@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { config, isValidPasswordHash } from "./config";
-import { getCredentials, hashPassword, validateNewPassword, validateUsername } from "./credentials";
+import { getCredentials, hashPassword, validateNewPassword, validateUsername, type StoredTwoFactor } from "./credentials";
 import { normalizeRelative, safeResolve } from "./files";
 import { AppError } from "./http";
 
@@ -20,9 +20,10 @@ export interface StoredUser {
   version: number;
   createdAt: string;
   updatedAt: string;
+  twoFactor?: StoredTwoFactor;
 }
 
-export type UserSummary = Omit<StoredUser, "passwordHash" | "version">;
+export type UserSummary = Omit<StoredUser, "passwordHash" | "version" | "twoFactor"> & { twoFactor: boolean };
 
 let mutationQueue: Promise<void> = Promise.resolve();
 
@@ -31,7 +32,7 @@ function usersFile() {
 }
 
 function summary(user: StoredUser): UserSummary {
-  return { id: user.id, username: user.username, role: user.role, root: user.root, createdAt: user.createdAt, updatedAt: user.updatedAt };
+  return { id: user.id, username: user.username, role: user.role, root: user.root, createdAt: user.createdAt, updatedAt: user.updatedAt, twoFactor: Boolean(user.twoFactor) };
 }
 
 async function readUsers(): Promise<StoredUser[]> {
@@ -150,6 +151,19 @@ export async function changeOwnPassword(id: string, newPassword: string) {
     if (!user) throw new AppError("That account no longer exists", 404, "NOT_FOUND");
     const updated = { ...user, passwordHash, version: user.version + 1, updatedAt: new Date().toISOString() };
     return { users: users.map((item) => (item.id === id ? updated : item)), result: updated.version };
+  });
+}
+
+/**
+ * Reads, changes, and saves one account, one change at a time; `change` returns null to leave it as
+ * it is. Used for two-factor sign-in, which changes the account on every code used.
+ */
+export async function updateUserAccount<T>(id: string, change: (user: StoredUser) => Promise<{ next: StoredUser | null; result: T }>) {
+  return mutate(async (users) => {
+    const user = users.find((item) => item.id === id);
+    if (!user) throw new AppError("That account no longer exists", 404, "NOT_FOUND");
+    const { next, result } = await change(user);
+    return { users: next ? users.map((item) => (item.id === id ? next : item)) : users, result };
   });
 }
 

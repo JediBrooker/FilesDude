@@ -5,7 +5,10 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { createSession } from "../lib/auth";
+import { clearLoginFailures, createSession } from "../lib/auth";
+import { currentStep, totpAt } from "../lib/totp";
+import { getCredentials as readCredentials } from "../lib/credentials";
+import { GET as twoFactorStatus, POST as twoFactorAction } from "../app/api/auth/two-factor/route";
 import { config } from "../lib/config";
 import { getCredentials } from "../lib/credentials";
 import { inside, openDirectory, withOpen } from "../lib/files";
@@ -361,6 +364,102 @@ test("only the owner sets trash retention, and the trash shows it", async () => 
     assert.deepEqual([saved.trashRetentionDays, saved.uploadOwnership], [30, { mode: "service" }]);
     assert.equal(await status(call(preferences, "/api/auth/preferences", owner, { trashRetentionDays: null })), 200);
     assert.equal((await (await call(readPreferences, "/api/auth/preferences", owner)).json()).trashRetentionDays, null);
+  });
+});
+
+const cookieFrom = (response: Response) => (response.headers.get("set-cookie") || "").split(";")[0];
+const signIn = (body: Record<string, unknown>) => login(new Request("http://localhost/api/auth/login", { method: "POST", headers: { "content-type": "application/json", "x-filedude-request": "1" }, body: JSON.stringify(body) }));
+
+// Turns two-factor sign-in on for an account and returns its secret, recovery codes, and new cookie.
+async function enableTwoFactor(cookie: string, password: string) {
+  const setup = await (await call(twoFactorAction, "/api/auth/two-factor", cookie, { action: "setup", currentPassword: password })).json();
+  assert.match(setup.qr, /^data:image\/svg\+xml;base64,/);
+  const enabled = await call(twoFactorAction, "/api/auth/two-factor", cookie, { action: "enable", setupToken: setup.setupToken, code: totpAt(setup.secret, currentStep()) });
+  assert.equal(enabled.status, 200);
+  return { secret: setup.secret as string, recoveryCodes: (await enabled.json()).recoveryCodes as string[], cookie: cookieFrom(enabled) };
+}
+
+test("two-factor sign-in: setup, codes used once, recovery codes, and attempts", async () => {
+  await withAccounts(async ({ bob }) => {
+    clearLoginFailures("direct-client");
+    assert.equal(await status(call(twoFactorAction, "/api/auth/two-factor", bob, { action: "setup", currentPassword: "wrong-password-here" })), 401);
+    const setup = await (await call(twoFactorAction, "/api/auth/two-factor", bob, { action: "setup", currentPassword: USER_PASSWORD })).json();
+    assert.equal(await status(call(twoFactorAction, "/api/auth/two-factor", bob, { action: "enable", setupToken: setup.setupToken, code: "000000" })), 400);
+    assert.equal(await status(call(twoFactorAction, "/api/auth/two-factor", bob, { action: "enable", setupToken: `${setup.setupToken}x`, code: totpAt(setup.secret, currentStep()) })), 400);
+    const enableStep = currentStep();
+    const enabled = await call(twoFactorAction, "/api/auth/two-factor", bob, { action: "enable", setupToken: setup.setupToken, code: totpAt(setup.secret, enableStep) });
+    assert.equal(enabled.status, 200);
+    const { recoveryCodes } = await enabled.json();
+    assert.equal(recoveryCodes.length, 10);
+    // Turning it on signs out other sessions; the response carries a fresh one.
+    assert.equal(await status(call(listFs, "/api/fs?path=home/bob", bob)), 401);
+    const fresh = cookieFrom(enabled);
+    assert.deepEqual(await (await call(twoFactorStatus, "/api/auth/two-factor", fresh)).json(), { enabled: true, enabledAt: (await (await call(twoFactorStatus, "/api/auth/two-factor", fresh)).json()).enabledAt, recoveryCodesLeft: 10 });
+
+    // The password alone no longer gives a session.
+    const first = await signIn({ username: "bob", password: USER_PASSWORD });
+    const challenge = await first.json();
+    assert.deepEqual([first.status, challenge.twoFactorRequired, cookieFrom(first)], [200, true, ""]);
+    assert.equal(await status(signIn({ challenge: challenge.challenge, code: "000000" })), 401);
+    // The code used to turn it on was consumed, so the same time step can't be replayed.
+    assert.equal(await status(signIn({ challenge: challenge.challenge, code: totpAt(setup.secret, enableStep) })), 401);
+    clearLoginFailures("direct-client");
+    const next = totpAt(setup.secret, enableStep + 1);
+    const verified = await signIn({ challenge: challenge.challenge, code: next });
+    assert.equal(verified.status, 200);
+    assert.equal(await status(call(listFs, "/api/fs?path=home/bob", cookieFrom(verified))), 200);
+    // A challenge can't be reused once it has worked, and the same code can't sign in again.
+    const again = (await (await signIn({ username: "bob", password: USER_PASSWORD })).json()).challenge;
+    assert.equal(await status(signIn({ challenge: again, code: next })), 401);
+
+    // A recovery code works once, with or without its dash.
+    clearLoginFailures("direct-client");
+    const recovery = await signIn({ challenge: again, code: recoveryCodes[0].replace("-", "").toUpperCase() });
+    assert.equal(recovery.status, 200);
+    assert.equal((await recovery.json()).recoveryCodesLeft, 9);
+    const third = (await (await signIn({ username: "bob", password: USER_PASSWORD })).json()).challenge;
+    assert.equal(await status(signIn({ challenge: third, code: recoveryCodes[0] })), 401);
+
+    // Each challenge allows five tries, after which the password is needed again.
+    clearLoginFailures("direct-client");
+    const limited = (await (await signIn({ username: "bob", password: USER_PASSWORD })).json()).challenge;
+    for (let attempt = 0; attempt < 4; attempt += 1) assert.equal(await status(signIn({ challenge: limited, code: "000000" })), 401);
+    clearLoginFailures("direct-client");
+    assert.equal(await status(signIn({ challenge: limited, code: "000000" })), 401);
+    const exhausted = await signIn({ challenge: limited, code: recoveryCodes[1] });
+    assert.deepEqual([exhausted.status, (await exhausted.json()).code], [401, "CHALLENGE_EXPIRED"]);
+    clearLoginFailures("direct-client");
+  });
+});
+
+test("two-factor sign-in can be turned off, reset by the owner, and survives credential changes", async () => {
+  await withAccounts(async ({ owner, bob, ids }) => {
+    clearLoginFailures("direct-client");
+    const bobTwoFactor = await enableTwoFactor(bob, USER_PASSWORD);
+    const listed = (await (await call(usersList, "/api/users", owner)).json()).users.find((user: { id: string }) => user.id === ids.bob);
+    assert.equal(listed.twoFactor, true);
+    assert.equal(JSON.stringify(listed).includes(bobTwoFactor.secret), false);
+
+    // Turning it off needs the password and a code.
+    assert.equal(await status(call(twoFactorAction, "/api/auth/two-factor", bobTwoFactor.cookie, { action: "disable", currentPassword: USER_PASSWORD, code: "000000" })), 401);
+    assert.equal(await status(call(twoFactorAction, "/api/auth/two-factor", bobTwoFactor.cookie, { action: "disable", currentPassword: "wrong-password-here", code: bobTwoFactor.recoveryCodes[0] })), 401);
+
+    // The owner resets it for a lost phone: bob is signed out and signs in with a password alone.
+    assert.equal(await status(call(usersAction, "/api/users", owner, { action: "resetTwoFactor", id: ids.bob })), 200);
+    assert.equal(await status(call(listFs, "/api/fs?path=home/bob", bobTwoFactor.cookie)), 401);
+    const plain = await signIn({ username: "bob", password: USER_PASSWORD });
+    assert.deepEqual([plain.status, (await plain.json()).authenticated], [200, true]);
+    assert.equal(await status(call(usersAction, "/api/users", owner, { action: "resetTwoFactor", id: ids.bob })), 409);
+
+    // The owner's own two-factor sign-in is kept when they change their password.
+    const ownerTwoFactor = await enableTwoFactor(owner, OWNER_PASSWORD);
+    const changed = await call(preferences, "/api/auth/preferences", ownerTwoFactor.cookie, { currentPassword: OWNER_PASSWORD, newPassword: "another-owner-password" });
+    assert.equal(changed.status, 200);
+    assert.ok((await readCredentials()).twoFactor);
+    const disabled = await call(twoFactorAction, "/api/auth/two-factor", cookieFrom(changed), { action: "disable", currentPassword: "another-owner-password", code: ownerTwoFactor.recoveryCodes[0] });
+    assert.equal(disabled.status, 200);
+    assert.equal((await readCredentials()).twoFactor, undefined);
+    clearLoginFailures("direct-client");
   });
 });
 

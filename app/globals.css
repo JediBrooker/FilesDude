@@ -612,6 +612,17 @@ kbd { padding: 3px 5px; border: 1px solid var(--line); border-bottom-width: 2px;
 .user-form { display: grid; gap: 12px; margin: 6px 0 0 !important; padding: 14px !important; border: 1px solid var(--line); border-radius: 10px; }
 .user-form > strong { font-size: 11px; }
 .user-form .modal-actions { margin-top: 0; padding-bottom: 0; }
+.two-factor-qr { display: flex; align-items: center; gap: 16px; }
+.two-factor-qr img { flex: 0 0 auto; padding: 6px; border-radius: 10px; background: #fff; }
+.two-factor-qr > div { display: flex; min-width: 0; flex-direction: column; gap: 6px; }
+.two-factor-qr span { color: var(--ink-soft); font-size: 11px; }
+.two-factor-secret { overflow-wrap: anywhere; font-size: 12px; letter-spacing: .04em; }
+.recovery-codes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 18px; margin: 0; padding-left: 22px; font-size: 13px; }
+.two-factor-badge { display: inline-flex; align-items: center; gap: 3px; margin-left: 7px; padding: 1px 6px; border-radius: 999px; background: var(--brand-soft); color: var(--brand); font-size: 9px; font-weight: 800; vertical-align: middle; }
+.login-hint { margin: -4px 0 0; color: var(--ink-soft); font-size: 11px; }
+.settings-section-title > .button { margin-left: auto; }
+.preferences-form .modal-actions { flex-wrap: wrap; }
+@media (max-width: 560px) { .two-factor-qr { flex-direction: column; align-items: flex-start; } .recovery-codes { grid-template-columns: 1fr; } }
 .trash-expiry { display: block; margin-top: 2px; color: var(--ink-soft); font-size: 9px; }
 .job-panels { position: fixed; z-index: 190; right: 22px; bottom: 78px; display: flex; max-height: calc(100vh - 120px); flex-direction: column; gap: 8px; overflow-y: auto; }
 .job-panel { display: grid; width: min(330px, calc(100vw - 44px)); gap: 9px; padding: 11px 12px; border: 1px solid color-mix(in srgb, var(--brand) 30%, var(--line)); border-radius: 11px; background: var(--panel); box-shadow: var(--shadow); }
