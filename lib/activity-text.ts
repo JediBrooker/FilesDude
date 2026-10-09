@@ -13,6 +13,11 @@ export const ACTIVITY_CATEGORIES: Array<{ id: ActivityCategory | "all"; label: s
   { id: "snapshots", label: "Snapshots" },
 ];
 
+// Who did it, for entries not made by an account: names no account can have (usernames are
+// letters, numbers, dots, dashes, and underscores).
+export const SHARE_LINK_ACTOR = "@share-link";
+export const SYSTEM_ACTOR = "@system";
+
 export function activityCategory(event: string): ActivityCategory {
   if (event === "fs.download" || event === "snapshots.download" || event === "share.download") return "downloads";
   if (event.startsWith("login.") || event === "logout") return "sign-ins";
@@ -22,25 +27,49 @@ export function activityCategory(event: string): ActivityCategory {
   return "files";
 }
 
-export type ActivityText = { text: string; detail?: string; tone?: "danger" | "warning" };
+/**
+ * A sentence as parts: plain words, and values that came from users (names, paths, addresses),
+ * which the page shows set apart so they can't pass for the sentence around them.
+ */
+export type ActivityPart = string | { value: string };
+export type ActivityText = { parts: ActivityPart[]; text: string; detail?: string; tone?: "danger" | "warning" };
 type Entry = { event: string; [key: string]: unknown };
 
-/** Who did it: the account, "share link" for downloads through a link, or "system" for upkeep. */
+/** Who did it: the account, a share link, or FilesDude itself (upkeep). */
 export function activityUser(entry: Entry) {
-  if (entry.event === "share.download") return "share link";
+  if (entry.event === "share.download") return SHARE_LINK_ACTOR;
   if (entry.event.startsWith("login.")) return typeof entry.username === "string" ? entry.username : "";
-  return typeof entry.username === "string" ? entry.username : "system";
+  return typeof entry.username === "string" ? entry.username : SYSTEM_ACTOR;
+}
+
+// Characters that are invisible or change the direction of the text around them.
+const HIDDEN_CHARACTERS = new RegExp("[\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u061c\\u180e\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u2069\\ufeff\\ufff9-\\ufffb]", "g");
+
+/** Text from a user with invisible and direction-changing characters shown as their code. */
+export function visibleText(value: string) {
+  return value.replace(HIDDEN_CHARACTERS, (character) => `⟨U+${character.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0")}⟩`);
 }
 
 const str = (value: unknown) => (typeof value === "string" ? value : "");
 const list = (value: unknown) => (Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : []);
 const slash = (value: unknown) => `/${str(value)}`;
 const count = (value: number, noun: string) => `${value.toLocaleString()} ${noun}${value === 1 ? "" : "s"}`;
+const v = (value: string): ActivityPart => ({ value });
+
+// Builds parts from a template: interpolated parts and part lists are kept, plain strings are words.
+function t(strings: TemplateStringsArray, ...values: Array<ActivityPart | ActivityPart[]>): ActivityPart[] {
+  const parts: ActivityPart[] = [];
+  strings.forEach((text, index) => {
+    if (text) parts.push(text);
+    if (index < values.length) parts.push(...(Array.isArray(values[index]) ? values[index] as ActivityPart[] : [values[index] as ActivityPart]));
+  });
+  return parts;
+}
 
 // "/a/b.txt" for one path, "3 items" for several; the detail line lists them.
-function items(paths: string[], fallback?: unknown) {
-  if (paths.length === 1) return slash(paths[0]);
-  if (!paths.length && typeof fallback === "string") return slash(fallback);
+function items(paths: string[], fallback?: unknown): ActivityPart {
+  if (paths.length === 1) return v(slash(paths[0]));
+  if (!paths.length && typeof fallback === "string") return v(slash(fallback));
   return count(paths.filter((item) => !item.startsWith("…")).length || paths.length, "item");
 }
 
@@ -60,80 +89,88 @@ function formatSize(bytes: number) {
 }
 
 // A job's outcome, when it didn't simply finish.
-function outcome(entry: Entry): Pick<ActivityText, "tone"> & { suffix: string } {
-  if (entry.status === "failed") return { tone: "danger", suffix: ` (failed${str(entry.error) ? `: ${str(entry.error)}` : ""})` };
-  if (entry.status === "cancelled") return { tone: "warning", suffix: " (cancelled)" };
-  return { suffix: "" };
+function outcome(entry: Entry): { tone?: ActivityText["tone"]; parts: ActivityPart[] } {
+  if (entry.status === "failed") return { tone: "danger", parts: str(entry.error) ? t` (failed: ${v(str(entry.error))})` : [" (failed)"] };
+  if (entry.status === "cancelled") return { tone: "warning", parts: [" (cancelled)"] };
+  return { parts: [] };
 }
 
-/** What happened, in words: "moved 3 items to /Media", with any long detail on a second line. */
-export function describeActivity(entry: Entry): ActivityText {
+function describe(entry: Entry): Omit<ActivityText, "text"> {
   const paths = list(entry.paths);
+  const client = str(entry.client) || undefined;
   switch (entry.event) {
-    case "login.succeeded": return { text: entry.twoFactor ? "signed in with two-factor" : "signed in", detail: str(entry.client) || undefined };
-    case "login.failed": return { text: `failed to sign in${str(entry.username) ? ` as “${str(entry.username)}”` : ""}`, detail: str(entry.client) || undefined, tone: "danger" };
-    case "login.two_factor.challenged": return { text: "entered their password and was asked for a code", detail: str(entry.client) || undefined };
-    case "login.two_factor.failed": return { text: "entered a wrong two-factor code", detail: str(entry.client) || undefined, tone: "danger" };
-    case "logout": return { text: "signed out" };
+    case "login.succeeded": return { parts: [entry.twoFactor ? "signed in with two-factor" : "signed in"], detail: client };
+    case "login.failed": return { parts: str(entry.username) ? t`failed to sign in as ${v(str(entry.username))}` : ["failed to sign in"], detail: client, tone: "danger" };
+    case "login.two_factor.challenged": return { parts: ["entered their password and was asked for a code"], detail: client };
+    case "login.two_factor.failed": return { parts: ["entered a wrong two-factor code"], detail: client, tone: "danger" };
+    case "logout": return { parts: ["signed out"] };
     case "fs.upload": {
       const files = Array.isArray(entry.files) ? entry.files.length : 0;
       const size = typeof entry.bytes === "number" ? ` (${formatSize(entry.bytes)})` : "";
-      return { text: `uploaded ${count(files, "file")}${size} to ${slash(entry.directory)}` };
+      return { parts: t`uploaded ${count(files, "file")}${size} to ${v(slash(entry.directory))}` };
     }
     case "fs.download": return typeof entry.items === "number"
-      ? { text: `downloaded ${count(entry.items, "item")} as a ZIP`, detail: pathDetail(paths) }
-      : { text: `downloaded ${slash(entry.path)}` };
-    case "fs.create": return { text: `created ${slash([str(entry.path), str(entry.name)].filter(Boolean).join("/"))}` };
-    case "fs.rename": return { text: `renamed ${slash(entry.path)}${str(entry.name) ? ` to “${str(entry.name)}”` : ""}` };
-    case "fs.write": return { text: `edited ${slash(entry.path)}` };
-    case "fs.delete": return { text: `${entry.permanent ? "permanently deleted" : "moved to the trash"} ${items(paths)}`, detail: pathDetail(paths), tone: entry.permanent ? "warning" : undefined };
+      ? { parts: [`downloaded ${count(entry.items, "item")} as a ZIP`], detail: pathDetail(paths) }
+      : { parts: t`downloaded ${v(slash(entry.path))}` };
+    case "fs.create": return { parts: t`created ${v(slash([str(entry.path), str(entry.name)].filter(Boolean).join("/")))}` };
+    case "fs.rename": return { parts: str(entry.name) ? t`renamed ${v(slash(entry.path))} to ${v(str(entry.name))}` : t`renamed ${v(slash(entry.path))}` };
+    case "fs.write": return { parts: t`edited ${v(slash(entry.path))}` };
+    case "fs.delete": return { parts: t`${entry.permanent ? "permanently deleted" : "moved to the trash"} ${items(paths)}`, detail: pathDetail(paths), tone: entry.permanent ? "warning" : undefined };
     case "fs.copy":
     case "fs.move": {
       const result = outcome(entry);
-      return { text: `${entry.event === "fs.move" ? "moved" : "copied"} ${items(paths)} to ${slash(entry.destination)}${result.suffix}`, detail: pathDetail(paths), tone: result.tone };
+      return { parts: t`${entry.event === "fs.move" ? "moved" : "copied"} ${items(paths)} to ${v(slash(entry.destination))}${result.parts}`, detail: pathDetail(paths), tone: result.tone };
     }
-    case "fs.chmod": return { text: `changed permissions of ${items(paths)}${str(entry.mode) ? ` to ${str(entry.mode)}` : ""}`, detail: pathDetail(paths) };
-    case "fs.chown": return { text: `changed the owner of ${items(paths)}${typeof entry.uid === "number" ? ` to ${entry.uid}:${entry.gid}` : ""}`, detail: pathDetail(paths) };
-    case "fs.bulkRename": return { text: `renamed ${items(paths)} at once`, detail: pathDetail(paths) };
+    case "fs.chmod": return { parts: str(entry.mode) ? t`changed permissions of ${items(paths)} to ${v(str(entry.mode))}` : t`changed permissions of ${items(paths)}`, detail: pathDetail(paths) };
+    case "fs.chown": return { parts: typeof entry.uid === "number" ? t`changed the owner of ${items(paths)} to ${`${entry.uid}:${entry.gid}`}` : t`changed the owner of ${items(paths)}`, detail: pathDetail(paths) };
+    case "fs.bulkRename": return { parts: t`renamed ${items(paths)} at once`, detail: pathDetail(paths) };
     case "fs.compress": {
       const result = outcome(entry);
-      return { text: `compressed ${items(paths)}${str(entry.result) ? ` into ${slash(entry.result)}` : ""}${result.suffix}`, detail: pathDetail(paths), tone: result.tone };
+      return { parts: t`compressed ${items(paths)}${str(entry.result) ? t` into ${v(slash(entry.result))}` : []}${result.parts}`, detail: pathDetail(paths), tone: result.tone };
     }
     case "fs.extract": {
       const result = outcome(entry);
-      return { text: `extracted ${slash(entry.path)}${str(entry.result) ? ` into ${slash(entry.result)}` : ""}${result.suffix}`, tone: result.tone };
+      return { parts: t`extracted ${v(slash(entry.path))}${str(entry.result) ? t` into ${v(slash(entry.result))}` : []}${result.parts}`, tone: result.tone };
     }
-    case "trash.restore": return { text: `restored ${count(list(entry.ids).length || 1, "item")} from the trash` };
-    case "trash.delete": return { text: `deleted ${count(list(entry.ids).length || 1, "item")} from the trash forever`, tone: "warning" };
-    case "trash.empty": return { text: `emptied the trash${typeof entry.removed === "number" ? ` (${count(entry.removed, "item")})` : ""}`, tone: "warning" };
-    case "trash.purge": return { text: `removed ${count(typeof entry.removed === "number" ? entry.removed : 0, "old item")} from the trash${typeof entry.retentionDays === "number" ? ` (kept ${entry.retentionDays} days)` : ""}` };
-    case "duplicates.scan": return { text: `looked for duplicates in ${slash(entry.path)}` };
-    case "duplicates.trash": return { text: `moved ${items(paths)} duplicates to the trash`, detail: pathDetail(paths) };
-    case "duplicates.link": return { text: `replaced ${count(Array.isArray(entry.linked) ? entry.linked.length : 0, "duplicate")} with hard links` };
-    case "share.create": return { text: `shared ${slash(entry.path)}${str(entry.expiresAt) ? `, until ${new Date(str(entry.expiresAt)).toLocaleString()}` : ""}` };
-    case "share.revoke": return { text: entry.reason === "item deleted" ? `revoked ${count(list(entry.ids).length, "share link")} for deleted items` : "revoked a share link" };
-    case "share.download": return { text: `downloaded ${slash(entry.path)}`, detail: str(entry.address) || undefined };
-    case "users.create": return { text: `added ${str(entry.role) === "viewer" ? "viewer" : "editor"} “${str(entry.account)}” with ${slash(entry.root)}` };
-    case "users.update": return { text: `changed “${str(entry.account)}” (${str(entry.role)}, ${slash(entry.root)})${entry.passwordReset ? " and reset their password" : ""}` };
-    case "users.delete": return { text: `removed the account “${str(entry.account)}”`, tone: "warning" };
-    case "users.two_factor_reset": return { text: `turned off two-factor for “${str(entry.account)}”`, tone: "warning" };
-    case "settings.password.changed": return { text: "changed their password" };
-    case "settings.credentials.failed": return { text: "entered a wrong current password in preferences", tone: "danger" };
-    case "settings.preferences.updated": return { text: str(entry.previousUsername) && entry.previousUsername !== entry.username ? `renamed their account from “${str(entry.previousUsername)}”` : "updated their preferences" };
-    case "settings.two_factor.enabled": return { text: "turned on two-factor sign-in" };
-    case "settings.two_factor.disabled": return { text: "turned off two-factor sign-in", tone: "warning" };
-    case "settings.two_factor.recovery_codes": return { text: "made new recovery codes" };
-    case "settings.two_factor.failed": return { text: "entered a wrong two-factor code in preferences", tone: "danger" };
-    case "snapshots.create": return { text: `took snapshot ${str(entry.name)}${entry.scheduled ? " (scheduled)" : ""}` };
-    case "snapshots.delete": return { text: `deleted snapshot ${str(entry.name)}`, tone: "warning" };
-    case "snapshots.prune": return { text: `removed ${count(list(entry.names).length, "old scheduled snapshot")}` };
+    case "trash.restore": return { parts: [`restored ${count(list(entry.ids).length || 1, "item")} from the trash`] };
+    case "trash.delete": return { parts: [`deleted ${count(list(entry.ids).length || 1, "item")} from the trash forever`], tone: "warning" };
+    case "trash.empty": return { parts: [`emptied the trash${typeof entry.removed === "number" ? ` (${count(entry.removed, "item")})` : ""}`], tone: "warning" };
+    case "trash.purge": return { parts: [`removed ${count(typeof entry.removed === "number" ? entry.removed : 0, "old item")} from the trash${typeof entry.retentionDays === "number" ? ` (kept ${entry.retentionDays} days)` : ""}`] };
+    case "duplicates.scan": return { parts: t`looked for duplicates in ${v(slash(entry.path))}` };
+    case "duplicates.trash": return { parts: t`moved ${items(paths)} duplicates to the trash`, detail: pathDetail(paths) };
+    case "duplicates.link": return { parts: [`replaced ${count(Array.isArray(entry.linked) ? entry.linked.length : 0, "duplicate")} with hard links`] };
+    case "share.create": return { parts: t`shared ${v(slash(entry.path))}${str(entry.expiresAt) ? `, until ${new Date(str(entry.expiresAt)).toLocaleString()}` : ""}` };
+    case "share.revoke": return { parts: [entry.reason === "item deleted" ? `revoked ${count(list(entry.ids).length, "share link")} for deleted items` : "revoked a share link"] };
+    case "share.download": return { parts: t`downloaded ${v(slash(entry.path))}`, detail: str(entry.address) || undefined };
+    case "users.create": return { parts: t`added ${str(entry.role) === "viewer" ? "viewer" : "editor"} ${v(str(entry.account))} with ${v(slash(entry.root))}` };
+    case "users.update": return { parts: t`changed ${v(str(entry.account))} (${str(entry.role)}, ${v(slash(entry.root))})${entry.passwordReset ? " and reset their password" : ""}` };
+    case "users.delete": return { parts: t`removed the account ${v(str(entry.account))}`, tone: "warning" };
+    case "users.two_factor_reset": return { parts: t`turned off two-factor for ${v(str(entry.account))}`, tone: "warning" };
+    case "settings.password.changed": return { parts: ["changed their password"] };
+    case "settings.credentials.failed": return { parts: ["entered a wrong current password in preferences"], tone: "danger" };
+    case "settings.preferences.updated": return { parts: str(entry.previousUsername) && entry.previousUsername !== entry.username ? t`renamed their account from ${v(str(entry.previousUsername))}` : ["updated their preferences"] };
+    case "settings.two_factor.enabled": return { parts: ["turned on two-factor sign-in"] };
+    case "settings.two_factor.disabled": return { parts: ["turned off two-factor sign-in"], tone: "warning" };
+    case "settings.two_factor.recovery_codes": return { parts: ["made new recovery codes"] };
+    case "settings.two_factor.failed": return { parts: ["entered a wrong two-factor code in preferences"], tone: "danger" };
+    case "snapshots.create": return { parts: t`took snapshot ${v(str(entry.name))}${entry.scheduled ? " (scheduled)" : ""}` };
+    case "snapshots.delete": return { parts: t`deleted snapshot ${v(str(entry.name))}`, tone: "warning" };
+    case "snapshots.prune": return { parts: [`removed ${count(list(entry.names).length, "old scheduled snapshot")}`] };
     case "snapshots.restore": {
       const result = outcome(entry);
-      return { text: `restored ${slash(entry.path)} from ${str(entry.snapshot)}${str(entry.restoredTo) ? ` as ${slash(entry.restoredTo)}` : ""}${result.suffix}`, tone: result.tone };
+      return { parts: t`restored ${v(slash(entry.path))} from ${v(str(entry.snapshot))}${str(entry.restoredTo) ? t` as ${v(slash(entry.restoredTo))}` : []}${result.parts}`, tone: result.tone };
     }
-    case "snapshots.download": return { text: `downloaded ${slash(entry.path)} from ${str(entry.snapshot)}` };
-    case "snapshots.schedule": return { text: "changed the snapshot schedule" };
-    case "snapshots.access": return { text: "changed who can see snapshots" };
-    default: return { text: entry.event };
+    case "snapshots.download": return { parts: t`downloaded ${v(slash(entry.path))} from ${v(str(entry.snapshot))}` };
+    case "snapshots.schedule": return { parts: ["changed the snapshot schedule"] };
+    case "snapshots.access": return { parts: ["changed who can see snapshots"] };
+    case "audit.rotated": return { parts: [`started a new audit log file${Array.isArray(entry.removed) ? `, removing ${count(entry.removed.length, "old file")}` : ""}`] };
+    case "audit.dropped": return { parts: [`couldn't record ${count(typeof entry.count === "number" ? entry.count : 0, "event")} during a flood of activity`], tone: "warning" };
+    default: return { parts: [v(entry.event)] };
   }
+}
+
+/** What happened, in words ("moved 3 items to /Media"), with any long detail on a second line. */
+export function describeActivity(entry: Entry): ActivityText {
+  const described = describe(entry);
+  return { ...described, text: described.parts.map((part) => (typeof part === "string" ? part : part.value)).join("") };
 }

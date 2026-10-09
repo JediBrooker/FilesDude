@@ -32,9 +32,24 @@ function unavailable() {
   return new Response("This link is invalid, has expired, or the item is no longer available.\n", { status: 404, headers: { ...baseHeaders, "Content-Type": "text/plain; charset=utf-8" } });
 }
 
+// Downloads through a link are recorded once per link and address every ten minutes, not for each
+// of the many range requests a video player or download manager makes.
+const RECORD_EVERY_MS = 10 * 60 * 1000;
+const recentlyRecorded = new Map<string, number>();
+
+function shouldRecord(key: string, startsDownload: boolean) {
+  const now = Date.now();
+  const last = recentlyRecorded.get(key);
+  if (!startsDownload && last !== undefined && now - last < RECORD_EVERY_MS) return false;
+  recentlyRecorded.delete(key);
+  recentlyRecorded.set(key, now);
+  if (recentlyRecorded.size > 5_000) recentlyRecorded.delete(recentlyRecorded.keys().next().value!);
+  return true;
+}
+
 /** Parses a single byte range, including suffix ranges ("bytes=-500" is the last 500 bytes). */
 function parseRange(header: string, size: number) {
-  const match = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+  const match = /^bytes=(\d{0,20})-(\d{0,20})$/.exec(header.trim());
   if (!match || (!match[1] && !match[2]) || size === 0) return null;
   if (!match[1]) {
     const suffix = Number(match[2]);
@@ -68,7 +83,10 @@ export async function GET(request: Request, { params }: { params: Promise<{ toke
     }
     const counts = request.method === "GET" && (!range || range.start === 0);
     if (counts && !(await recordShareDownload(share.id))) return unavailable();
-    if (request.method === "GET") await audit("share.download", { id: share.id, path: share.path, address: clientAddress(request), range: rangeHeader ?? undefined });
+    const address = clientAddress(request);
+    if (request.method === "GET" && shouldRecord(`${share.id}|${address}`, counts)) {
+      await audit("share.download", { id: share.id, path: share.path, address, range: range ? `${range.start}-${range.end}` : undefined });
+    }
 
     if (request.method === "HEAD") {
       return new Response(null, { headers: { ...baseHeaders, "Content-Type": stat.isDirectory() ? "application/zip" : getMime(path.basename(openedPath)), "Content-Disposition": dispositionName(stat.isDirectory() ? `${share.name}.zip` : share.name) } });

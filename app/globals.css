@@ -554,6 +554,7 @@ kbd { padding: 3px 5px; border: 1px solid var(--line); border-bottom-width: 2px;
 .activity-icon.downloads, .activity-icon.sharing { background: color-mix(in srgb, var(--accent) 18%, var(--panel)); color: var(--warning); }
 .activity-row p { margin: 0; padding-top: 4px; line-height: 1.45; overflow-wrap: anywhere; }
 .activity-row small { display: block; overflow: hidden; margin-top: 2px; color: var(--ink-faint); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.activity-value { padding: 0 3px; border-radius: 4px; background: var(--panel-strong); font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; font-size: 9px; unicode-bidi: isolate; }
 .activity-row.danger p { color: var(--danger); }
 .activity-row.warning p { color: var(--warning); }
 .activity-row.danger .activity-icon { background: var(--danger-soft); color: var(--danger); }

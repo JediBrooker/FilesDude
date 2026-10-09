@@ -72,7 +72,7 @@ import {
 } from "lucide-react";
 import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { ACTIVITY_CATEGORIES, activityCategory, activityUser, describeActivity, type ActivityCategory } from "@/lib/activity-text";
+import { ACTIVITY_CATEGORIES, activityCategory, activityUser, describeActivity, SHARE_LINK_ACTOR, SYSTEM_ACTOR, visibleText, type ActivityCategory } from "@/lib/activity-text";
 import { isNewerBuild as differsFrom, type BuildIdentity } from "@/lib/build";
 import { moveCursor, selectionRange } from "@/lib/selection";
 import { INITIAL_DIRECTION, nextSort, parseSort, sortEntries, type SortKey, type SortState } from "@/lib/sort";
@@ -2182,8 +2182,8 @@ function ActivityDialog({ owner, onClose }: { owner: string; onClose: () => void
             <select aria-label="Account" value={user} onChange={(event) => setUser(event.target.value)}>
               <option value="">Everyone</option>
               {people.map((person) => <option key={person} value={person}>{person}</option>)}
-              <option value="share link">Share links</option>
-              <option value="system">FilesDude itself</option>
+              <option value={SHARE_LINK_ACTOR}>Share links</option>
+              <option value={SYSTEM_ACTOR}>FilesDude itself</option>
             </select>
             <label className="search-field"><Search size={15} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Filter by name, path, or address" aria-label="Filter activity" /></label>
           </div>
@@ -2197,8 +2197,9 @@ function ActivityDialog({ owner, onClose }: { owner: string; onClose: () => void
               const day = activityDay(at);
               const heading = day !== lastDay ? <h3 className="activity-day">{day}</h3> : null;
               lastDay = day;
-              const { text, detail, tone } = describeActivity(entry);
-              const actor = entry.event === "login.failed" ? "Someone" : activityUser(entry) || "Someone";
+              const { parts, detail, tone } = describeActivity(entry);
+              const user = activityUser(entry);
+              const actor = entry.event === "login.failed" || !user ? "Someone" : user === SYSTEM_ACTOR ? "FilesDude" : user === SHARE_LINK_ACTOR ? "A share link" : user;
               const kind = activityCategory(entry.event);
               return (
                 <div key={`${entry.at}-${index}`}>
@@ -2206,7 +2207,7 @@ function ActivityDialog({ owner, onClose }: { owner: string; onClose: () => void
                   <div className={`activity-row ${tone ?? ""}`}>
                     <time dateTime={entry.at} title={at.toLocaleString()}>{at.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}</time>
                     <span className={`activity-icon ${kind}`}>{ACTIVITY_ICONS[kind]}</span>
-                    <div><p><strong>{actor === "system" ? "FilesDude" : actor === "share link" ? "A share link" : actor}</strong> {text}</p>{detail && <small title={detail}>{detail}</small>}</div>
+                    <div><p><strong>{actor}</strong> {parts.map((part, partIndex) => (typeof part === "string" ? part : <bdi key={partIndex} className="activity-value">{visibleText(part.value)}</bdi>))}</p>{detail && <small title={visibleText(detail)}><bdi>{visibleText(detail)}</bdi></small>}</div>
                   </div>
                 </div>
               );

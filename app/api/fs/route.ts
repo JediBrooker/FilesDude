@@ -77,6 +77,9 @@ export async function POST(request: Request) {
     if (body.path !== undefined && (typeof body.path !== "string" || body.path.length > 4096)) throw new AppError("Path is invalid", 400, "INVALID_PATH");
     if (body.destination !== undefined && (typeof body.destination !== "string" || body.destination.length > 4096)) throw new AppError("Destination is invalid", 400, "INVALID_PATH");
     if (body.name !== undefined && (typeof body.name !== "string" || Buffer.byteLength(body.name, "utf8") > 255)) throw new AppError("Name is invalid", 400, "INVALID_NAME");
+    for (const flag of ["permanent", "requireTrash", "apply"] as const) {
+      if (body[flag] !== undefined && typeof body[flag] !== "boolean") throw new AppError("Request body is invalid", 400, "INVALID_REQUEST");
+    }
     const paths = Array.isArray(body.paths) ? body.paths : [];
     if (paths.length > 1_000 || paths.some((item) => typeof item !== "string" || item.length > 4096)) {
       throw new AppError("Too many or invalid paths", 400, "INVALID_PATHS");
@@ -141,19 +144,19 @@ export async function POST(request: Request) {
       return operationResult;
     });
 
-    await audit(`fs.${body.action}`, {
+    // Only what each action uses is recorded: its items, a new or changed name, permissions, owner,
+    // whether a delete was permanent, and whether a bulk rename was applied rather than previewed.
+    const action = body.action;
+    await audit(`fs.${action}`, {
       username: session.username,
-      path: body.path,
-      paths,
-      destination: body.destination,
-      permanent: body.permanent,
-      // What was set, for the Activity view: a new or changed name, permissions, owner, or whether a
-      // bulk rename was applied rather than previewed.
-      name: body.action === "create" || body.action === "rename" ? body.name : undefined,
-      mode: body.action === "chmod" ? body.mode : undefined,
-      uid: body.action === "chown" ? Number(body.uid) : undefined,
-      gid: body.action === "chown" ? Number(body.gid) : undefined,
-      apply: body.action === "bulkRename" ? Boolean(body.apply) : undefined,
+      path: action === "delete" || action === "chmod" || action === "chown" || action === "bulkRename" ? undefined : body.path,
+      paths: action === "delete" || action === "chmod" || action === "chown" || action === "bulkRename" ? paths : undefined,
+      permanent: action === "delete" ? Boolean(body.permanent) : undefined,
+      name: action === "create" || action === "rename" ? body.name : undefined,
+      mode: action === "chmod" ? String(body.mode) : undefined,
+      uid: action === "chown" ? Number(body.uid) : undefined,
+      gid: action === "chown" ? Number(body.gid) : undefined,
+      apply: action === "bulkRename" ? Boolean(body.apply) : undefined,
     });
     return NextResponse.json({ ok: true, result }, { headers: { "Cache-Control": "no-store" } });
     });

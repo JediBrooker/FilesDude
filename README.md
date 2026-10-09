@@ -258,8 +258,16 @@ state directory, newest first: sign-ins (and failed attempts, with the address),
 downloads, changes, shares and their downloads, account changes, and snapshots. Filter by
 kind, by account (including share links and FilesDude's own upkeep), or by any text such as
 a file name or address, and load older entries as you scroll back. Looking at an item's
-Properties is logged but not shown. The log rotates at 8 MB, keeping two older files
-(`audit.jsonl.1` and `.2`), so it never grows without limit.
+Properties is logged but not shown. Names, paths, and addresses that came from users are
+shown set apart, with invisible or direction-changing characters spelled out, so a crafted
+file name can't read as part of the sentence around it.
+
+The log is set aside as a dated archive (`audit-<time>.jsonl`) at 8 MB. Archives are kept
+for at least 30 days however much is written, so nobody can push recent history out by
+flooding the log, and beyond that while history stays under 256 MB; only past 1 GB in total
+are recent ones removed, to protect the disk. Every entry is kept small, rotations and
+removals are recorded in the log, and downloads through a share link are recorded once per
+link and address every ten minutes rather than for each range request.
 
 ## Duplicate files
 
