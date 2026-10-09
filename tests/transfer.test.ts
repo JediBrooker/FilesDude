@@ -4,7 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { config } from "../lib/config";
-import { copyOrMove, deleteEntries, listTrash, PartialTransferError, renameEntry, restoreTrashItems } from "../lib/files";
+import { copyOrMove, deleteEntries, listTrash, PartialTransferError, renameEntry, restoreTrashItems, withFilesystemLock } from "../lib/files";
+import type { JobProgress } from "../lib/types";
+
+const MB = 1024 * 1024;
 
 async function withTempRoot<T>(run: (root: string) => Promise<T>) {
   const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "filesdude-transfer-")));
@@ -113,5 +116,49 @@ test("deleting to trash returns ids that restore the items", async () => {
     await restoreTrashItems(result.trashed.map((item) => item.id));
     assert.equal(await fs.readFile(path.join(root, "keep.txt"), "utf8"), "k");
     assert.deepEqual(await deleteEntries(["keep.txt"], true), { trashed: [] });
+  });
+});
+
+test("copies report byte progress and don't hold the filesystem lock while copying", async () => {
+  await withTempRoot(async (root) => {
+    await fs.mkdir(path.join(root, "big"));
+    await fs.writeFile(path.join(root, "big", "a.bin"), Buffer.alloc(12 * MB, 1));
+    await fs.writeFile(path.join(root, "big", "b.bin"), Buffer.alloc(4 * MB, 2));
+    await fs.mkdir(path.join(root, "dest"));
+    const reports: JobProgress[] = [];
+    let lockedAt: number | null = null;
+    let lockRequested = false;
+    const copied = await copyOrMove(["big"], "dest", false, {
+      report: (progress) => {
+        reports.push(progress);
+        if (progress.done > 0 && !lockRequested) {
+          lockRequested = true;
+          void withFilesystemLock(async () => { lockedAt = reports.at(-1)!.done; });
+        }
+      },
+    });
+    assert.deepEqual(copied, [{ source: "big", path: "dest/big", renamed: false }]);
+    assert.equal(reports[0].total, 16 * MB);
+    assert.equal(reports.at(-1)!.done, 16 * MB);
+    // Other work got the lock while the copy was still writing.
+    assert.ok(lockedAt !== null && lockedAt < 16 * MB, `lock taken at ${lockedAt}`);
+    assert.equal((await fs.stat(path.join(root, "dest", "big", "a.bin"))).size, 12 * MB);
+    assert.deepEqual((await fs.readdir(path.join(root, "dest"))).sort(), ["big"]);
+  });
+});
+
+test("a cancelled copy leaves nothing behind", async () => {
+  await withTempRoot(async (root) => {
+    await fs.mkdir(path.join(root, "src"));
+    await fs.writeFile(path.join(root, "src", "one.bin"), Buffer.alloc(2 * MB));
+    await fs.writeFile(path.join(root, "src", "two.bin"), Buffer.alloc(6 * MB));
+    await fs.mkdir(path.join(root, "dest"));
+    const controller = new AbortController();
+    await assert.rejects(
+      copyOrMove(["src"], "dest", false, { signal: controller.signal, report: (progress) => { if (progress.done >= 3 * MB) controller.abort(); } }),
+      /cancelled/,
+    );
+    assert.deepEqual(await fs.readdir(path.join(root, "dest")), []);
+    assert.deepEqual((await fs.readdir(path.join(root, "src"))).sort(), ["one.bin", "two.bin"]);
   });
 });

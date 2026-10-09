@@ -6,11 +6,9 @@ import {
   applyBulkRename,
   changeMode,
   changeOwner,
-  copyOrMove,
   createEntry,
   deleteEntries,
   details,
-  PartialTransferError,
   listDirectory,
   previewBulkRename,
   renameEntry,
@@ -19,16 +17,9 @@ import {
   writeTextFile,
 } from "@/lib/files";
 import type { BulkRenameRule } from "@/lib/types";
-import { rewriteFavoritePaths } from "@/lib/favorites";
-import { rewriteSharePaths } from "@/lib/shares";
 import { config } from "@/lib/config";
-
-// Favourites and share links follow items that are renamed or moved, and drop deleted ones.
-async function rewriteLinkedPaths(changes: Array<{ from: string; to?: string }>, username: string) {
-  await rewriteFavoritePaths(changes);
-  const revoked = await rewriteSharePaths(changes);
-  if (revoked.length) await audit("share.revoke", { username, ids: revoked, reason: "item deleted" });
-}
+import { waitForJob } from "@/lib/jobs";
+import { rewriteLinkedPaths, startTransferJob } from "@/lib/transfers";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -91,6 +82,15 @@ export async function POST(request: Request) {
       throw new AppError("Too many or invalid paths", 400, "INVALID_PATHS");
     }
     assertPermission(session, actionPermission(body.action));
+    // Copies and moves run as jobs (shown with progress by /api/fs/jobs). Here the request waits for
+    // the job, which takes the filesystem lock only for its quick steps.
+    if (body.action === "copy" || body.action === "move") {
+      if (body.destination === undefined) throw new AppError("Destination is required");
+      const finished = await waitForJob(startTransferJob(session.username, body.action, paths, body.destination).id);
+      if (finished.failure) throw finished.failure;
+      if (finished.state.status !== "done") throw new AppError("The transfer was cancelled", 409, "JOB_CANCELLED");
+      return NextResponse.json({ ok: true, result: finished.state.transferred ?? [] }, { headers: { "Cache-Control": "no-store" } });
+    }
     const result = await withFilesystemLock(async () => {
       let operationResult: unknown = { ok: true };
       switch (body.action) {
@@ -110,23 +110,6 @@ export async function POST(request: Request) {
         operationResult = await deleteEntries(paths, Boolean(body.permanent));
         await rewriteLinked(paths.map((favoritePath) => ({ from: favoritePath })));
         break;
-      case "copy":
-      case "move": {
-        if (body.destination === undefined) throw new AppError("Destination is required");
-        let transferred;
-        try {
-          transferred = await copyOrMove(paths, body.destination, body.action === "move");
-        } catch (error) {
-          // Keep favourites pointing at items that moved before the failure.
-          if (error instanceof PartialTransferError && body.action === "move") {
-            await rewriteLinked(error.completed.map((item) => ({ from: item.source, to: item.path })));
-          }
-          throw error;
-        }
-        if (body.action === "move") await rewriteLinked(transferred.map((item) => ({ from: item.source, to: item.path })));
-        operationResult = transferred;
-        break;
-      }
       case "chmod":
         if (!body.mode) throw new AppError("Permissions are required");
         await changeMode(paths, body.mode);

@@ -398,7 +398,9 @@ export function FileManager() {
   const [menu, setMenu] = useState<MenuState | null>(null);
   const [clipboard, setClipboard] = useState<ClipboardState | null>(null);
   const [dropTarget, setDropTarget] = useState<string | null>(null);
-  const [activeJob, setActiveJob] = useState<JobState | null>(null);
+  // Background jobs started from this browser (or found running after a reload), oldest first.
+  const [jobs, setJobs] = useState<JobState[]>([]);
+  const finishedJobsRef = useRef<Set<string>>(new Set());
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [theme, setTheme] = useState<"light" | "dark">("light");
   const uploadRef = useRef<HTMLInputElement>(null);
@@ -499,15 +501,18 @@ export function FileManager() {
     try {
       const result = await requestJson<{ favorites: FavoriteLocation[] }>("/api/favorites");
       setFavorites(result.favorites);
-      // Shared links follow renames and moves too, so they refresh alongside favourites.
-      const { shares } = await requestJson<{ shares: ShareLink[] }>("/api/shares");
-      setSharedPaths(new Set(shares.map((share) => share.path)));
+      // Shared links follow renames and moves too, so they refresh alongside favourites. Only the
+      // owner manages them; other accounts would be refused.
+      if (auth.role === "owner") {
+        const { shares } = await requestJson<{ shares: ShareLink[] }>("/api/shares");
+        setSharedPaths(new Set(shares.map((share) => share.path)));
+      }
     } catch (error) {
       const typed = error as Error & { status?: number };
       if (typed.status === 401) await refreshAuth();
       else notify(typed.message, "error");
     }
-  }, [auth.authenticated, notify, refreshAuth]);
+  }, [auth.authenticated, auth.role, notify, refreshAuth]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -662,66 +667,98 @@ export function FileManager() {
     await refreshListing();
   };
 
+  // Reports a finished job once (polls can overlap), offering an undo where one makes sense.
+  const finishJob = async (job: JobState) => {
+    if (finishedJobsRef.current.has(job.id)) return;
+    finishedJobsRef.current.add(job.id);
+    if (job.kind === "copy" || job.kind === "move") {
+      const items = job.transferred ?? [];
+      const copy = job.kind === "copy";
+      if (job.status === "done") {
+        const destination = items.length ? parentOf(items[0].path) : "";
+        notify(`${itemCount(items.length)} ${copy ? "copied" : "moved"} to ${folderLabel(destination)}`, undefined, undoFor({ action: job.kind }, items) ?? undefined);
+      } else if (job.status === "failed") {
+        notify(job.error || `The ${job.kind} failed`, "error");
+      } else {
+        notify(`${copy ? "Copy" : "Move"} cancelled${items.length ? ` after ${itemCount(items.length)}` : ""}`);
+      }
+    } else {
+      const result = job.result;
+      if (job.status === "done" && result) {
+        const name = result.path.split("/").at(-1);
+        const compressed = job.kind === "compress";
+        const skipped = result.skipped ? ` · ${result.skipped} ${result.skipped === 1 ? "link or duplicate was" : "links or duplicates were"} skipped` : "";
+        notify(compressed ? `Created ${name} (${formatBytes(result.bytes)})` : `Extracted ${itemCount(result.entries)} into ${name}${skipped}`, undefined, {
+          done: compressed ? "Moved the archive to trash" : "Moved the extracted folder to trash",
+          run: async () => { await postJson("/api/fs", { action: "delete", paths: [result.path], requireTrash: true }); },
+        });
+      } else if (job.status === "failed") {
+        notify(job.error || "The archive job failed", "error");
+      } else {
+        notify(job.kind === "compress" ? "Compression cancelled" : "Extraction cancelled");
+      }
+    }
+    await refreshListing();
+  };
+
+  // Shows a newly started job, or reports it at once if it already finished.
+  const trackJob = async (job: JobState) => {
+    if (job.status === "running") setJobs((current) => [...current.filter((item) => item.id !== job.id), job]);
+    else await finishJob(job);
+    return job.status !== "failed";
+  };
+
   const startArchiveJob = async (body: Record<string, unknown>) => {
     try {
-      const { job } = await postJson<{ job: JobState }>("/api/fs/archive", body);
-      setActiveJob(job);
-      return true;
+      return await trackJob((await postJson<{ job: JobState }>("/api/fs/archive", body)).job);
     } catch (error) {
       notify((error as Error).message, "error");
       return false;
     }
   };
 
-  const cancelArchiveJob = async (job: JobState) => {
+  const cancelJob = async (job: JobState) => {
     try {
-      setActiveJob(((await postJson<{ job: JobState }>("/api/fs/archive", { action: "cancel", id: job.id })).job));
+      const { job: updated } = await postJson<{ job: JobState }>("/api/fs/jobs", { action: "cancel", id: job.id });
+      setJobs((current) => current.map((item) => (item.id === updated.id ? updated : item)));
     } catch (error) {
       notify((error as Error).message, "error");
     }
   };
 
-  // Poll a running archive job, then report its outcome once it finishes.
+  // Polls running jobs each second, reporting each one as it finishes. Jobs started while a poll
+  // is in flight are kept.
   useEffect(() => {
-    if (!activeJob) return;
+    if (!jobs.length) return;
+    const polled = new Set(jobs.map((job) => job.id));
     const timer = window.setTimeout(async () => {
-      if (activeJob.status === "running") {
+      const updated = await Promise.all(jobs.map(async (job) => {
         try {
-          setActiveJob((await requestJson<{ job: JobState }>(`/api/fs/archive?id=${encodeURIComponent(activeJob.id)}`)).job);
+          return (await requestJson<{ job: JobState }>(`/api/fs/jobs?id=${encodeURIComponent(job.id)}`)).job;
         } catch (error) {
-          setActiveJob(null);
           notify((error as Error).message, "error");
+          return null;
         }
-        return;
-      }
-      setActiveJob(null);
-      const result = activeJob.result;
-      if (activeJob.status === "done" && result) {
-        const name = result.path.split("/").at(-1);
-        const compressed = activeJob.kind === "compress";
-        const skipped = result.skipped ? ` · ${result.skipped} ${result.skipped === 1 ? "link or duplicate was" : "links or duplicates were"} skipped` : "";
-        notify(compressed ? `Created ${name} (${formatBytes(result.bytes)})` : `Extracted ${itemCount(result.entries)} into ${name}${skipped}`, undefined, {
-          done: compressed ? "Moved the archive to trash" : "Moved the extracted folder to trash",
-          run: async () => { await postJson("/api/fs", { action: "delete", paths: [result.path], requireTrash: true }); },
-        });
-      } else if (activeJob.status === "failed") {
-        notify(activeJob.error || "The archive job failed", "error");
-      } else {
-        notify(activeJob.kind === "compress" ? "Compression cancelled" : "Extraction cancelled");
-      }
-      await refreshListing();
-    }, activeJob.status === "running" ? 1000 : 0);
+      }));
+      const byId = new Map(updated.flatMap((job) => (job ? [[job.id, job] as const] : [])));
+      setJobs((current) => current.flatMap((job) => {
+        if (!polled.has(job.id)) return [job];
+        const latest = byId.get(job.id);
+        return latest?.status === "running" ? [latest] : [];
+      }));
+      for (const job of updated) if (job && job.status !== "running") await finishJob(job);
+    }, 1000);
     return () => window.clearTimeout(timer);
-  }, [activeJob]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [jobs]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Pick up a job still running from before a reload.
+  // Pick up this account's jobs still running from before a reload.
   useEffect(() => {
     if (!auth.authenticated) return;
     const timer = window.setTimeout(async () => {
       try {
-        const { jobs } = await requestJson<{ jobs: JobState[] }>("/api/fs/archive");
-        const running = jobs.find((job) => job.status === "running");
-        if (running) setActiveJob((current) => current ?? running);
+        const { jobs: listed } = await requestJson<{ jobs: JobState[] }>("/api/fs/jobs");
+        const running = listed.filter((job) => job.status === "running" && job.own);
+        if (running.length) setJobs((current) => [...current, ...running.filter((job) => !current.some((item) => item.id === job.id))]);
       } catch {
         // The listing works without job progress.
       }
@@ -729,8 +766,17 @@ export function FileManager() {
     return () => window.clearTimeout(timer);
   }, [auth.authenticated]);
 
-  const transferEntries = (mode: "copy" | "move", paths: string[], destination: string) =>
-    runAction({ action: mode, paths, destination }, `${itemCount(paths.length)} ${mode === "copy" ? "copied" : "moved"} to ${folderLabel(destination)}`);
+  // Copies and moves run as background jobs; quick ones come back already finished.
+  const transferEntries = async (mode: "copy" | "move", paths: string[], destination: string) => {
+    try {
+      const { job } = await postJson<{ job: JobState }>("/api/fs/jobs", { action: mode, paths, destination });
+      setDialog(null);
+      return await trackJob(job);
+    } catch (error) {
+      notify((error as Error).message, "error");
+      return false;
+    }
+  };
 
   const clip = (mode: ClipboardState["mode"], paths: string[]) => {
     if (!paths.length) return;
@@ -1254,6 +1300,7 @@ export function FileManager() {
           notify={notify}
           onRefresh={() => loadDirectory()}
           onStartJob={startArchiveJob}
+          onTransfer={transferEntries}
           role={auth.role ?? "viewer"}
           home={home}
           onSharesChanged={() => loadFavorites()}
@@ -1267,10 +1314,7 @@ export function FileManager() {
         ? <FileActionMenu entry={menu.entry} targets={menuTargets(menu.entry)} position={{ top: menu.top, left: menu.left }} menuRef={menuRef} favoritePaths={favoritePaths} canWrite={canWrite} isOwner={isOwner} canPaste={canWrite && Boolean(clipboard) && menu.entry.type === "directory"} onAction={(action, entry) => { setMenu(null); handleEntryAction(action, entry); }} />
         : <BackgroundMenu canWrite={canWrite} position={{ top: menu.top, left: menu.left }} menuRef={menuRef} folder={currentPath ? currentPath.split("/").at(-1) || "" : "All files"} clipboardCount={clipboard?.paths.length ?? 0} canSelectAll={sortedEntries.length > 0} onChoose={chooseBackground} />,
       document.body)}
-      {activeJob && <div className="job-panel" role="status" aria-live="polite">
-        <div className="job-panel-head"><span className="file-icon">{activeJob.kind === "compress" ? <FileArchive size={17} /> : <PackageOpen size={17} />}</span><div><strong title={activeJob.label}>{activeJob.label}</strong><small>{activeJob.status === "running" ? jobProgressText(activeJob) : "Finishing…"}</small></div>{activeJob.status === "running" && <button className="icon-button" aria-label="Cancel job" title="Cancel" onClick={() => void cancelArchiveJob(activeJob)}><X size={16} /></button>}</div>
-        <div className={`job-panel-track ${activeJob.progress.total ? "" : "indeterminate"}`} role="progressbar" aria-label={activeJob.label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={activeJob.progress.total ? Math.round((activeJob.progress.done / activeJob.progress.total) * 100) : undefined}><span style={activeJob.progress.total ? { width: `${Math.min(100, (activeJob.progress.done / activeJob.progress.total) * 100)}%` } : undefined} /></div>
-      </div>}
+      {jobs.length > 0 && <div className="job-panels">{jobs.map((job) => <JobPanel key={job.id} job={job} onCancel={() => void cancelJob(job)} />)}</div>}
       {toast && <div className={`toast ${toast.tone === "error" ? "toast-error" : ""}`} role="status">{toast.tone === "error" ? <CircleAlert size={18} /> : <Check size={18} />}<span>{toast.message}</span>{toast.undo && <button className="toast-action" onClick={() => void runUndo(toast.undo!)}><Undo2 size={14} /> Undo</button>}</div>}
     </div>
   );
@@ -1570,7 +1614,18 @@ function FileSkeleton() {
   return <div className="file-skeleton">{Array.from({ length: 6 }).map((_, index) => <div key={index}><span /><span /><span /><span /></div>)}</div>;
 }
 
-function DialogHost({ dialog, selected, currentPath, username, role, home, onClose, onRun, notify, onRefresh, onStartJob, onSharesChanged, onCredentialsUpdated, onReveal, onPreview }: {
+function JobPanel({ job, onCancel }: { job: JobState; onCancel: () => void }) {
+  const icons: Record<JobState["kind"], ReactNode> = { compress: <FileArchive size={17} />, extract: <PackageOpen size={17} />, copy: <Copy size={17} />, move: <FolderInput size={17} /> };
+  const percent = job.progress.total ? Math.min(100, (job.progress.done / job.progress.total) * 100) : undefined;
+  return (
+    <div className="job-panel" role="status" aria-live="polite">
+      <div className="job-panel-head"><span className="file-icon">{icons[job.kind]}</span><div><strong title={job.label}>{job.label}</strong><small>{job.status === "running" ? jobProgressText(job) : "Finishing…"}</small></div>{job.status === "running" && <button className="icon-button" aria-label={`Cancel ${job.label}`} title="Cancel" onClick={onCancel}><X size={16} /></button>}</div>
+      <div className={`job-panel-track ${percent === undefined ? "indeterminate" : ""}`} role="progressbar" aria-label={job.label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent === undefined ? undefined : Math.round(percent)}><span style={percent === undefined ? undefined : { width: `${percent}%` }} /></div>
+    </div>
+  );
+}
+
+function DialogHost({ dialog, selected, currentPath, username, role, home, onClose, onRun, notify, onRefresh, onStartJob, onTransfer, onSharesChanged, onCredentialsUpdated, onReveal, onPreview }: {
   dialog: NonNullable<DialogState>;
   selected: FileEntry[];
   currentPath: string;
@@ -1582,6 +1637,7 @@ function DialogHost({ dialog, selected, currentPath, username, role, home, onClo
   notify: (message: string, tone?: "error") => void;
   onRefresh: () => Promise<void>;
   onStartJob: (body: Record<string, unknown>) => Promise<boolean>;
+  onTransfer: (mode: "copy" | "move", paths: string[], destination: string) => Promise<boolean>;
   onSharesChanged: () => Promise<void>;
   onCredentialsUpdated: () => Promise<void>;
   onReveal: (entry: FileEntry) => void;
@@ -1599,7 +1655,7 @@ function DialogHost({ dialog, selected, currentPath, username, role, home, onClo
   if (dialog.kind === "delete") return <DeleteDialog entries={selected} onClose={onClose} onRun={onRun} />;
   if (dialog.kind === "permissions") return <PermissionsDialog entries={selected} onClose={onClose} onRun={onRun} />;
   if (dialog.kind === "ownership") return <OwnershipDialog entries={selected} onClose={onClose} onRun={onRun} />;
-  if (dialog.kind === "transfer") return <TransferDialog mode={dialog.mode} entries={selected} startPath={currentPath} home={home} onClose={onClose} onRun={onRun} />;
+  if (dialog.kind === "transfer") return <TransferDialog mode={dialog.mode} entries={selected} startPath={currentPath} home={home} onClose={onClose} onTransfer={onTransfer} />;
   if (dialog.kind === "bulk") return <BulkRenameDialog entries={selected} onClose={onClose} notify={notify} onRefresh={onRefresh} />;
   if (dialog.kind === "preview") return <PreviewDialog entry={dialog.entry} onClose={onClose} />;
   if (dialog.kind === "edit") return <EditDialog entry={dialog.entry} onClose={onClose} onRun={onRun} />;
@@ -2161,7 +2217,7 @@ function OwnershipDialog({ entries, onClose, onRun }: { entries: FileEntry[]; on
   return <Modal title="Change ownership" subtitle={`Apply a numeric user and group id to ${entries.length} ${entries.length === 1 ? "item" : "items"}`} icon={<UserRoundCog size={19} />} onClose={onClose}><form onSubmit={submit}><div className="field-pair"><FormField label="User ID (UID)"><input value={uid} onChange={(event) => setUid(event.target.value)} type="number" min="0" required /></FormField><FormField label="Group ID (GID)"><input value={gid} onChange={(event) => setGid(event.target.value)} type="number" min="0" required /></FormField></div><div className="info-box"><Info size={17} /> Use IDs from the Proxmox host or container, such as <code>0:0</code> for root.</div><ModalActions onClose={onClose} submitLabel="Apply ownership" busy={busy} /></form></Modal>;
 }
 
-function TransferDialog({ mode, entries, startPath, home, onClose, onRun }: { mode: "copy" | "move"; entries: FileEntry[]; startPath: string; home: string; onClose: () => void; onRun: (body: Record<string, unknown>, success: string) => Promise<boolean> }) {
+function TransferDialog({ mode, entries, startPath, home, onClose, onTransfer }: { mode: "copy" | "move"; entries: FileEntry[]; startPath: string; home: string; onClose: () => void; onTransfer: (mode: "copy" | "move", paths: string[], destination: string) => Promise<boolean> }) {
   const [destination, setDestination] = useState(startPath);
   const [busy, setBusy] = useState(false);
   const blockedDirectories = useMemo(() => entries.filter((entry) => entry.type === "directory").map((entry) => entry.path), [entries]);
@@ -2170,7 +2226,7 @@ function TransferDialog({ mode, entries, startPath, home, onClose, onRun }: { mo
     event.preventDefault();
     if (blocked) return;
     setBusy(true);
-    await onRun({ action: mode, paths: entries.map((entry) => entry.path), destination }, `${entries.length} ${entries.length === 1 ? "item" : "items"} ${mode === "copy" ? "copied" : "moved"}`);
+    await onTransfer(mode, entries.map((entry) => entry.path), destination);
     setBusy(false);
   };
   return (

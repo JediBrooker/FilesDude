@@ -178,14 +178,18 @@ export interface ArchiveResult {
 
 export interface JobState {
   id: string;
-  kind: "compress" | "extract";
+  kind: "compress" | "extract" | "copy" | "move";
   label: string;
   status: "running" | "done" | "failed" | "cancelled";
   startedAt: string;
   finishedAt?: string;
   progress: JobProgress;
   result?: ArchiveResult;
+  /** For copy and move jobs: what was transferred, including items finished before a failure. */
+  transferred?: TransferResult[];
   error?: string;
+  /** Whether the signed-in account started the job (the owner also sees other accounts' jobs). */
+  own?: boolean;
 }
 
 export interface TrashRestoreResult {

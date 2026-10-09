@@ -20,7 +20,7 @@ function trashItemVisible(originalPath: string | null) {
   if (!scope || scope.role === "owner") return true;
   return originalPath !== null && withinScope(originalPath, scope.root);
 }
-import type { BulkRenameRule, DeleteResult, DiskInfo, EntryType, FileEntry, IdentityOption, LargestFilesResult, LargestFilesScanning, OwnershipPair, RenamePreview, TransferResult, TrashItem, TrashListing, TrashRestoreResult } from "./types";
+import type { BulkRenameRule, DeleteResult, DiskInfo, EntryType, FileEntry, IdentityOption, JobProgress, LargestFilesResult, LargestFilesScanning, OwnershipPair, RenamePreview, TransferResult, TrashItem, TrashListing, TrashRestoreResult } from "./types";
 
 export const INTERNAL_NAMES = new Set([".filedude"]);
 const mimeTypes: Record<string, string> = {
@@ -289,11 +289,21 @@ async function removeEntry(directory: AnchoredDirectory, name: string, depth = 0
   await fs.rmdir(location);
 }
 
-async function copyContents(input: FileHandle, output: FileHandle) {
+// What a copy carries through its walk: folders it made (so it never copies into itself), a way to
+// stop it, and a running count of bytes for progress.
+type CopyContext = { made: Set<string>; signal?: AbortSignal; copied?: (bytes: number) => void };
+
+function throwIfCancelled(signal?: AbortSignal) {
+  if (signal?.aborted) throw new AppError("The job was cancelled", 409, "JOB_CANCELLED");
+}
+
+async function copyContents(input: FileHandle, output: FileHandle, context: CopyContext) {
   const buffer = Buffer.allocUnsafe(1024 * 1024);
   for (let position = 0; ;) {
+    throwIfCancelled(context.signal);
     const { bytesRead } = await input.read(buffer, 0, buffer.length, position);
     if (!bytesRead) return;
+    context.copied?.(bytesRead);
     for (let written = 0; written < bytesRead;) {
       written += (await output.write(buffer, written, bytesRead - written, position + written)).bytesWritten;
     }
@@ -309,8 +319,9 @@ async function applyCopiedAttributes(handle: FileHandle, source: Stats) {
   await handle.chmod(source.mode & 0o1777);
 }
 
-async function copyEntry(from: AnchoredDirectory, name: string, to: AnchoredDirectory, targetName: string, made: Set<string>, depth = 0) {
+async function copyEntry(from: AnchoredDirectory, name: string, to: AnchoredDirectory, targetName: string, context: CopyContext, depth = 0) {
   tooDeep(depth);
+  throwIfCancelled(context.signal);
   const source = inside(from, name);
   const target = inside(to, targetName);
   const stat = await fs.lstat(source);
@@ -320,15 +331,15 @@ async function copyEntry(from: AnchoredDirectory, name: string, to: AnchoredDire
   }
   if (stat.isDirectory()) {
     // A folder this copy made that was moved into the source meanwhile; copying it would never end.
-    if (made.has(`${stat.dev}:${stat.ino}`)) return;
+    if (context.made.has(`${stat.dev}:${stat.ino}`)) return;
     await fs.mkdir(target, 0o700);
     await withOpen(openChild(to, targetName), async (created) => {
       if (!(await isFreshFolder(created, 0o700))) {
         throw new AppError("The destination changed while it was being copied to", 409, "PATH_CHANGED");
       }
-      made.add(`${created.stat.dev}:${created.stat.ino}`);
+      context.made.add(`${created.stat.dev}:${created.stat.ino}`);
       const original = await withOpen(openChild(from, name), async (folder) => {
-        for (const entry of await fs.readdir(folder.base)) await copyEntry(folder, entry, created, entry, made, depth + 1);
+        for (const entry of await fs.readdir(folder.base)) await copyEntry(folder, entry, created, entry, context, depth + 1);
         return folder.stat;
       });
       await applyCopiedAttributes(created.handle, original);
@@ -343,7 +354,7 @@ async function copyEntry(from: AnchoredDirectory, name: string, to: AnchoredDire
     if (!opened.isFile()) throw special;
     const output = await fs.open(target, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
     try {
-      await copyContents(input, output);
+      await copyContents(input, output, context);
       await applyCopiedAttributes(output, opened);
     } finally {
       await output.close();
@@ -358,7 +369,7 @@ async function moveEntry(from: AnchoredDirectory, name: string, to: AnchoredDire
     await fs.rename(inside(from, name), inside(to, targetName));
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EXDEV") throw error;
-    await copyEntry(from, name, to, targetName, new Set());
+    await copyEntry(from, name, to, targetName, { made: new Set() });
     await removeEntry(from, name);
   }
 }
@@ -937,47 +948,116 @@ export class PartialTransferError extends AppError {
   }
 }
 
-// Copies that would collide get a free "name (copy).ext" name; moves never rename and fail on a conflict.
-export async function copyOrMove(paths: string[], destinationPath: string, move: boolean): Promise<TransferResult[]> {
+export type TransferOptions = { report?: (progress: JobProgress) => void; signal?: AbortSignal };
+
+// The total size of what a copy will write, for progress; undefined when it can't be measured fully.
+async function measureSources(paths: string[]) {
+  let total = 0;
+  for (const sourcePath of paths) {
+    const measured = await withParent(sourcePath, (parent, name) => measureTree(inside(parent, name))).catch(() => null);
+    if (!measured?.complete) return undefined;
+    total += measured.bytes;
+  }
+  return total;
+}
+
+/**
+ * Copies or moves items into a folder. It takes the filesystem lock itself, and only for the quick
+ * steps (checks, renames, and choosing names): a copy is written under a hidden temporary name
+ * without the lock, so a large copy doesn't hold up everything else, and gets its final name under
+ * the lock once complete. A copy that fails or is cancelled part-way is removed. Copies that would
+ * collide get a free "name (copy).ext" name; moves never rename and fail on a conflict.
+ */
+export async function copyOrMove(paths: string[], destinationPath: string, move: boolean, { report, signal }: TransferOptions = {}): Promise<TransferResult[]> {
   const destinationRelative = cleanRelative(destinationPath);
-  const opening = openDirectory(destinationRelative).catch((error: unknown) => {
+  const destination = await withFilesystemLock(() => openDirectory(destinationRelative)).catch((error: unknown) => {
     if (error instanceof AppError && error.code === "NOT_A_DIRECTORY") throw new AppError("Destination is not a folder", 400);
     throw error;
   });
-  return withOpen(opening, async (destination) => {
+  try {
+    const progress: JobProgress = move
+      ? { done: 0, total: paths.length, unit: "entries" }
+      : { done: 0, total: await measureSources(paths), unit: "bytes" };
+    report?.({ ...progress });
+    const copied = (bytes: number) => {
+      progress.done += bytes;
+      report?.({ ...progress });
+    };
     const results: TransferResult[] = [];
     for (const sourcePath of paths) {
       try {
-        results.push(await transferOne(sourcePath, destination, destinationRelative, move));
+        throwIfCancelled(signal);
+        results.push(await transferOne(sourcePath, destination, destinationRelative, move, { made: new Set(), signal, copied: move ? undefined : copied }));
+        if (move) {
+          progress.done += 1;
+          report?.({ ...progress });
+        }
       } catch (error) {
         if (results.length) throw new PartialTransferError(error, results, move);
         throw error;
       }
     }
     return results;
-  });
+  } finally {
+    await destination.handle.close().catch(() => undefined);
+  }
 }
 
-async function transferOne(sourcePath: string, destination: AnchoredDirectory, destinationRelative: string, move: boolean): Promise<TransferResult> {
+async function transferOne(sourcePath: string, destination: AnchoredDirectory, destinationRelative: string, move: boolean, context: CopyContext): Promise<TransferResult> {
   const sourceRelative = cleanRelative(sourcePath);
   if (move) assertNotHome(sourceRelative);
   const invalid = new AppError(`You can't ${move ? "move" : "copy"} a folder into itself or one of its own subfolders`, 400, "INVALID_DESTINATION");
+  const conflict = () => new AppError("An item with that name already exists in the destination", 409, "NAME_CONFLICT");
   if (!sourceRelative) throw invalid;
-  return withParent(sourceRelative, async (parent, name, relative) => {
-    // Compared by real location, since either path may run through symlinks.
-    const sourceReal = path.join(parent.real, name);
-    if (destination.real === sourceReal || destination.real.startsWith(`${sourceReal}${path.sep}`)) throw invalid;
-    if (move && parent.real === destination.real) throw new AppError("The item is already in that folder", 409, "SAME_DESTINATION");
-    let targetName = name;
-    let renamed = false;
-    if (await fs.lstat(inside(destination, name)).catch(missingAsNull)) {
-      if (move) throw new AppError("An item with that name already exists in the destination", 409, "NAME_CONFLICT");
-      ({ name: targetName, renamed } = await availableName(destination, name, entryType(await fs.lstat(inside(parent, name))), "copy"));
-    }
-    if (move) await moveEntry(parent, name, destination, targetName);
-    else await copyEntry(parent, name, destination, targetName, new Set());
-    return { source: relative, path: childOf(destinationRelative, targetName), renamed };
-  });
+  let release: (() => void) | null = await acquireFilesystemLock();
+  const unlock = () => {
+    release?.();
+    release = null;
+  };
+  try {
+    return await withParent(sourceRelative, async (parent, name, relative) => {
+      // Compared by real location, since either path may run through symlinks.
+      const sourceReal = path.join(parent.real, name);
+      if (destination.real === sourceReal || destination.real.startsWith(`${sourceReal}${path.sep}`)) throw invalid;
+      if (move && parent.real === destination.real) throw new AppError("The item is already in that folder", 409, "SAME_DESTINATION");
+      const result = (targetName: string, renamed: boolean) => ({ source: relative, path: childOf(destinationRelative, targetName), renamed });
+      if (move) {
+        if (await fs.lstat(inside(destination, name)).catch(missingAsNull)) throw conflict();
+        try {
+          await fs.rename(inside(parent, name), inside(destination, name));
+          return result(name, false);
+        } catch (error) {
+          // Between filesystems a move becomes a copy followed by removing the original.
+          if ((error as NodeJS.ErrnoException).code !== "EXDEV") throw error;
+        }
+      }
+      const type = entryType(await fs.lstat(inside(parent, name)));
+      const temporary = `.filedude-copy-${crypto.randomUUID()}`;
+      unlock();
+      let targetName = name;
+      let renamed = false;
+      try {
+        await copyEntry(parent, name, destination, temporary, context);
+        release = await acquireFilesystemLock();
+        if (move) {
+          if (await fs.lstat(inside(destination, name)).catch(missingAsNull)) throw conflict();
+        } else {
+          ({ name: targetName, renamed } = await availableName(destination, name, type, "copy"));
+        }
+        await fs.rename(inside(destination, temporary), inside(destination, targetName));
+      } catch (error) {
+        await removeEntry(destination, temporary).catch(() => undefined);
+        throw error;
+      }
+      if (move) {
+        unlock();
+        await removeEntry(parent, name);
+      }
+      return result(targetName, renamed);
+    });
+  } finally {
+    unlock();
+  }
 }
 
 export async function changeMode(paths: string[], mode: string) {
