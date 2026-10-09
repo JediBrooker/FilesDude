@@ -8,7 +8,8 @@ import test from "node:test";
 import sharp from "sharp";
 import { config } from "../lib/config";
 import { thumbnailFor } from "../lib/thumbnails";
-import { hiddenPaths, setFrameRunner, videoThumbnailsAvailable } from "../lib/video-frames";
+import { hiddenPaths } from "../lib/media-sandbox";
+import { setFrameRunner, videoThumbnailsAvailable } from "../lib/video-frames";
 
 async function withRoot<T>(run: (root: string) => Promise<T>) {
   const base = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "filesdude-video-")));

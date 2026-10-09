@@ -159,6 +159,8 @@ const THUMBNAIL_MIME = new Set(["image/jpeg", "image/png", "image/gif", "image/w
 const MAX_THUMBNAIL_SOURCE_BYTES = 64 * 1024 * 1024;
 // Mirrors VIDEO_THUMBNAIL_TYPES: videos get a thumbnail when the server can make them (any size).
 const VIDEO_THUMBNAIL_MIME = new Set(["video/mp4", "video/webm", "video/x-matroska", "video/quicktime", "video/x-msvideo"]);
+// Mirrors the server's media details: images (as thumbnailed), videos, and audio.
+const MEDIA_INFO_MIME = new Set([...THUMBNAIL_MIME, ...VIDEO_THUMBNAIL_MIME, "audio/mpeg", "audio/wav", "audio/ogg", "audio/flac", "audio/mp4", "audio/aac"]);
 // Properties hashes files up to this size straight away; larger ones wait for a click.
 const AUTO_CHECKSUM_BYTES = 64 * 1024 * 1024;
 
@@ -3211,9 +3213,74 @@ function ChecksumPanel({ entry }: { entry: FileEntry }) {
   );
 }
 
+type MediaInfo = {
+  kind: "image" | "video" | "audio";
+  format?: string; width?: number; height?: number; frames?: number; bitDepth?: string; colorSpace?: string; hasAlpha?: boolean; camera?: string; taken?: string;
+  duration?: number; bitRate?: number; frameRate?: number; videoCodec?: string; audioCodec?: string; sampleRate?: number; channels?: string;
+  audioTracks?: number; subtitleTracks?: number; title?: string; artist?: string; album?: string;
+};
+
+function formatDuration(seconds: number) {
+  const whole = Math.round(seconds);
+  const hours = Math.floor(whole / 3600);
+  const minutes = Math.floor((whole % 3600) / 60);
+  const rest = String(whole % 60).padStart(2, "0");
+  return hours ? `${hours}:${String(minutes).padStart(2, "0")}:${rest}` : `${minutes}:${rest}`;
+}
+
+function formatBitRate(bitsPerSecond: number) {
+  return bitsPerSecond >= 1_000_000 ? `${(bitsPerSecond / 1_000_000).toFixed(1)} Mbps` : `${Math.round(bitsPerSecond / 1000)} kbps`;
+}
+
+function mediaRows(info: MediaInfo) {
+  const colour = [info.colorSpace, info.bitDepth, info.hasAlpha ? "transparency" : undefined].filter(Boolean).join(", ");
+  const rows: Array<[string, string | number | undefined]> = [
+    ["Title", info.title], ["Artist", info.artist], ["Album", info.album],
+    ["Dimensions", info.width && info.height ? `${info.width.toLocaleString()} × ${info.height.toLocaleString()}` : undefined],
+    ["Length", info.duration !== undefined ? formatDuration(info.duration) : undefined],
+    ["Format", info.format],
+    ["Video", info.videoCodec],
+    ["Frame rate", info.frameRate ? `${info.frameRate} fps` : undefined],
+    ["Frames", info.frames],
+    ["Audio", [info.audioCodec, info.channels, info.sampleRate ? `${info.sampleRate / 1000} kHz` : undefined].filter(Boolean).join(", ") || undefined],
+    ["Audio tracks", info.audioTracks], ["Subtitles", info.subtitleTracks ? `${info.subtitleTracks} track${info.subtitleTracks === 1 ? "" : "s"}` : undefined],
+    ["Bit rate", info.bitRate ? formatBitRate(info.bitRate) : undefined],
+    ["Colour", colour || undefined],
+    ["Camera", info.camera],
+    ["Taken", info.taken],
+  ];
+  return rows.filter((row): row is [string, string | number] => row[1] !== undefined && row[1] !== "");
+}
+
+function MediaPanel({ entry }: { entry: FileEntry }) {
+  const [state, setState] = useState<{ status: "loading" | "done" | "error" | "hidden"; info?: MediaInfo; error?: string }>({ status: "loading" });
+  useEffect(() => {
+    const controller = new AbortController();
+    requestJson<MediaInfo>(`/api/fs/media-info?path=${encodePath(entry.path)}`, { signal: controller.signal })
+      .then((info) => setState({ status: "done", info }))
+      .catch((error: Error & { status?: number }) => {
+        if (error.name === "AbortError") return;
+        // Without ffprobe on the server, audio and video simply have no media section.
+        setState(error.status === 415 ? { status: "hidden" } : { status: "error", error: error.message });
+      });
+    return () => controller.abort();
+  }, [entry.path]);
+  if (state.status === "hidden") return null;
+  const rows = state.info ? mediaRows(state.info) : [];
+  return (
+    <section className="media-panel" aria-label="Media details">
+      <div className="checksum-heading"><strong>{entry.mime.startsWith("image/") ? "Image" : entry.mime.startsWith("audio/") ? "Audio" : "Video"}</strong></div>
+      {state.status === "loading" && <p className="checksum-note"><LoaderCircle className="spin" size={14} /> Reading media details…</p>}
+      {state.status === "error" && <p className="checksum-note error"><CircleAlert size={14} /> {state.error}</p>}
+      {state.status === "done" && (rows.length ? <dl className="details-list">{rows.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}</dl> : <p className="checksum-note">No media details found.</p>)}
+    </section>
+  );
+}
+
 function DetailsDialog({ entry, onClose }: { entry: FileEntry; onClose: () => void }) {
+  const media = entry.type === "file" && MEDIA_INFO_MIME.has(entry.mime) && (!THUMBNAIL_MIME.has(entry.mime) || entry.size <= MAX_THUMBNAIL_SOURCE_BYTES);
   const rows = [["Type", entry.type === "directory" ? "Folder" : entry.mime], ["Size", entry.type === "directory" ? "—" : `${formatBytes(entry.size)} (${entry.size.toLocaleString()} bytes)`], ["Location", `/${entry.path}`], ["Owner", `${entry.owner}:${entry.group} (${entry.uid}:${entry.gid})`], ["Permissions", entry.mode], ["Modified", new Date(entry.modified).toLocaleString()], ["Created", new Date(entry.created).toLocaleString()]];
-  return <Modal title="Item details" subtitle={entry.name} icon={<Info size={19} />} onClose={onClose}><div className="details-hero"><span className={`file-icon ${entry.type}`}>{fileIcon(entry, 32)}</span><div><strong>{entry.name}</strong><span>{entry.type === "directory" ? "Folder" : extension(entry.name)}</span></div></div><dl className="details-list">{rows.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{label === "Permissions" ? <code className="mode-chip">{value}</code> : value}</dd></div>)}</dl>{entry.type === "file" && <ChecksumPanel entry={entry} />}<div className="modal-actions"><button className="button primary" onClick={onClose}>Done</button></div></Modal>;
+  return <Modal title="Item details" subtitle={entry.name} icon={<Info size={19} />} onClose={onClose}><div className="details-hero"><span className={`file-icon ${entry.type}`}>{fileIcon(entry, 32)}</span><div><strong>{entry.name}</strong><span>{entry.type === "directory" ? "Folder" : extension(entry.name)}</span></div></div><dl className="details-list">{rows.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{label === "Permissions" ? <code className="mode-chip">{value}</code> : value}</dd></div>)}</dl>{media && <MediaPanel entry={entry} />}{entry.type === "file" && <ChecksumPanel entry={entry} />}<div className="modal-actions"><button className="button primary" onClick={onClose}>Done</button></div></Modal>;
 }
 
 function FormField({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {

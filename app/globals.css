@@ -536,6 +536,7 @@ kbd { padding: 3px 5px; border: 1px solid var(--line); border-bottom-width: 2px;
 .details-list dt { color: var(--ink-faint); }
 .details-list dd { min-width: 0; margin: 0; overflow-wrap: anywhere; text-align: right; }
 .checksum-panel { display: grid; gap: 8px; margin: 14px 22px 0; }
+.media-panel { display: grid; gap: 8px; margin: 14px 22px 0; }
 .checksum-heading { display: flex; align-items: center; justify-content: space-between; }
 .checksum-heading strong { font-size: 10px; }
 .checksum-panel > .button { justify-self: start; min-height: 32px; font-size: 9px; }

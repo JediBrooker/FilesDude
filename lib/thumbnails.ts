@@ -20,7 +20,7 @@ sharp.concurrency(1);
  * renamed to .png never reaches its decoder.
  */
 export const THUMBNAIL_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp", "image/avif"]);
-const DECODED_FORMATS = new Set(["jpeg", "png", "gif", "webp", "heif"]);
+export const DECODED_FORMATS = new Set(["jpeg", "png", "gif", "webp", "heif"]);
 /** Videos get a thumbnail from one frame, taken in a sandbox (see video-frames.ts), when available. */
 export const VIDEO_THUMBNAIL_TYPES = new Set(["video/mp4", "video/webm", "video/x-matroska", "video/quicktime", "video/x-msvideo"]);
 const DECODE_TIMEOUT_SECONDS = 10;
@@ -37,7 +37,7 @@ const failedVideos = new Map<string, number>();
 
 // A queue allowing a few thumbnails to be made at once. Images and videos have separate queues,
 // so slow videos never hold up images.
-function limiter(maxActive: number, maxWaiting: number) {
+export function limiter(maxActive: number, maxWaiting: number, busy = "Too many thumbnails are being prepared; try again shortly", code = "THUMBNAILS_BUSY") {
   let active = 0;
   const waiting: Array<() => void> = [];
   return {
@@ -46,18 +46,20 @@ function limiter(maxActive: number, maxWaiting: number) {
         active += 1;
         return;
       }
-      if (waiting.length >= maxWaiting) throw new AppError("Too many thumbnails are being prepared; try again shortly", 503, "THUMBNAILS_BUSY");
+      if (waiting.length >= maxWaiting) throw new AppError(busy, 503, code);
+      // A released slot is handed straight to the next waiter, so nobody arriving meanwhile takes it.
       await new Promise<void>((resolve) => waiting.push(resolve));
-      active += 1;
     },
     release() {
-      active -= 1;
-      waiting.shift()?.();
+      const next = waiting.shift();
+      if (next) next();
+      else active -= 1;
     },
   };
 }
 
-const imageSlots = limiter(2, 200);
+/** Image decoding, shared with media details: libuv's small thread pool is shared with file I/O. */
+export const imageSlots = limiter(2, 200);
 const videoSlots = limiter(1, 50);
 
 function videoFailed(key: string) {
@@ -106,7 +108,7 @@ async function usableCacheDirectory() {
 
 // Reads at most the size measured when the file was opened, refusing a file that has since grown,
 // so a sparse file enlarged mid-request can't force a huge allocation.
-async function readExactly(handle: Awaited<ReturnType<typeof fs.open>>, size: number) {
+export async function readExactly(handle: Awaited<ReturnType<typeof fs.open>>, size: number) {
   const buffer = Buffer.alloc(size + 1);
   let offset = 0;
   while (offset < buffer.length) {
@@ -197,9 +199,10 @@ export async function thumbnailFor(relativePath: string, knownEtag?: string | nu
   try {
     if (!stat.isFile() || isReserved(openedPath)) throw new AppError("Only images and videos have thumbnails", 415, "NO_THUMBNAIL");
     if (video ? !VIDEO_THUMBNAIL_TYPES.has(getMime(openedPath)) : !THUMBNAIL_TYPES.has(getMime(openedPath))) throw new AppError("This file type has no thumbnail", 415, "NO_THUMBNAIL");
-    // A video frame is found by seeking, so a large video is fine; an image is read whole.
-    if (!video && stat.size > MAX_THUMBNAIL_SOURCE_BYTES) throw new AppError("This image is too large for a thumbnail", 413, "IMAGE_TOO_LARGE");
     const identity = await handle.stat({ bigint: true });
+    // A video frame is found by seeking, so a large video is fine; an image is read whole, at the
+    // size measured here (the one that is read), not the one from opening it.
+    if (!video && identity.size > BigInt(MAX_THUMBNAIL_SOURCE_BYTES)) throw new AppError("This image is too large for a thumbnail", 413, "IMAGE_TOO_LARGE");
     const key = crypto.createHash("sha256").update(`${config.root}:${identity.dev}:${identity.ino}:${identity.size}:${identity.mtimeNs}:${identity.ctimeNs}:${THUMBNAIL_SIZE}`).digest("hex");
     const etag = `"${key.slice(0, 32)}"`;
     if (knownEtag === etag) return { data: null, etag };
