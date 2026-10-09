@@ -31,13 +31,19 @@ function compareBy(key: SortKey, a: FileEntry, b: FileEntry) {
 }
 
 /** Sorts a listing with folders first; ties fall back to natural name order. */
-export function sortEntries(entries: FileEntry[], sort: SortState) {
+export function sortEntries(entries: FileEntry[], sort: SortState, folderSizes?: Map<string, number>) {
   const factor = sort.direction === "asc" ? 1 : -1;
   return [...entries].sort((a, b) => {
     const aFolder = a.type === "directory";
     if (aFolder !== (b.type === "directory")) return aFolder ? -1 : 1;
-    // Folder sizes are not meaningful, so folders stay in name order when sorting by size.
-    if (aFolder && sort.key === "size") return collator.compare(a.name, b.name);
+    // A folder's own size means nothing, so folders sort by their counted contents when known
+    // (uncounted ones last) and otherwise stay in name order.
+    if (aFolder && sort.key === "size") {
+      const sizeA = folderSizes?.get(a.path);
+      const sizeB = folderSizes?.get(b.path);
+      if (sizeA === undefined || sizeB === undefined) return sizeA !== undefined ? -1 : sizeB !== undefined ? 1 : collator.compare(a.name, b.name);
+      return (sizeA - sizeB) * factor || collator.compare(a.name, b.name);
+    }
     return compareBy(sort.key, a, b) * factor || collator.compare(a.name, b.name);
   });
 }

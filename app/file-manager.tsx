@@ -538,7 +538,17 @@ export function FileManager() {
   const toastTimerRef = useRef<number | undefined>(undefined);
   const undoRef = useRef<UndoAction | null>(null);
   const dragPathsRef = useRef<string[]>([]);
-  const sortedEntries = useMemo(() => sortEntries(entries, sort), [entries, sort]);
+  // Folder sizes for the Size column, counted for the folder being shown when switched on.
+  const [showFolderSizes, setShowFolderSizes] = useState(() => {
+    try {
+      return typeof window !== "undefined" && window.localStorage.getItem("filesdude-folder-sizes") === "on";
+    } catch {
+      return false;
+    }
+  });
+  const [folderSizes, setFolderSizes] = useState<{ path: string; sizes: Map<string, number>; complete: boolean } | null>(null);
+  const shownFolderSizes = showFolderSizes && folderSizes?.path === currentPath ? folderSizes : null;
+  const sortedEntries = useMemo(() => sortEntries(entries, sort, shownFolderSizes?.sizes), [entries, sort, shownFolderSizes]);
   // What the signed-in account may do. The server enforces all of this; the UI just hides what
   // would be refused.
   const home = auth.root ?? "";
@@ -654,6 +664,27 @@ export function FileManager() {
       controller.abort();
     };
   }, [auth.authenticated, searchMode, activeSearch, currentPath, showHidden, matchCase, searchRun]);
+
+  useEffect(() => {
+    if (!auth.authenticated || !showFolderSizes || nameSearching || (searchMode === "contents" && activeSearch)) return;
+    const controller = new AbortController();
+    const folder = currentPath;
+    requestJson<{ sizes: Record<string, { bytes: number }>; complete: boolean }>(`/api/fs/folder-size?path=${encodePath(folder)}&children=1`, { signal: controller.signal })
+      .then((result) => setFolderSizes({ path: folder, complete: result.complete, sizes: new Map(Object.entries(result.sizes).map(([name, size]) => [folder ? `${folder}/${name}` : name, size.bytes])) }))
+      .catch((error: Error) => { if (error.name !== "AbortError") setFolderSizes({ path: folder, complete: false, sizes: new Map() }); });
+    return () => controller.abort();
+    // Counted again whenever the listing reloads, so changes show up.
+  }, [auth.authenticated, showFolderSizes, currentPath, entries, nameSearching, searchMode, activeSearch]);
+
+  const toggleFolderSizes = () => {
+    const next = !showFolderSizes;
+    setShowFolderSizes(next);
+    try {
+      window.localStorage.setItem("filesdude-folder-sizes", next ? "on" : "off");
+    } catch {
+      // Not remembered in a private window; it still applies now.
+    }
+  };
 
   const loadFavorites = useCallback(async () => {
     if (!auth.authenticated) return;
@@ -1451,6 +1482,7 @@ export function FileManager() {
               </select>
               <button className="icon-button" title={sort.direction === "asc" ? "Ascending" : "Descending"} aria-label={`Sort ${sort.direction === "asc" ? "descending" : "ascending"} instead`} onClick={() => applySort({ ...sort, direction: sort.direction === "asc" ? "desc" : "asc" })}>{sort.direction === "asc" ? <ArrowUpNarrowWide size={16} /> : <ArrowDownWideNarrow size={16} />}</button>
             </div>
+            <button className={`toolbar-button ${showFolderSizes ? "active" : ""}`} aria-pressed={showFolderSizes} onClick={toggleFolderSizes} title="Show how much each folder holds"><HardDrive size={16} /> Sizes</button>
             <button className={`toolbar-button ${showHidden ? "active" : ""}`} onClick={() => setShowHidden(!showHidden)} title="Show hidden files">{showHidden ? <Eye size={17} /> : <EyeOff size={17} />}<span>Hidden</span></button>
             <div className="view-switch" role="group" aria-label="View style">
               <button className={view === "list" ? "active" : ""} aria-label="List view" onClick={() => setView("list")}><List size={17} /></button>
@@ -1505,6 +1537,7 @@ export function FileManager() {
             ) : view === "list" ? (
               <FileTable
                 folder={currentPath}
+                folderSizes={showFolderSizes && !nameSearching ? (shownFolderSizes?.sizes ?? "counting") : undefined}
                 entries={sortedEntries}
                 sort={sort}
                 onSort={(key) => applySort(nextSort(sort, key))}
@@ -1684,9 +1717,11 @@ function entryStateClasses(entry: FileEntry, interactions: EntryInteractions) {
   return `${interactions.cutPaths.has(entry.path) ? "cut" : ""} ${interactions.dropTarget === entry.path ? "drop-target" : ""}`;
 }
 
-function FileTable({ entries, sort, onSort, selected, cursor, interactions, allSelected, onToggleAll, onToggle, onOpen, folder }: {
+function FileTable({ entries, sort, onSort, selected, cursor, interactions, allSelected, onToggleAll, onToggle, onOpen, folder, folderSizes }: {
   /** The folder being shown; search results from elsewhere say where they are. */
   folder?: string;
+  /** Counted folder sizes by path, "counting" while they're worked out, or nothing when off. */
+  folderSizes?: Map<string, number> | "counting";
   entries: FileEntry[];
   sort: SortState;
   onSort: (key: SortKey) => void;
@@ -1722,7 +1757,7 @@ function FileTable({ entries, sort, onSort, selected, cursor, interactions, allS
           <div key={entry.path} data-path={entry.path} aria-selected={isSelected} className={`file-row ${isSelected ? "selected" : ""} ${cursor === entry.path ? "cursor" : ""} ${entryStateClasses(entry, interactions)}`} role="row" {...entryItemProps(entry, interactions)} onMouseDown={(event) => { if (event.shiftKey) event.preventDefault(); }} onDoubleClick={(event) => { if (!(event.target as HTMLElement).closest("button,input,label")) onOpen(entry); }} onClick={(event) => { if ((event.target as HTMLElement).closest("button,input,label")) return; onToggle(entry, { additive: event.metaKey || event.ctrlKey, range: event.shiftKey }); }}>
             <div role="cell"><CheckBox checked={isSelected} onChange={(event) => onToggle(entry, { additive: true, range: event.shiftKey })} label={`Select ${entry.name}`} /></div>
             <div className="file-name-cell" role="cell"><span className={`file-icon ${entry.type}`}>{fileIcon(entry)}</span>{folder !== undefined && parentOf(entry.path) !== folder ? <div className="file-name-stack"><button className="file-name" onClick={() => onOpen(entry)}>{entry.name}</button><small title={`/${entry.path}`}>{folderLabel(parentOf(entry.path))}</small></div> : <button className="file-name" onClick={() => onOpen(entry)}>{entry.name}</button>}{interactions.sharedPaths.has(entry.path) && <span className="shared-badge" title="Shared by link"><Link2 size={13} /></span>}{entry.symlinkBlocked && <span className="warning-badge" title="This link points outside the allowed root"><CircleAlert size={13} /></span>}</div>
-            <div className="muted" role="cell">{entry.type === "directory" ? "—" : formatBytes(entry.size)}</div>
+            <div className="muted" role="cell">{entry.type !== "directory" ? formatBytes(entry.size) : folderSizes === "counting" ? <LoaderCircle className="spin" size={12} aria-label="Counting" /> : folderSizes?.has(entry.path) ? formatBytes(folderSizes.get(entry.path)!) : "—"}</div>
             <div className="owner-cell" role="cell"><span className="mini-avatar">{entry.owner.slice(0, 1).toUpperCase()}</span><span>{entry.owner}:{entry.group}</span></div>
             <div role="cell"><code className="mode-chip">{entry.mode}</code></div>
             <div className="muted" role="cell">{formatDate(entry.modified)}</div>

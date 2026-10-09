@@ -41,6 +41,14 @@ test("sorts by size with name tie-breaks and folders kept in name order", () => 
   assert.deepEqual(names(sortEntries(entries, { key: "size", direction: "asc" })), ["archive", "photos", "file10.txt", "b.log", "File2.txt"]);
 });
 
+test("folders sort by their counted contents when known", () => {
+  const sizes = new Map([["photos", 5_000_000], ["archive", 200]]);
+  assert.deepEqual(names(sortEntries(entries, { key: "size", direction: "desc" }, sizes)).slice(0, 2), ["photos", "archive"]);
+  assert.deepEqual(names(sortEntries(entries, { key: "size", direction: "asc" }, sizes)).slice(0, 2), ["archive", "photos"]);
+  // A folder not yet counted goes after the counted ones.
+  assert.deepEqual(names(sortEntries(entries, { key: "size", direction: "desc" }, new Map([["photos", 1]]))).slice(0, 2), ["photos", "archive"]);
+});
+
 test("sorts by modified time, owner, and numeric permissions", () => {
   assert.deepEqual(names(sortEntries(entries, { key: "modified", direction: "desc" })).slice(2), ["file10.txt", "b.log", "File2.txt"]);
   assert.deepEqual(names(sortEntries(entries, { key: "owner", direction: "asc" })), ["archive", "photos", "b.log", "file10.txt", "File2.txt"]);

@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { config } from "../lib/config";
-import { folderSize } from "../lib/folder-size";
+import { childFolderSizes, folderSize } from "../lib/folder-size";
 import { runInScope } from "../lib/scope";
 
 async function withRoot<T>(run: (root: string) => Promise<T>) {
@@ -41,6 +41,21 @@ test("a folder's files, folders, and size are counted, with hard links once and 
     assert.ok(size.allocated > 0);
     const whole = await folderSize("");
     assert.equal(whole.bytes, 10_009);
+  });
+});
+
+test("each folder inside a folder is counted for the Size column", async () => {
+  await withRoot(async (root) => {
+    await write(root, { "top/films/a.mkv": "x".repeat(1000), "top/films/b/c.mkv": "x".repeat(500), "top/music/d.flac": "x".repeat(20), "top/loose.txt": "loose", "top/.filedude/hidden": "x".repeat(9999) });
+    await fs.mkdir(path.join(root, "top/empty"));
+    await fs.symlink("films", path.join(root, "top/films-link"));
+    const { sizes, complete } = await childFolderSizes("top");
+    assert.equal(complete, true);
+    assert.deepEqual(Object.fromEntries(Object.entries(sizes).map(([name, size]) => [name, [size.bytes, size.files]])), { films: [1500, 2], music: [20, 1], empty: [0, 0] });
+    // Out of budget, the folders not reached are left out and the result says so.
+    const short = await childFolderSizes("top", undefined, { entries: 4, milliseconds: 60_000 });
+    assert.equal(short.complete, false);
+    assert.ok(Object.keys(short.sizes).length < 3);
   });
 });
 
