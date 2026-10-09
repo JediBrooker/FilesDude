@@ -108,6 +108,8 @@ export interface TransferResult {
   path: string;
   /** True when a copy was given a new name because the original name was taken. */
   renamed: boolean;
+  /** Set when a move between filesystems left items in the original location because they changed while being copied. */
+  leftBehind?: boolean;
 }
 
 export interface DeleteResult {

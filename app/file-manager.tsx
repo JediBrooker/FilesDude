@@ -676,7 +676,8 @@ export function FileManager() {
       const copy = job.kind === "copy";
       if (job.status === "done") {
         const destination = items.length ? parentOf(items[0].path) : "";
-        notify(`${itemCount(items.length)} ${copy ? "copied" : "moved"} to ${folderLabel(destination)}`, undefined, undoFor({ action: job.kind }, items) ?? undefined);
+        const leftBehind = items.some((item) => item.leftBehind) ? " · some items changed during the move and were left in the original folder" : "";
+        notify(`${itemCount(items.length)} ${copy ? "copied" : "moved"} to ${folderLabel(destination)}${leftBehind}`, undefined, undoFor({ action: job.kind }, items) ?? undefined);
       } else if (job.status === "failed") {
         notify(job.error || `The ${job.kind} failed`, "error");
       } else {

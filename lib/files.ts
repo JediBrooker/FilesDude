@@ -349,8 +349,10 @@ async function copyEntry(from: AnchoredDirectory, name: string, to: AnchoredDire
   const target = inside(to, targetName);
   const stat = await fs.lstat(source);
   if (stat.isSymbolicLink()) {
+    const before = context.sources && fingerprintOf(await fs.lstat(source, { bigint: true }));
     await fs.symlink(await fs.readlink(source), target);
-    context.sources?.add(fingerprintOf(await fs.lstat(source, { bigint: true })));
+    // Only a link that wasn't replaced while it was read may be removed by a move.
+    if (before && before === fingerprintOf(await fs.lstat(source, { bigint: true }))) context.sources!.add(before);
     if (depth === 0) markCreated(context, depth, await fs.lstat(target));
     return;
   }
@@ -425,6 +427,27 @@ async function removeCopied(directory: AnchoredDirectory, name: string, sources:
     if ((error as NodeJS.ErrnoException).code === "ENOTEMPTY" || (error as NodeJS.ErrnoException).code === "EEXIST") return false;
     throw error;
   }
+}
+
+/**
+ * Removes the item a copy created at `name`. A folder is checked through the same handle that is
+ * then emptied, so an item swapped in at that name is never emptied, and the final rmdir by name
+ * fails harmlessly if the name now holds something else.
+ */
+async function removeCreated(directory: AnchoredDirectory, name: string, created: string | undefined) {
+  if (!created) return;
+  const stat = await fs.lstat(inside(directory, name)).catch(missingAsNull);
+  if (!stat || identityOf(stat) !== created) return;
+  if (!stat.isDirectory()) {
+    await fs.unlink(inside(directory, name));
+    return;
+  }
+  const emptied = await withOpen(openChild(directory, name), async (folder) => {
+    if (identityOf(folder.stat) !== created) return false;
+    for (const entry of await fs.readdir(folder.base)) await removeEntry(folder, entry, 1);
+    return true;
+  });
+  if (emptied) await fs.rmdir(inside(directory, name)).catch(() => undefined);
 }
 
 const nameConflict = () => new AppError("An item with that name already exists in the destination", 409, "NAME_CONFLICT");
@@ -968,6 +991,13 @@ async function openDirectoryPath(relativePath: string) {
   }
 }
 
+// Shortens `stem` (by whole characters) so that it and `suffix` fit the 255-byte name limit.
+function fitName(stem: string, suffix: string) {
+  const characters = [...stem];
+  while (characters.length && Buffer.byteLength(characters.join("") + suffix, "utf8") > 255) characters.pop();
+  return characters.join("") + suffix;
+}
+
 // Picks name, then "name (label).ext", "name (label 2).ext", ... in the folder, whichever is free.
 // With `labelled`, the plain name is skipped.
 async function availableName(directory: AnchoredDirectory, name: string, type: EntryType, label: string, labelled = false) {
@@ -975,7 +1005,7 @@ async function availableName(directory: AnchoredDirectory, name: string, type: E
   const extension = type === "directory" ? "" : path.extname(name);
   const stem = extension ? name.slice(0, -extension.length) : name;
   for (let index = labelled ? 1 : 0; index < 1_000; index += 1) {
-    const candidateName = index === 0 ? name : `${stem} (${label}${index > 1 ? ` ${index}` : ""})${extension}`;
+    const candidateName = index === 0 ? name : fitName(stem, ` (${label}${index > 1 ? ` ${index}` : ""})${extension}`);
     if (!(await fs.lstat(inside(directory, candidateName)).catch(missingAsNull))) return { name: candidateName, renamed: index > 0 };
   }
   throw new AppError(`Unable to choose an available name for ${name}`, 409, "NAME_CONFLICT");
@@ -1147,10 +1177,6 @@ async function transferOne(sourcePath: string, destination: AnchoredDirectory, d
       const { name: temporary } = await availableName(destination, name, type, "copying", true);
       if (move) context.sources = new Set();
       else context.created = unlock;
-      const removeTemporary = async () => {
-        const current = await fs.lstat(inside(destination, temporary)).catch(missingAsNull);
-        if (current && identityOf(current) === context.top) await removeEntry(destination, temporary);
-      };
       let targetName = name;
       let renamed = false;
       try {
@@ -1163,12 +1189,18 @@ async function transferOne(sourcePath: string, destination: AnchoredDirectory, d
         if (!move) ({ name: targetName, renamed } = await availableName(destination, name, type, "copy"));
         await placeEntry(destination, temporary, destination, targetName);
       } catch (error) {
-        await removeTemporary().catch(() => undefined);
+        await relock();
+        await removeCreated(destination, temporary, context.top).catch(() => undefined);
         throw error;
       }
       if (!move) return result(targetName, renamed);
-      await removeCopied(parent, name, context.sources!);
-      return placed(result(name, false));
+      // The item is in place, so the move stands even if removing the original stops part-way;
+      // whatever is left (changed or added while it was copied) is reported, not lost.
+      const removed = await removeCopied(parent, name, context.sources!).catch((error: unknown) => {
+        console.error("Could not remove all of a moved original", error);
+        return false;
+      });
+      return placed({ ...result(name, false), ...(removed ? {} : { leftBehind: true }) });
     });
   } finally {
     unlock();

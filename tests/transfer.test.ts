@@ -178,7 +178,7 @@ test("a move between filesystems removes only what it copied and leaves anything
     });
     try {
       const moved = await copyOrMove(["src"], "dest", true);
-      assert.deepEqual(moved, [{ source: "src", path: "dest/src", renamed: false }]);
+      assert.deepEqual(moved, [{ source: "src", path: "dest/src", renamed: false, leftBehind: true }]);
     } finally {
       Object.assign(fs, original);
     }
@@ -209,6 +209,18 @@ test("a copy cancelled while waiting to be put in place is removed", async () =>
       },
     }), /cancelled/);
     assert.deepEqual(await fs.readdir(path.join(root, "dest")), []);
+  });
+});
+
+test("copies of items with names near the length limit still get a placeholder that fits", async () => {
+  await withTempRoot(async (root) => {
+    const name = `${"é".repeat(124)}x.txt`;
+    assert.equal(Buffer.byteLength(name), 253);
+    await fs.writeFile(path.join(root, name), "long");
+    await fs.mkdir(path.join(root, "dest"));
+    assert.deepEqual(await copyOrMove([name], "dest", false), [{ source: name, path: `dest/${name}`, renamed: false }]);
+    const second = await copyOrMove([name], "dest", false);
+    assert.ok(Buffer.byteLength(path.posix.basename(second[0].path)) <= 255 && second[0].renamed);
   });
 });
 
