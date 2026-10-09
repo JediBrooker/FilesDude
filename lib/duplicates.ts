@@ -3,7 +3,7 @@ import { constants } from "node:fs";
 import fs, { type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { config } from "./config";
-import { ensureRoot, INTERNAL_NAMES, normalizeRelative, safeResolve, verifyFileHandleWithinRoot } from "./files";
+import { ensureRoot, INTERNAL_NAMES, isUnchangedFile, normalizeRelative, safeResolve, trashIfUnchanged, verifyFileHandleWithinRoot, type FileIdentity } from "./files";
 import { AppError } from "./http";
 
 // Finds files with identical contents under a folder. Files are grouped by size, groups narrowed by
@@ -37,12 +37,18 @@ export interface DuplicateProgress {
 
 type Seen = { relative: string; size: number; dev: number; ino: number; mtimeMs: number; nlink: number };
 
+// Smaller files are left out: they free little space and would make reports enormous.
+export const MIN_DUPLICATE_BYTES = 64 * 1024;
 const SAMPLE_BYTES = 64 * 1024;
 const READ_BYTES = 1024 * 1024;
 const MAX_DEPTH = 256;
 
-let scan: { controller: AbortController; progress: DuplicateProgress; startedAt: number; promise: Promise<void> } | null = null;
+type Scan = { controller: AbortController; progress: DuplicateProgress; startedAt: number; promise: Promise<void> };
+let scan: Scan | null = null;
+let starting = false;
 let lastReport: DuplicateReport | null = null;
+// Each reported copy's identity when it was scanned, so a removal can check it hasn't changed since.
+let reportFiles = new Map<string, FileIdentity>();
 let lastError: string | null = null;
 
 const cancelled = () => new AppError("The duplicate scan was cancelled", 409, "JOB_CANCELLED");
@@ -179,7 +185,8 @@ async function walk(folder: string, minBytes: number, progress: DuplicateProgres
   return { root, bySize, skipped };
 }
 
-async function findDuplicates(folder: string, minBytes: number, progress: DuplicateProgress, signal: AbortSignal, startedAt: number): Promise<DuplicateReport> {
+async function findDuplicates(folder: string, minBytes: number, progress: DuplicateProgress, signal: AbortSignal, startedAt: number): Promise<{ report: DuplicateReport; files: Map<string, FileIdentity> }> {
+  const files = new Map<string, FileIdentity>();
   const { root, bySize, skipped: walkSkipped } = await walk(folder, minBytes, progress, signal);
   let skipped = walkSkipped;
   const sizeGroups = [...bySize.values()].filter((group) => new Set(group.map(inodeOf)).size > 1);
@@ -210,6 +217,7 @@ async function findDuplicates(folder: string, minBytes: number, progress: Duplic
     }
     skipped += [...hashes.values()].filter((value) => value === null).length;
     for (const matching of splitBy(group, (item) => hashes.get(inodeOf(item)) ?? null)) {
+      for (const item of matching) files.set(item.relative, { dev: item.dev, ino: item.ino, size: item.size, mtimeMs: item.mtimeMs });
       const copies = matching
         .map((item) => ({ path: item.relative, modified: new Date(item.mtimeMs).toISOString(), inode: inodeOf(item), links: item.nlink }))
         .sort((a, b) => a.modified.localeCompare(b.modified) || a.path.localeCompare(b.path));
@@ -217,7 +225,7 @@ async function findDuplicates(folder: string, minBytes: number, progress: Duplic
     }
   }
   groups.sort((a, b) => b.wastedBytes - a.wastedBytes || a.copies[0].path.localeCompare(b.copies[0].path));
-  return {
+  const report = {
     folder,
     minBytes,
     generatedAt: new Date().toISOString(),
@@ -227,28 +235,40 @@ async function findDuplicates(folder: string, minBytes: number, progress: Duplic
     groups,
     wastedBytes: groups.reduce((total, group) => total + group.wastedBytes, 0),
   };
+  return { report, files };
 }
 
 /** Starts scanning a folder for duplicates; one scan runs at a time. */
 export async function startDuplicateScan(folderPath: string, minBytes: number) {
-  if (scan) throw new AppError("A duplicate scan is already running", 409, "JOB_RUNNING");
-  if (!Number.isInteger(minBytes) || minBytes < 1) throw new AppError("Choose a minimum file size", 400, "INVALID_REQUEST");
-  const folder = normalizeRelative(folderPath).replace(/\/+$/, "");
-  const absolute = await safeResolve(folder);
-  if (!(await fs.stat(absolute)).isDirectory()) throw new AppError("Path is not a folder", 400, "NOT_A_DIRECTORY");
+  // The slot is claimed before anything is awaited, so two requests can't both start a scan.
+  if (scan || starting) throw new AppError("A duplicate scan is already running", 409, "JOB_RUNNING");
+  starting = true;
+  let folder: string;
+  try {
+    if (!Number.isInteger(minBytes) || minBytes < MIN_DUPLICATE_BYTES) throw new AppError("Choose a minimum file size of at least 64 KB", 400, "INVALID_REQUEST");
+    folder = normalizeRelative(folderPath).replace(/\/+$/, "");
+    const absolute = await safeResolve(folder);
+    if (!(await fs.stat(absolute)).isDirectory()) throw new AppError("Path is not a folder", 400, "NOT_A_DIRECTORY");
+  } finally {
+    starting = false;
+  }
   const controller = new AbortController();
   const startedAt = Date.now();
   const progress: DuplicateProgress = { phase: "listing", folder, filesSeen: 0, directoriesSeen: 0, candidates: 0, bytesToHash: 0, bytesHashed: 0, elapsedMs: 0 };
   lastError = null;
-  const promise = findDuplicates(folder, minBytes, progress, controller.signal, startedAt)
-    .then((report) => { lastReport = report; })
+  const current: Scan = { controller, progress, startedAt, promise: Promise.resolve() };
+  current.promise = findDuplicates(folder, minBytes, progress, controller.signal, startedAt)
+    .then(({ report, files }) => {
+      lastReport = report;
+      reportFiles = files;
+    })
     .catch((error: unknown) => {
       if (controller.signal.aborted) return;
       console.error(error);
       lastError = error instanceof AppError ? error.message : "The duplicate scan failed unexpectedly";
     })
-    .finally(() => { scan = null; });
-  scan = { controller, progress, startedAt, promise };
+    .finally(() => { if (scan === current) scan = null; });
+  scan = current;
 }
 
 export function cancelDuplicateScan() {
@@ -263,6 +283,43 @@ export function duplicateStatus({ offset = 0, limit = 200 }: { offset?: number; 
     report,
     error: lastError,
   };
+}
+
+/**
+ * Moves chosen copies to the trash. Call with the filesystem lock held, so the checks and the
+ * removals can't interleave with another request. Each copy must be in the last report and still be
+ * exactly the file scanned (same identity, size, and time, at its real location); one that changed
+ * is skipped. Every set must keep at least one unchanged copy on disk. The report is updated as
+ * each copy goes.
+ */
+export async function trashDuplicates(paths: string[]) {
+  const removing = checkDuplicateRemoval(paths);
+  const removingSet = new Set(removing);
+  for (const group of lastReport!.groups) {
+    if (!group.copies.some((copy) => removingSet.has(copy.path))) continue;
+    let kept = false;
+    for (const copy of group.copies) {
+      const identity = reportFiles.get(copy.path);
+      if (!removingSet.has(copy.path) && identity && await isUnchangedFile(copy.path, identity)) {
+        kept = true;
+        break;
+      }
+    }
+    if (!kept) throw new AppError(`No unchanged copy of ${path.posix.basename(group.copies[0].path)} would be left; scan again`, 409, "KEEP_ONE_COPY");
+  }
+  const trashed: Array<{ path: string; id: string }> = [];
+  const changed: string[] = [];
+  try {
+    for (const item of removing) {
+      const identity = reportFiles.get(item);
+      const id = identity ? await trashIfUnchanged(item, identity) : null;
+      if (id) trashed.push({ path: item, id });
+      else changed.push(item);
+    }
+  } finally {
+    forgetDuplicatePaths([...trashed.map((item) => item.path), ...changed]);
+  }
+  return { trashed, changed };
 }
 
 /**
@@ -287,10 +344,18 @@ export function checkDuplicateRemoval(paths: string[]) {
 /** Forgets removed paths, so the report stays accurate after copies are deleted. */
 export function forgetDuplicatePaths(paths: string[]) {
   if (!lastReport || !paths.length) return;
-  const removed = new Set(paths.map((item) => normalizeRelative(item)));
+  const removed = new Set(paths.map((item) => normalizeRelative(item).replace(/\/+$/, "")));
+  // A copy goes if it, or any folder above it, was removed.
+  const gone = (copyPath: string) => {
+    for (let end = copyPath.length; end > 0; end = copyPath.lastIndexOf("/", end - 1)) {
+      if (removed.has(copyPath.slice(0, end))) return true;
+    }
+    return false;
+  };
+  for (const item of removed) reportFiles.delete(item);
   const groups = lastReport.groups
     .map((group) => {
-      const copies = group.copies.filter((copy) => !removed.has(copy.path) && ![...removed].some((item) => copy.path.startsWith(`${item}/`)));
+      const copies = group.copies.filter((copy) => !gone(copy.path));
       return { ...group, copies, wastedBytes: group.size * Math.max(0, new Set(copies.map((copy) => copy.inode)).size - 1) };
     })
     .filter((group) => group.wastedBytes > 0);

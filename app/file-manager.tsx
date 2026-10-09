@@ -2295,10 +2295,15 @@ function DuplicatesDialog({ startPath, onClose, notify, onRefresh, onReveal }: {
     setError("");
     try {
       const paths = [...selected];
+      let trashed = 0;
+      let changed = 0;
       for (let start = 0; start < paths.length; start += 500) {
-        setStatus(await post({ action: "trash", paths: paths.slice(start, start + 500) }));
+        const response = await requestJson<DuplicateStatus & { result: { trashed: unknown[]; changed: unknown[] } }>("/api/fs/duplicates", { method: "POST", body: JSON.stringify({ action: "trash", paths: paths.slice(start, start + 500) }) });
+        setStatus(response);
+        trashed += response.result.trashed.length;
+        changed += response.result.changed.length;
       }
-      notify(`${itemCount(paths.length)} moved to the trash${freed ? ` · about ${formatBytes(freed)} freed once the trash is emptied` : ""}`);
+      notify(`${itemCount(trashed)} moved to the trash${changed ? ` · ${itemCount(changed)} changed since the scan and ${changed === 1 ? "was" : "were"} left alone` : ""}`, changed ? "error" : undefined);
       setSelected(new Set());
       await onRefresh();
     } catch (caught) {

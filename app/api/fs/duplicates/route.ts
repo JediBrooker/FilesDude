@@ -2,8 +2,8 @@ import { NextResponse } from "next/server";
 import { withAccess } from "@/lib/access";
 import { audit } from "@/lib/audit";
 import { config } from "@/lib/config";
-import { cancelDuplicateScan, checkDuplicateRemoval, duplicateStatus, forgetDuplicatePaths, startDuplicateScan } from "@/lib/duplicates";
-import { deleteEntries, withFilesystemLock } from "@/lib/files";
+import { cancelDuplicateScan, duplicateStatus, startDuplicateScan, trashDuplicates } from "@/lib/duplicates";
+import { withFilesystemLock } from "@/lib/files";
 import { assertMutationRequest, AppError, jsonError, readJsonBody } from "@/lib/http";
 import { rewriteLinkedPaths } from "@/lib/transfers";
 
@@ -53,14 +53,13 @@ export async function POST(request: Request) {
           if (!requested.length || requested.length > 1000 || requested.some((item) => typeof item !== "string" || item.length > 4096)) {
             throw new AppError("Choose between 1 and 1,000 copies", 400, "INVALID_PATHS");
           }
-          const paths = checkDuplicateRemoval(requested as string[]);
+          // Checks, removals, and the report update happen together under the lock.
           const result = await withFilesystemLock(async () => {
-            const deleted = await deleteEntries(paths);
-            await rewriteLinkedPaths(paths.map((item) => ({ from: item })), session.username);
-            return deleted;
+            const outcome = await trashDuplicates(requested as string[]);
+            await rewriteLinkedPaths(outcome.trashed.map((item) => ({ from: item.path })), session.username);
+            return outcome;
           });
-          forgetDuplicatePaths(paths);
-          await audit("duplicates.trash", { username: session.username, paths });
+          await audit("duplicates.trash", { username: session.username, paths: result.trashed.map((item) => item.path), changed: result.changed });
           return NextResponse.json({ ok: true, result, ...duplicateStatus() }, noStore);
         }
         default:
