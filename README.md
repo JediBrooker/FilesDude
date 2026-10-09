@@ -234,10 +234,15 @@ When the host has ffmpeg (`/usr/bin/ffmpeg`, or set `FILEDUDE_FFMPEG_PATH`) and 
 service runs as root under systemd, videos get thumbnails in grid view from a frame a few
 seconds in. ffmpeg decodes files other users control, so it never runs inside FilesDude:
 each frame comes from a throwaway systemd unit running as a temporary unprivileged user,
-with no network or capabilities, a system-call filter, memory, task, CPU, and time
-limits, and no view of the data root, FilesDude's state, or `/etc` beyond what the
-dynamic linker needs. The video is passed in as the already-opened file, never by path.
-Set `FILEDUDE_VIDEO_THUMBNAILS=false` to turn this off.
+with no network, sockets, or capabilities, a system-call filter, memory, task, CPU, and
+time limits (15 seconds), and nothing of the filesystem but the system's programs and
+libraries: every other top-level folder is hidden, and `/etc` and `/run` are empty apart
+from what the dynamic linker needs. The video is passed in as the already-opened file,
+never by path, and ffmpeg may only read that file, as MP4/MOV, Matroska/WebM, or AVI, so a
+crafted file can't make it open playlists, other files, or URLs. One video is worked on at
+a time, separately from images, and a video no frame could be taken from isn't tried
+again for six hours unless it changes. Set `FILEDUDE_VIDEO_THUMBNAILS=false` to turn this
+off.
 
 ## Duplicate files
 

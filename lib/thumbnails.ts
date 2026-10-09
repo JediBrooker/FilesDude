@@ -9,7 +9,8 @@ import { AppError } from "./http";
 import { videoFrame, videoThumbnailsAvailable } from "./video-frames";
 
 // Image decoding is CPU- and memory-heavy and shares libuv's small thread pool with file I/O, so
-// sharp keeps no cache, uses one thread per image, and at most two thumbnails are made at once.
+// sharp keeps no cache, uses one thread per image, and at most two images (and one video) are
+// thumbnailed at once.
 sharp.cache(false);
 sharp.concurrency(1);
 
@@ -26,27 +27,51 @@ const DECODE_TIMEOUT_SECONDS = 10;
 export const MAX_THUMBNAIL_SOURCE_BYTES = 64 * 1024 * 1024;
 const MAX_SOURCE_PIXELS = 100_000_000;
 const THUMBNAIL_SIZE = 320;
-const MAX_ACTIVE = 2;
-const MAX_WAITING = 200;
 const CACHE_MAX_FILES = 4_000;
+// Videos for which no frame could be taken (often slowly) aren't tried again for a while.
+const FAILED_VIDEOS_MAX = 2_000;
+const FAILED_VIDEO_RETRY_MS = 6 * 60 * 60 * 1000;
 
-let active = 0;
 let writesSincePrune = 0;
-const waiting: Array<() => void> = [];
+const failedVideos = new Map<string, number>();
 
-async function takeSlot() {
-  if (active < MAX_ACTIVE) {
-    active += 1;
-    return;
-  }
-  if (waiting.length >= MAX_WAITING) throw new AppError("Too many thumbnails are being prepared; try again shortly", 503, "THUMBNAILS_BUSY");
-  await new Promise<void>((resolve) => waiting.push(resolve));
-  active += 1;
+// A queue allowing a few thumbnails to be made at once. Images and videos have separate queues,
+// so slow videos never hold up images.
+function limiter(maxActive: number, maxWaiting: number) {
+  let active = 0;
+  const waiting: Array<() => void> = [];
+  return {
+    async take() {
+      if (active < maxActive) {
+        active += 1;
+        return;
+      }
+      if (waiting.length >= maxWaiting) throw new AppError("Too many thumbnails are being prepared; try again shortly", 503, "THUMBNAILS_BUSY");
+      await new Promise<void>((resolve) => waiting.push(resolve));
+      active += 1;
+    },
+    release() {
+      active -= 1;
+      waiting.shift()?.();
+    },
+  };
 }
 
-function releaseSlot() {
-  active -= 1;
-  waiting.shift()?.();
+const imageSlots = limiter(2, 200);
+const videoSlots = limiter(1, 50);
+
+function videoFailed(key: string) {
+  const failedAt = failedVideos.get(key);
+  if (failedAt !== undefined && Date.now() - failedAt < FAILED_VIDEO_RETRY_MS) return true;
+  failedVideos.delete(key);
+  return false;
+}
+
+function rememberFailedVideo(key: string) {
+  failedVideos.delete(key);
+  failedVideos.set(key, Date.now());
+  // Maps keep insertion order, so the first key is the oldest failure.
+  if (failedVideos.size > FAILED_VIDEOS_MAX) failedVideos.delete(failedVideos.keys().next().value!);
 }
 
 function cacheDirectory() {
@@ -120,11 +145,16 @@ async function storeThumbnail(name: string, data: Buffer) {
 
 // A video's thumbnail: one frame (a PNG from the sandbox), checked and resized like an image.
 async function videoThumbnail(fd: number, key: string) {
-  await takeSlot();
+  const noFrame = () => new AppError("No frame could be taken from this video", 422, "INVALID_VIDEO");
+  if (videoFailed(key)) throw noFrame();
+  await videoSlots.take();
   try {
+    // It may have failed while this request waited for its turn.
+    if (videoFailed(key)) throw noFrame();
     const frame = await videoFrame(fd);
     if (!frame || !frame.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
-      throw new AppError("No frame could be taken from this video", 422, "INVALID_VIDEO");
+      rememberFailedVideo(key);
+      throw noFrame();
     }
     let output: Buffer;
     try {
@@ -134,12 +164,13 @@ async function videoThumbnail(fd: number, key: string) {
         .webp({ quality: 72 })
         .toBuffer();
     } catch {
-      throw new AppError("No frame could be taken from this video", 422, "INVALID_VIDEO");
+      rememberFailedVideo(key);
+      throw noFrame();
     }
     await storeThumbnail(`${key}.webp`, output);
     return output;
   } finally {
-    releaseSlot();
+    videoSlots.release();
   }
 }
 
@@ -180,7 +211,7 @@ export async function thumbnailFor(relativePath: string, knownEtag?: string | nu
     const { bytesRead } = await handle.read(header, 0, header.length, 0);
     if (!looksLikeRasterImage(header.subarray(0, bytesRead))) throw new AppError("This image couldn't be read", 422, "INVALID_IMAGE");
 
-    await takeSlot();
+    await imageSlots.take();
     try {
       const source = await readExactly(handle, Number(identity.size));
       let output: Buffer;
@@ -200,7 +231,7 @@ export async function thumbnailFor(relativePath: string, knownEtag?: string | nu
       await storeThumbnail(`${key}.webp`, output);
       return { data: output, etag };
     } finally {
-      releaseSlot();
+      imageSlots.release();
     }
   } finally {
     await handle.close().catch(() => undefined);
