@@ -7,6 +7,7 @@ FilesDude is a secure, self-hosted web file manager designed for a Proxmox host,
 - Browse folders in list or grid view, sorted by name, size, owner, permissions, or modified time (folders stay first and the choice is remembered per browser), including an optional hidden-files view; the browser's own back/forward buttons and gestures step through folder history instead of leaving the app
 - Use a SharePoint-style row menu, also available by right-clicking any item (or empty space for folder actions), for preview, text editing, downloads, organization, administration, properties, and deletion; with several items selected it acts on all of them
 - Cut, copy, and paste items between folders, or drag them onto a folder, favourite, or breadcrumb to move them (hold Option/Alt to copy); copies into a folder that already has the name are saved as `name (copy)`
+- Copies and moves run as background jobs with byte progress and cancel, so large copies don't hold up browsing or other work; a copy in progress shows as `name (copying)` and gets its real name once complete, a cancelled or failed copy is removed, and a move between filesystems removes only what it copied unchanged
 - Undo the latest rename, move, copy, or delete from the confirmation toast or with `Command/Ctrl + Z`; deletes are undone by restoring from protected trash
 - Pin durable favourite folder locations to the sidebar from a folder menu, selection toolbar, or the current-location button
 - Create files and folders; edit text/code files up to 2 MB; rename, copy, move, soft-delete, and permanently delete, with a breadcrumb folder browser and autofill suggestions for picking a copy/move destination
@@ -286,7 +287,6 @@ The safest default set is already included. These are strong next additions when
 - Duplicate detection, video thumbnails, media metadata, and an index for searching file contents on very large trees
 - Antivirus scanning and upload quarantine for environments with untrusted uploaders
 - ZFS snapshot shortcuts and a version-history browser for Proxmox storage
-- Background jobs with progress for very large copies and moves (archives already run this way)
 - SFTP/SMB/NFS connection profiles for managing remote roots without mounting them into the app container
 
 ## Development checks

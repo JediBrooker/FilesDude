@@ -4,7 +4,12 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { config } from "../lib/config";
-import { copyOrMove, deleteEntries, listTrash, PartialTransferError, renameEntry, restoreTrashItems } from "../lib/files";
+import { execFileSync } from "node:child_process";
+import { acquireFilesystemLock, copyOrMove, deleteEntries, listTrash, PartialTransferError, renameEntry, restoreTrashItems, withFilesystemLock } from "../lib/files";
+import { listJobs, startJob } from "../lib/jobs";
+import type { JobProgress } from "../lib/types";
+
+const MB = 1024 * 1024;
 
 async function withTempRoot<T>(run: (root: string) => Promise<T>) {
   const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "filesdude-transfer-")));
@@ -113,5 +118,156 @@ test("deleting to trash returns ids that restore the items", async () => {
     await restoreTrashItems(result.trashed.map((item) => item.id));
     assert.equal(await fs.readFile(path.join(root, "keep.txt"), "utf8"), "k");
     assert.deepEqual(await deleteEntries(["keep.txt"], true), { trashed: [] });
+  });
+});
+
+test("copies report byte progress and don't hold the filesystem lock while copying", async () => {
+  await withTempRoot(async (root) => {
+    await fs.mkdir(path.join(root, "big"));
+    await fs.writeFile(path.join(root, "big", "a.bin"), Buffer.alloc(12 * MB, 1));
+    await fs.writeFile(path.join(root, "big", "b.bin"), Buffer.alloc(4 * MB, 2));
+    await fs.mkdir(path.join(root, "dest"));
+    const reports: JobProgress[] = [];
+    let lockedAt: number | null = null;
+    let lockRequested = false;
+    const copied = await copyOrMove(["big"], "dest", false, {
+      report: (progress) => {
+        reports.push(progress);
+        if (progress.done > 0 && !lockRequested) {
+          lockRequested = true;
+          void withFilesystemLock(async () => { lockedAt = reports.at(-1)!.done; });
+        }
+      },
+    });
+    assert.deepEqual(copied, [{ source: "big", path: "dest/big", renamed: false }]);
+    assert.equal(reports[0].total, 16 * MB);
+    assert.equal(reports.at(-1)!.done, 16 * MB);
+    // Other work got the lock while the copy was still writing.
+    assert.ok(lockedAt !== null && lockedAt < 16 * MB, `lock taken at ${lockedAt}`);
+    assert.equal((await fs.stat(path.join(root, "dest", "big", "a.bin"))).size, 12 * MB);
+    assert.deepEqual((await fs.readdir(path.join(root, "dest"))).sort(), ["big"]);
+  });
+});
+
+test("a move between filesystems removes only what it copied and leaves anything new in place", async () => {
+  await withTempRoot(async (root) => {
+    await fs.mkdir(path.join(root, "src"));
+    await fs.writeFile(path.join(root, "src", "a.txt"), "a");
+    await fs.mkdir(path.join(root, "dest"));
+    const original = { rename: fs.rename, link: fs.link, readdir: fs.readdir };
+    let injected = false;
+    // Pretend dest is another filesystem, and have a file arrive in the original once the copy has
+    // listed it, as a process already working inside the folder could.
+    const crossDevice = (target: unknown) => {
+      if (String(target).includes(`${path.sep}dest`) || /\/proc\/self\/fd\/\d+\/src$/.test(String(target))) {
+        return Promise.reject(Object.assign(new Error("cross-device"), { code: "EXDEV" }));
+      }
+      return null;
+    };
+    Object.assign(fs, {
+      rename: (from: string, to: string) => (String(from).endsWith("/src") ? crossDevice(to) ?? original.rename(from, to) : original.rename(from, to)),
+      link: (from: string, to: string) => crossDevice(to) ?? original.link(from, to),
+      readdir: async (...args: Parameters<typeof fs.readdir>) => {
+        const result = await (original.readdir as (...a: unknown[]) => Promise<unknown>)(...args);
+        if (!injected && Array.isArray(result) && result.includes("a.txt")) {
+          injected = true;
+          await fs.writeFile(path.join(root, "src", "late.txt"), "late");
+        }
+        return result;
+      },
+    });
+    try {
+      const moved = await copyOrMove(["src"], "dest", true);
+      assert.deepEqual(moved, [{ source: "src", path: "dest/src", renamed: false, leftBehind: true }]);
+    } finally {
+      Object.assign(fs, original);
+    }
+    assert.ok(injected);
+    assert.deepEqual(await fs.readdir(path.join(root, "dest", "src")), ["a.txt"]);
+    assert.deepEqual(await fs.readdir(path.join(root, "src")), ["late.txt"]);
+    assert.deepEqual(await fs.readdir(path.join(root, "dest")), ["src"]);
+  });
+});
+
+test("a copy cancelled while waiting to be put in place is removed", async () => {
+  await withTempRoot(async (root) => {
+    await fs.mkdir(path.join(root, "dest"));
+    await fs.writeFile(path.join(root, "file.bin"), Buffer.alloc(2 * MB));
+    const controller = new AbortController();
+    let held = false;
+    await assert.rejects(copyOrMove(["file.bin"], "dest", false, {
+      signal: controller.signal,
+      report: (progress) => {
+        // Take the lock as the copy finishes, cancel while the job waits for it, then let it go.
+        if (progress.total && progress.done >= progress.total && !held) {
+          held = true;
+          void acquireFilesystemLock().then((release) => {
+            controller.abort();
+            setTimeout(release, 20);
+          });
+        }
+      },
+    }), /cancelled/);
+    assert.deepEqual(await fs.readdir(path.join(root, "dest")), []);
+  });
+});
+
+test("copies of items with names near the length limit still get a placeholder that fits", async () => {
+  await withTempRoot(async (root) => {
+    const name = `${"é".repeat(124)}x.txt`;
+    assert.equal(Buffer.byteLength(name), 253);
+    await fs.writeFile(path.join(root, name), "long");
+    await fs.mkdir(path.join(root, "dest"));
+    assert.deepEqual(await copyOrMove([name], "dest", false), [{ source: name, path: `dest/${name}`, renamed: false }]);
+    const second = await copyOrMove([name], "dest", false);
+    assert.ok(Buffer.byteLength(path.posix.basename(second[0].path)) <= 255 && second[0].renamed);
+  });
+});
+
+test("a failed copy never removes an item that took over its placeholder name", async () => {
+  await withTempRoot(async (root) => {
+    await fs.mkdir(path.join(root, "dest"));
+    await fs.writeFile(path.join(root, "file.bin"), Buffer.alloc(3 * MB));
+    let swapped = false;
+    await assert.rejects(copyOrMove(["file.bin"], "dest", false, {
+      report: (progress) => {
+        if (progress.done > 0 && !swapped) {
+          swapped = true;
+          // Someone renames the placeholder away and puts their own file at its name.
+          execFileSync("sh", ["-c", `mv "${path.join(root, "dest", "file (copying).bin")}" "${path.join(root, "dest", "moved.bin")}" && echo mine > "${path.join(root, "dest", "file (copying).bin")}"`]);
+        }
+      },
+    }), /changed while it was being written/);
+    assert.equal(await fs.readFile(path.join(root, "dest", "file (copying).bin"), "utf8"), "mine\n");
+    assert.ok(!(await fs.readdir(path.join(root, "dest"))).includes("file.bin"));
+  });
+});
+
+test("each account keeps only its most recent finished jobs", async () => {
+  for (let index = 0; index < 30; index += 1) {
+    startJob("move", `job ${index}`, { done: 0, unit: "entries" }, async () => []);
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  startJob("move", "last", { done: 0, unit: "entries" }, async () => []);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const finished = listJobs().filter((job) => job.status === "done");
+  assert.ok(finished.length <= 11, `${finished.length} finished jobs kept`);
+  assert.ok(finished.some((job) => job.label === "last"));
+  assert.ok(finished.every((job) => job.transferred === undefined));
+});
+
+test("a cancelled copy leaves nothing behind", async () => {
+  await withTempRoot(async (root) => {
+    await fs.mkdir(path.join(root, "src"));
+    await fs.writeFile(path.join(root, "src", "one.bin"), Buffer.alloc(2 * MB));
+    await fs.writeFile(path.join(root, "src", "two.bin"), Buffer.alloc(6 * MB));
+    await fs.mkdir(path.join(root, "dest"));
+    const controller = new AbortController();
+    await assert.rejects(
+      copyOrMove(["src"], "dest", false, { signal: controller.signal, report: (progress) => { if (progress.done >= 3 * MB) controller.abort(); } }),
+      /cancelled/,
+    );
+    assert.deepEqual(await fs.readdir(path.join(root, "dest")), []);
+    assert.deepEqual((await fs.readdir(path.join(root, "src"))).sort(), ["one.bin", "two.bin"]);
   });
 });

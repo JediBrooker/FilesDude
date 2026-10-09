@@ -21,6 +21,7 @@ import { GET as listFs, POST as fsAction } from "../app/api/fs/route";
 import { GET as trashList, POST as trashAction } from "../app/api/fs/trash/route";
 import { POST as upload } from "../app/api/fs/upload/route";
 import { GET as favoritesList, POST as favoritesAction } from "../app/api/favorites/route";
+import { GET as jobsStatus, POST as jobsAction } from "../app/api/fs/jobs/route";
 import { GET as sharesList } from "../app/api/shares/route";
 import { GET as usersList, POST as usersAction } from "../app/api/users/route";
 
@@ -304,6 +305,44 @@ test("each account runs its own jobs, which stop when the account changes", asyn
     assert.equal(getJob(bobJob.id)?.status, "cancelled");
     assert.equal(getJob(aliceJob.id)?.status, "running");
     cancelAccountJobs(ids.alice);
+  });
+});
+
+test("undo-style moves still work while background transfers fill the allowance", async () => {
+  await withAccounts(async ({ root, bob, ids }) => {
+    const scope: AccessScope = { accountKey: ids.bob, username: "bob", role: "editor", root: "home/bob" };
+    const waitForCancel = (_report: unknown, signal: AbortSignal) => new Promise<never>((_resolve, reject) => {
+      signal.addEventListener("abort", () => reject(new Error("stopped")), { once: true });
+    });
+    for (let index = 0; index < 4; index += 1) runInScope(scope, () => startJob("copy", `copy ${index}`, { done: 0, unit: "bytes" }, waitForCancel));
+    await fs.mkdir(path.join(root, "home", "bob", "elsewhere"));
+    assert.equal(await status(call(jobsAction, "/api/fs/jobs", bob, { action: "copy", paths: ["home/bob/docs"], destination: "home/bob/elsewhere" })), 409);
+    assert.equal(await status(call(fsAction, "/api/fs", bob, { action: "move", paths: ["home/bob/docs"], destination: "home/bob/elsewhere" })), 200);
+    cancelAccountJobs(ids.bob);
+  });
+});
+
+test("copy and move jobs respect accounts and keep favourites following moved items", async () => {
+  await withAccounts(async ({ root, bob, alice, viewer }) => {
+    const start = (cookie: string, body: Record<string, unknown>) => call(jobsAction, "/api/fs/jobs", cookie, body);
+    assert.equal(await status(start(viewer, { action: "copy", paths: ["shared"], destination: "shared" })), 403);
+    const escaped = await (await start(bob, { action: "copy", paths: ["home/bob/docs/plan.txt"], destination: "home/alice" })).json();
+    assert.equal(escaped.job.status, "failed");
+    assert.deepEqual(await fs.readdir(path.join(root, "home", "alice")), ["diary.txt"]);
+
+    await call(favoritesAction, "/api/favorites", bob, { action: "add", path: "home/bob/docs" });
+    await fs.mkdir(path.join(root, "home", "bob", "archive"));
+    // A quick move comes back already finished.
+    const moved = await (await start(bob, { action: "move", paths: ["home/bob/docs"], destination: "home/bob/archive" })).json();
+    assert.equal(moved.job.status, "done");
+    assert.equal(moved.job.own, true);
+    assert.deepEqual(moved.job.transferred, [{ source: "home/bob/docs", path: "home/bob/archive/docs", renamed: false }]);
+    const favourites = (await (await call(favoritesList, "/api/favorites", bob)).json()).favorites;
+    assert.deepEqual(favourites.map((favorite: { path: string }) => favorite.path), ["home/bob/archive/docs"]);
+
+    assert.equal(await status(call(jobsStatus, `/api/fs/jobs?id=${moved.job.id}`, bob)), 200);
+    assert.equal(await status(call(jobsStatus, `/api/fs/jobs?id=${moved.job.id}`, alice)), 404);
+    assert.equal(await status(call(jobsAction, "/api/fs/jobs", alice, { action: "cancel", id: moved.job.id })), 404);
   });
 });
 

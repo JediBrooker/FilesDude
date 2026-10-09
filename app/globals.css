@@ -612,7 +612,8 @@ kbd { padding: 3px 5px; border: 1px solid var(--line); border-bottom-width: 2px;
 .user-form { display: grid; gap: 12px; margin: 6px 0 0 !important; padding: 14px !important; border: 1px solid var(--line); border-radius: 10px; }
 .user-form > strong { font-size: 11px; }
 .user-form .modal-actions { margin-top: 0; padding-bottom: 0; }
-.job-panel { position: fixed; z-index: 190; right: 22px; bottom: 78px; display: grid; width: min(330px, calc(100vw - 44px)); gap: 9px; padding: 11px 12px; border: 1px solid color-mix(in srgb, var(--brand) 30%, var(--line)); border-radius: 11px; background: var(--panel); box-shadow: var(--shadow); }
+.job-panels { position: fixed; z-index: 190; right: 22px; bottom: 78px; display: flex; max-height: calc(100vh - 120px); flex-direction: column; gap: 8px; overflow-y: auto; }
+.job-panel { display: grid; width: min(330px, calc(100vw - 44px)); gap: 9px; padding: 11px 12px; border: 1px solid color-mix(in srgb, var(--brand) 30%, var(--line)); border-radius: 11px; background: var(--panel); box-shadow: var(--shadow); }
 .job-panel-head { display: flex; min-width: 0; align-items: center; gap: 9px; }
 .job-panel-head .file-icon { width: 29px; height: 29px; }
 .job-panel-head > div { display: flex; min-width: 0; flex: 1; flex-direction: column; }
