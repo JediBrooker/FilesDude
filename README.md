@@ -27,7 +27,7 @@ FilesDude is a secure, self-hosted web file manager designed for a Proxmox host,
 - Signed, expiring, HTTP-only, SameSite login sessions; scrypt password hashes; login throttling; same-origin mutation checks; and hardened response headers
 - Account preferences for changing the username and password; credential changes invalidate other sessions
 - Optional two-factor sign-in for every account with an authenticator app (6-digit codes), with one-time recovery codes
-- Duplicate finder (owner): scan a folder for files with identical contents, see which copies waste the most space, and move extra copies to the trash, always keeping one of each
+- Duplicate finder (owner): scan a folder for files with identical contents, see which copies waste the most space, and move extra copies to the trash or replace them with hard links, always keeping one of each
 - ZFS snapshots: when the root is a ZFS dataset, browse earlier versions of files ("Previous versions" or **Snapshots**), download them, and restore them beside the current version; the owner can take snapshots or schedule them hourly or daily
 - User accounts: the owner (the installer's login) can add editors (view and change files) and viewers (view and download only), each confined to one folder, from **Users** in the sidebar
 - Multi-selection toolbar actions, responsive UI, dark mode, keyboard shortcuts, and no external analytics or storage services
@@ -242,7 +242,16 @@ minimum size, and scan for files with identical contents.
   but the oldest" / "All but the newest", then move them to the trash. At least one copy
   of each set is always kept, and nothing is deleted outright (protected trash must be
   on), so a mistake can be restored from the trash.
-- Removing a copy that a torrent client is still seeding breaks that torrent.
+- **Replace with hard links** instead turns each chosen copy into a hard link to a copy
+  you keep (the oldest one not chosen), so every path keeps working, for example files a
+  torrent client is seeding, while they share one copy of the data. Each replaced copy
+  goes to the trash, so the space comes back once the trash is emptied, and until then
+  it can be restored. A copy is only linked if it is still exactly the scanned file and
+  has the same owner, group, and permissions as the kept copy (a hard link shares
+  them), and isn't executable or writable by its group or others (so linking can't widen
+  who may change it); others are left alone and listed.
+- Removing a copy that a torrent client is still seeding breaks that torrent; replacing
+  it with a hard link doesn't.
 
 ## Snapshots (ZFS)
 
@@ -369,7 +378,6 @@ The safest default set is already included. These are strong next additions when
 
 - OIDC single sign-on, and passkeys for installations served over HTTPS
 - Video thumbnails, media metadata, and an index for searching file contents on very large trees
-- Replacing duplicate files with hard links (keeping every path, freeing the space)
 - Antivirus scanning and upload quarantine for environments with untrusted uploaders
 - SFTP/SMB/NFS connection profiles for managing remote roots without mounting them into the app container
 

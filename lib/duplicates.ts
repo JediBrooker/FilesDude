@@ -3,7 +3,7 @@ import { constants } from "node:fs";
 import fs, { type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { config } from "./config";
-import { ensureRoot, INTERNAL_NAMES, isUnchangedFile, normalizeRelative, safeResolve, trashIfUnchanged, verifyFileHandleWithinRoot, type FileIdentity } from "./files";
+import { ensureRoot, INTERNAL_NAMES, isUnchangedFile, normalizeRelative, replaceWithLink, safeResolve, trashIfUnchanged, verifyFileHandleWithinRoot, type FileIdentity, type LinkOutcome } from "./files";
 import { AppError } from "./http";
 
 // Finds files with identical contents under a folder. Files are grouped by size, groups narrowed by
@@ -320,6 +320,75 @@ export async function trashDuplicates(paths: string[]) {
     forgetDuplicatePaths([...trashed.map((item) => item.path), ...changed]);
   }
   return { trashed, changed };
+}
+
+export type LinkSkip = { path: string; reason: Exclude<LinkOutcome, { linked: true }>["reason"]; trashId?: string };
+
+/** Whether a scan is running (removals and links wait for it, as it replaces the report). */
+export function isDuplicateScanRunning() {
+  return Boolean(scan || starting);
+}
+
+/**
+ * Replaces chosen copies with hard links to a kept copy of the same set: the oldest copy not
+ * chosen that is still unchanged on disk. Each replaced copy goes to the protected trash. Call
+ * with the filesystem lock held. Copies that changed, or whose owner or permissions differ from
+ * the kept copy's, are skipped and reported. The report then shows the linked copies as one file.
+ */
+export async function linkDuplicates(paths: string[]) {
+  const linking = new Set(checkDuplicateRemoval(paths));
+  const plans: Array<{ group: DuplicateGroup; target: DuplicateCopy; copies: DuplicateCopy[] }> = [];
+  for (const group of lastReport!.groups) {
+    const chosen = group.copies.filter((copy) => linking.has(copy.path));
+    if (!chosen.length) continue;
+    let target: DuplicateCopy | null = null;
+    for (const copy of group.copies) {
+      const identity = reportFiles.get(copy.path);
+      if (!linking.has(copy.path) && identity && await isUnchangedFile(copy.path, identity)) {
+        target = copy;
+        break;
+      }
+    }
+    if (!target) throw new AppError(`No unchanged copy of ${path.posix.basename(group.copies[0].path)} is left to link to; scan again`, 409, "KEEP_ONE_COPY");
+    plans.push({ group, target, copies: chosen });
+  }
+  const linked: Array<{ path: string; target: string; trashId: string }> = [];
+  const skipped: LinkSkip[] = [];
+  try {
+    for (const plan of plans) {
+      const targetIdentity = reportFiles.get(plan.target.path);
+      for (const copy of plan.copies) {
+        // A copy already linked to the kept file shares its data, so there is nothing to do.
+        if (copy.inode === plan.target.inode) continue;
+        const identity = reportFiles.get(copy.path);
+        if (!targetIdentity || !identity) {
+          skipped.push({ path: copy.path, reason: "changed" });
+          continue;
+        }
+        // Each copy on its own: one that fails doesn't stop the rest, or lose what was done.
+        const outcome = await replaceWithLink(copy.path, identity, plan.target.path, targetIdentity).catch((error: unknown): LinkOutcome => {
+          console.error("Could not replace a duplicate with a hard link", error);
+          return { linked: false, reason: "failed" };
+        });
+        if (outcome.linked) {
+          linked.push({ path: copy.path, target: plan.target.path, trashId: outcome.trashId });
+          Object.assign(copy, { inode: plan.target.inode, modified: plan.target.modified, links: plan.target.links + 1 });
+          reportFiles.set(copy.path, targetIdentity);
+        } else {
+          skipped.push({ path: copy.path, reason: outcome.reason, ...(outcome.trashId ? { trashId: outcome.trashId } : {}) });
+          // A copy whose name was taken is in the trash; it is no longer a copy here.
+          if (outcome.reason === "taken") forgetDuplicatePaths([copy.path]);
+        }
+      }
+    }
+  } finally {
+    // Linked copies share the kept file's data now; sets left without an extra copy drop out.
+    const groups = lastReport!.groups
+      .map((group) => ({ ...group, wastedBytes: group.size * Math.max(0, new Set(group.copies.map((copy) => copy.inode)).size - 1) }))
+      .filter((group) => group.wastedBytes > 0);
+    lastReport = { ...lastReport!, groups, wastedBytes: groups.reduce((total, group) => total + group.wastedBytes, 0) };
+  }
+  return { linked, skipped };
 }
 
 /**

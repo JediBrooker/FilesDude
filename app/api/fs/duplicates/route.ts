@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { withAccess } from "@/lib/access";
 import { audit } from "@/lib/audit";
 import { config } from "@/lib/config";
-import { cancelDuplicateScan, duplicateStatus, startDuplicateScan, trashDuplicates } from "@/lib/duplicates";
+import { cancelDuplicateScan, duplicateStatus, isDuplicateScanRunning, linkDuplicates, startDuplicateScan, trashDuplicates } from "@/lib/duplicates";
 import { withFilesystemLock } from "@/lib/files";
 import { assertMutationRequest, AppError, jsonError, readJsonBody } from "@/lib/http";
 import { rewriteLinkedPaths } from "@/lib/transfers";
@@ -36,6 +36,9 @@ export async function POST(request: Request) {
       const parsed = await readJsonBody<unknown>(request, 2 * 1024 * 1024);
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new AppError("Request body is invalid", 400, "INVALID_REQUEST");
       const body = parsed as DuplicatesBody;
+      if ((body.action === "link" || body.action === "trash") && isDuplicateScanRunning()) {
+        throw new AppError("Wait for the scan to finish (or cancel it) before changing files", 409, "JOB_RUNNING");
+      }
       switch (body.action) {
         case "scan": {
           const folder = typeof body.path === "string" && body.path.length <= 4096 ? body.path : "";
@@ -47,6 +50,17 @@ export async function POST(request: Request) {
         case "cancel":
           cancelDuplicateScan();
           return NextResponse.json({ ok: true }, noStore);
+        case "link": {
+          if (!config.trashEnabled) throw new AppError("Protected trash is turned off, so duplicates can't be replaced safely here", 409, "TRASH_DISABLED");
+          const requested = Array.isArray(body.paths) ? body.paths : [];
+          if (!requested.length || requested.length > 1000 || requested.some((item) => typeof item !== "string" || item.length > 4096)) {
+            throw new AppError("Choose between 1 and 1,000 copies", 400, "INVALID_PATHS");
+          }
+          // The paths keep working as links, so favourites and share links stay put.
+          const result = await withFilesystemLock(() => linkDuplicates(requested as string[]));
+          await audit("duplicates.link", { username: session.username, linked: result.linked.map((item) => ({ path: item.path, to: item.target, trashId: item.trashId })), skipped: result.skipped });
+          return NextResponse.json({ ok: true, result, ...duplicateStatus() }, noStore);
+        }
         case "trash": {
           if (!config.trashEnabled) throw new AppError("Protected trash is turned off, so duplicates can't be removed safely here", 409, "TRASH_DISABLED");
           const requested = Array.isArray(body.paths) ? body.paths : [];
