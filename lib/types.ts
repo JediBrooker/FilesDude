@@ -182,7 +182,7 @@ export interface ArchiveResult {
 
 export interface JobState {
   id: string;
-  kind: "compress" | "extract" | "copy" | "move";
+  kind: "compress" | "extract" | "copy" | "move" | "restore";
   label: string;
   status: "running" | "done" | "failed" | "cancelled";
   startedAt: string;

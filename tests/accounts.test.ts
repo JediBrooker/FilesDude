@@ -25,6 +25,9 @@ import { GET as trashList, POST as trashAction } from "../app/api/fs/trash/route
 import { POST as upload } from "../app/api/fs/upload/route";
 import { GET as favoritesList, POST as favoritesAction } from "../app/api/favorites/route";
 import { GET as jobsStatus, POST as jobsAction } from "../app/api/fs/jobs/route";
+import { GET as snapshotsInfo, POST as snapshotsAction } from "../app/api/fs/snapshots/route";
+import { GET as snapshotDownload } from "../app/api/fs/snapshots/download/route";
+import { setZfsRunner } from "../lib/snapshots";
 import { GET as sharesList } from "../app/api/shares/route";
 import { GET as usersList, POST as usersAction } from "../app/api/users/route";
 
@@ -485,6 +488,51 @@ test("two-factor sign-in can be turned off, reset by the owner, and survives cre
     assert.equal(disabled.status, 200);
     assert.equal((await readCredentials()).twoFactor, undefined);
     clearLoginFailures("direct-client");
+  });
+});
+
+test("snapshots: everyone browses inside their folder, editors restore, only the owner manages them", async () => {
+  await withAccounts(async ({ root, owner, bob, viewer }) => {
+    const snapshotFolder = path.join(root, ".zfs", "snapshot", "s1");
+    await fs.mkdir(path.join(snapshotFolder, "home", "bob", "docs"), { recursive: true });
+    await fs.mkdir(path.join(snapshotFolder, "shared"), { recursive: true });
+    await fs.writeFile(path.join(snapshotFolder, "home", "bob", "docs", "plan.txt"), "last week's plan");
+    await fs.writeFile(path.join(snapshotFolder, "shared", "notice.txt"), "old notice");
+    const snapshots = [{ name: "s1", creation: 1_700_000_000 }];
+    setZfsRunner(async (args) => {
+      if (args[0] === "list" && args.includes("filesystem")) return `pool/ct100\t${root}\n`;
+      if (args[0] === "list") return snapshots.map((item) => `pool/ct100@${item.name}\t${item.creation}\t4096`).join("\n");
+      if (args[0] === "snapshot") snapshots.push({ name: args[1].split("@")[1], creation: 1_800_000_000 });
+      return "";
+    });
+    try {
+      const forViewer = await (await call(snapshotsInfo, "/api/fs/snapshots", viewer)).json();
+      assert.deepEqual([forViewer.available, forViewer.snapshots[0].used, forViewer.schedule], [true, undefined, undefined]);
+      const forOwner = await (await call(snapshotsInfo, "/api/fs/snapshots", owner)).json();
+      assert.deepEqual([forOwner.snapshots[0].used, forOwner.schedule.frequency, forOwner.dataset], [4096, "off", "pool/ct100"]);
+
+      assert.equal(await status(call(snapshotsAction, "/api/fs/snapshots", bob, { action: "create" })), 403);
+      assert.equal(await status(call(snapshotsAction, "/api/fs/snapshots", bob, { action: "schedule", schedule: { frequency: "daily", keep: 7 } })), 403);
+      assert.equal(await status(call(snapshotsAction, "/api/fs/snapshots", owner, { action: "schedule", schedule: { frequency: "weekly", keep: 7 } })), 400);
+      assert.equal(await status(call(snapshotsAction, "/api/fs/snapshots", owner, { action: "create" })), 200);
+
+      // Viewers download but can't restore; editors restore only inside their folder.
+      assert.equal(await status(call(snapshotDownload, "/api/fs/snapshots/download?snapshot=s1&path=shared/notice.txt", viewer)), 200);
+      assert.equal(await status(call(snapshotDownload, "/api/fs/snapshots/download?snapshot=s1&path=home/bob/docs/plan.txt", viewer)), 403);
+      assert.equal(await status(call(snapshotsAction, "/api/fs/snapshots", viewer, { action: "restore", snapshot: "s1", path: "shared/notice.txt" })), 403);
+      assert.equal(await status(call(snapshotsAction, "/api/fs/snapshots", bob, { action: "restore", snapshot: "s1", path: "shared/notice.txt" })), 403);
+      const restored = await (await call(snapshotsAction, "/api/fs/snapshots", bob, { action: "restore", snapshot: "s1", path: "home/bob/docs/plan.txt" })).json();
+      assert.equal(restored.job.status, "done");
+      assert.match(restored.job.transferred[0].path, /^home\/bob\/docs\/plan \(restored \d{4}-\d{2}-\d{2} \d{2}\.\d{2}\)\.txt$/);
+      assert.equal(await fs.readFile(path.join(root, "home", "bob", "docs", "plan.txt"), "utf8"), "bob's plan");
+      assert.equal(await fs.readFile(path.join(root, restored.job.transferred[0].path), "utf8"), "last week's plan");
+
+      const versions = await (await call(snapshotsInfo, "/api/fs/snapshots?view=versions&path=home/bob/docs/plan.txt", bob)).json();
+      assert.deepEqual(versions.versions.map((version: { snapshot: string }) => version.snapshot), ["s1"]);
+      assert.equal(await status(call(snapshotsInfo, "/api/fs/snapshots?view=browse&snapshot=s1&path=shared", bob)), 403);
+    } finally {
+      setZfsRunner(undefined as never);
+    }
   });
 });
 

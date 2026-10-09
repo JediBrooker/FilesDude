@@ -243,6 +243,24 @@ async function openTrashFolder(location: string): Promise<AnchoredDirectory> {
   }
 }
 
+// A folder inside a ZFS snapshot. Snapshots are read-only, so a folder checked once can't change;
+// children are opened without following links.
+async function openSnapshotFolder(location: string): Promise<AnchoredDirectory> {
+  const handle = await fs.open(location, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW | constants.O_NONBLOCK).catch(openFailure);
+  try {
+    const real = await openedHandlePath(handle, location);
+    if (real !== location) throw new AppError("That snapshot folder isn't where it should be", 409, "PATH_CHANGED");
+    return { handle, base: ON_LINUX ? `/proc/self/fd/${handle.fd}` : location, real, stat: await handle.stat() };
+  } catch (error) {
+    await handle.close().catch(() => undefined);
+    throw error;
+  }
+}
+
+function openSnapshotChild(directory: AnchoredDirectory, name: string) {
+  return openSnapshotFolder(path.join(directory.real, name));
+}
+
 export async function withOpen<T>(opening: Promise<AnchoredDirectory>, run: (directory: AnchoredDirectory) => Promise<T>) {
   const directory = await opening;
   try {
@@ -310,6 +328,8 @@ type CopyContext = {
   topBirth?: string;
   created?: () => Promise<void>;
   moved?: (item: TransferResult, copies?: CopiedItems) => Promise<void>;
+  /** The source can't change (a ZFS snapshot), so its folders are opened without the root check. */
+  sourceIsSnapshot?: boolean;
 };
 
 const itemIdentityOf = (stat: BigIntStats): ItemIdentity => ({ dev: String(stat.dev), ino: String(stat.ino) });
@@ -379,7 +399,7 @@ async function copyEntry(from: AnchoredDirectory, name: string, to: AnchoredDire
       }
       context.made.add(identityOf(created.stat));
       await markCreated(context, depth, await created.handle.stat({ bigint: true }));
-      const original = await withOpen(openChild(from, name), async (folder) => {
+      const original = await withOpen(context.sourceIsSnapshot ? openSnapshotChild(from, name) : openChild(from, name), async (folder) => {
         if (context.sources) {
           const folderStat = await folder.handle.stat({ bigint: true });
           context.sources.add(fingerprintOf(folderStat));
@@ -1251,6 +1271,68 @@ export async function copyOrMove(requested: string[], destinationPath: string, m
   }
 }
 
+type LockControl = { unlock: () => void; relock: () => Promise<void> };
+
+/**
+ * Copies `name` from `from` into `destination`, called with the filesystem lock held. The copy is
+ * written under a visible "name (copying)" placeholder, chosen and created under the lock, and the
+ * lock is let go as soon as the placeholder exists (unless `holdLock`). Once complete, the lock is
+ * taken again and the copy is renamed to the name `chooseName` picks, but only if it is still the
+ * item this copy created. A failed or cancelled copy is removed.
+ */
+async function copyThroughPlaceholder(
+  from: AnchoredDirectory,
+  name: string,
+  destination: AnchoredDirectory,
+  context: CopyContext,
+  lock: LockControl,
+  { holdLock, chooseName }: { holdLock: boolean; chooseName: (type: EntryType) => Promise<{ name: string; renamed: boolean }> },
+) {
+  const type = entryType(await fs.lstat(inside(from, name)));
+  const { name: temporary } = await availableName(destination, name, type, "copying", true);
+  // The placeholder is journaled as soon as it exists, so a restart part-way through the copy
+  // doesn't leave it behind (see recoverInterruptedCopies).
+  const journalId = crypto.randomUUID();
+  let journaled = false;
+  context.created = async () => {
+    // The journal only helps clean up after a restart; a copy goes ahead without it.
+    await recordCopy({ id: journalId, directory: destination.real, name: temporary, identity: context.top!, birth: context.topBirth, startedAt: new Date().toISOString() })
+      .then(() => { journaled = true; }, (error: unknown) => console.error("Could not record a copy in the journal", error));
+    if (!holdLock) lock.unlock();
+  };
+  // Before placing, a failure to forget stops the copy, so no entry can outlive its placeholder
+  // and later match the finished copy; when cleaning up, it is only logged.
+  const forget = async (strict = false) => {
+    if (!journaled) return;
+    journaled = false;
+    await forgetCopies([journalId]).catch((error: unknown) => {
+      if (strict) {
+        journaled = true;
+        throw error;
+      }
+      console.error("Could not update the copy journal", error);
+    });
+  };
+  try {
+    await copyEntry(from, name, destination, temporary, context);
+    await lock.relock();
+    throwIfCancelled(context.signal);
+    const written = await fs.lstat(inside(destination, temporary)).catch(missingAsNull);
+    if (!written || identityOf(written) !== context.top) throw new AppError("The copy changed while it was being written", 409, "PATH_CHANGED");
+    const chosen = await chooseName(type);
+    // Forgotten before placing, so a stale entry can never point at the finished copy; a crash in
+    // between leaves a visible placeholder rather than risking the copy.
+    await forget(true);
+    await placeEntry(destination, temporary, destination, chosen.name);
+    return chosen;
+  } catch (error) {
+    await lock.relock();
+    await removeCreated(destination, temporary, context.top).catch(() => undefined);
+    await forget();
+    throw error;
+  }
+}
+
 async function transferOne(sourcePath: string, destination: AnchoredDirectory, destinationRelative: string, move: boolean, context: CopyContext): Promise<TransferResult> {
   const sourceRelative = cleanRelative(sourcePath);
   if (move) assertNotHome(sourceRelative);
@@ -1285,57 +1367,14 @@ async function transferOne(sourcePath: string, destination: AnchoredDirectory, d
           if ((error as NodeJS.ErrnoException).code !== "EXDEV") throw error;
         }
       }
-      const type = entryType(await fs.lstat(inside(parent, name)));
-      // The copy is written under a visible "name (copying)" placeholder, chosen and created under
-      // the lock, then renamed once complete. A copy lets the lock go as soon as the placeholder
-      // exists. A move between filesystems (rare: the root is normally one filesystem) keeps the
-      // lock throughout, so nothing else in FilesDude changes the original meanwhile, and removes
-      // only what it copied unchanged; anything other processes add or change stays where it was.
-      const { name: temporary } = await availableName(destination, name, type, "copying", true);
+      // A move between filesystems (rare: the root is normally one filesystem) keeps the lock
+      // throughout, so nothing else in FilesDude changes the original meanwhile, and removes only
+      // what it copied unchanged; anything other processes add or change stays where it was.
       if (move) Object.assign(context, { sources: new Set(), copies: new Map() });
-      // The placeholder is journaled as soon as it exists, so a restart part-way through the copy
-      // doesn't leave it behind (see recoverInterruptedCopies).
-      const journalId = crypto.randomUUID();
-      let journaled = false;
-      context.created = async () => {
-        // The journal only helps clean up after a restart; a copy goes ahead without it.
-        await recordCopy({ id: journalId, directory: destination.real, name: temporary, identity: context.top!, birth: context.topBirth, startedAt: new Date().toISOString() })
-          .then(() => { journaled = true; }, (error: unknown) => console.error("Could not record a copy in the journal", error));
-        if (!move) unlock();
-      };
-      // Before placing, a failure to forget stops the copy, so no entry can outlive its placeholder
-      // and later match the finished copy; when cleaning up, it is only logged.
-      const forget = async (strict = false) => {
-        if (!journaled) return;
-        journaled = false;
-        await forgetCopies([journalId]).catch((error: unknown) => {
-          if (strict) {
-            journaled = true;
-            throw error;
-          }
-          console.error("Could not update the copy journal", error);
-        });
-      };
-      let targetName = name;
-      let renamed = false;
-      try {
-        await copyEntry(parent, name, destination, temporary, context);
-        await relock();
-        throwIfCancelled(context.signal);
-        // The copy is only put in place if it is still the item this copy created.
-        const written = await fs.lstat(inside(destination, temporary)).catch(missingAsNull);
-        if (!written || identityOf(written) !== context.top) throw new AppError("The copy changed while it was being written", 409, "PATH_CHANGED");
-        if (!move) ({ name: targetName, renamed } = await availableName(destination, name, type, "copy"));
-        // Forgotten before placing, so a stale entry can never point at the finished copy; a crash in
-        // between leaves a visible placeholder rather than risking the copy.
-        await forget(true);
-        await placeEntry(destination, temporary, destination, targetName);
-      } catch (error) {
-        await relock();
-        await removeCreated(destination, temporary, context.top).catch(() => undefined);
-        await forget();
-        throw error;
-      }
+      const { name: targetName, renamed } = await copyThroughPlaceholder(parent, name, destination, context, { unlock, relock }, {
+        holdLock: move,
+        chooseName: (type) => (move ? Promise.resolve({ name, renamed: false }) : availableName(destination, name, type, "copy")),
+      });
       if (!move) return result(targetName, renamed);
       // The item is in place, so the move stands even if removing the original stops part-way;
       // whatever is left (changed or added while it was copied) is reported, not lost.
@@ -1348,6 +1387,46 @@ async function transferOne(sourcePath: string, destination: AnchoredDirectory, d
   } finally {
     unlock();
   }
+}
+
+/**
+ * Copies an item out of a ZFS snapshot back into the live tree, into `destinationRelative` (which
+ * is recreated if missing, and confined like any other path). The item keeps its name if that is
+ * free, otherwise it becomes "name (label).ext"; nothing is ever replaced. `snapshotFolder` is the
+ * real path of the folder holding the item inside the snapshot (see snapshotItem).
+ */
+export async function restoreFromSnapshot(snapshotFolder: string, name: string, destinationRelative: string, label: string, { report, signal }: TransferOptions = {}): Promise<TransferResult> {
+  const destinationPath = cleanRelative(destinationRelative);
+  return withOpen(openSnapshotFolder(snapshotFolder), async (from) => {
+    const measured = await measureTree(inside(from, name), signal);
+    const progress: JobProgress = { done: 0, total: measured.complete ? measured.bytes : undefined, unit: "bytes" };
+    report?.({ ...progress });
+    const context: CopyContext = {
+      made: new Set(),
+      signal,
+      sourceIsSnapshot: true,
+      copied: (bytes) => {
+        progress.done += bytes;
+        report?.({ ...progress });
+      },
+    };
+    let release: (() => void) | null = await acquireFilesystemLock();
+    const unlock = () => {
+      release?.();
+      release = null;
+    };
+    try {
+      return await withOpen(openDirectoryPath(destinationPath), async (destination) => {
+        const chosen = await copyThroughPlaceholder(from, name, destination, context, {
+          unlock,
+          relock: async () => { if (!release) release = await acquireFilesystemLock(); },
+        }, { holdLock: false, chooseName: (type) => availableName(destination, name, type, label) });
+        return { source: name, path: childOf(destinationPath, chosen.name), renamed: chosen.renamed };
+      });
+    } finally {
+      unlock();
+    }
+  });
 }
 
 /**

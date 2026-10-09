@@ -6,6 +6,7 @@ import {
   ArrowLeft,
   ArrowRight,
   ArrowUpNarrowWide,
+  Camera,
   Check,
   ChevronDown,
   ChevronRight,
@@ -48,6 +49,7 @@ import {
   Pencil,
   Plus,
   RefreshCw,
+  History,
   RotateCcw,
   Scissors,
   Search,
@@ -107,11 +109,19 @@ type DialogState =
   | { kind: "edit"; entry: FileEntry }
   | { kind: "preferences" }
   | { kind: "twoFactor" }
+  | { kind: "snapshots" }
+  | { kind: "versions"; entry: FileEntry }
   | { kind: "details"; entry: FileEntry }
   | null;
 
 type ViewMode = "list" | "grid";
-type EntryAction = "open" | "edit" | "download" | "favorite" | "rename" | "cut" | "clipboard" | "paste" | "copy" | "move" | "compress" | "extract" | "share" | "permissions" | "ownership" | "details" | "delete";
+type SnapshotInfo = { name: string; createdAt: string; used?: number; kind: "auto" | "manual" | "other" };
+type SnapshotSchedule = { frequency: "off" | "hourly" | "daily"; keep: number };
+type SnapshotEntry = { name: string; path: string; type: "file" | "directory" | "symlink" | "other"; size: number; modified: string; mime: string };
+type SnapshotVersion = { snapshot: string; snapshotCreatedAt: string; type: SnapshotEntry["type"]; size: number; modified: string };
+const SNAPSHOT_KIND_LABELS: Record<SnapshotInfo["kind"], string> = { auto: "Scheduled", manual: "Manual", other: "Other" };
+
+type EntryAction = "versions" | "open" | "edit" | "download" | "favorite" | "rename" | "cut" | "clipboard" | "paste" | "copy" | "move" | "compress" | "extract" | "share" | "permissions" | "ownership" | "details" | "delete";
 type FavoriteLocation = { path: string; name: string; createdAt: string };
 type SelectOptions = { additive?: boolean; range?: boolean };
 type MenuPosition = { top: number; left: number };
@@ -278,8 +288,12 @@ function jobProgressText(job: JobState) {
 
 // Downloads go through a temporary link, which saves the file and leaves the page as it is.
 function startDownload(pathValue: string) {
+  downloadFrom(`/api/fs/download?path=${encodePath(pathValue)}`);
+}
+
+function downloadFrom(url: string) {
   const link = document.createElement("a");
-  link.href = `/api/fs/download?path=${encodePath(pathValue)}`;
+  link.href = url;
   link.download = "";
   document.body.append(link);
   link.click();
@@ -413,6 +427,8 @@ export function FileManager() {
   const [dropTarget, setDropTarget] = useState<string | null>(null);
   // Background jobs started from this browser (or found running after a reload), oldest first.
   const [jobs, setJobs] = useState<JobState[]>([]);
+  // Whether the root is on ZFS, so earlier versions can be browsed in snapshots.
+  const [snapshotsAvailable, setSnapshotsAvailable] = useState(false);
   const finishedJobsRef = useRef<Set<string>>(new Set());
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [theme, setTheme] = useState<"light" | "dark">("light");
@@ -684,7 +700,16 @@ export function FileManager() {
   const finishJob = async (job: JobState) => {
     if (finishedJobsRef.current.has(job.id)) return;
     finishedJobsRef.current.add(job.id);
-    if (job.kind === "copy" || job.kind === "move") {
+    if (job.kind === "restore") {
+      const restored = job.transferred?.[0];
+      if (job.status === "done" && restored) {
+        notify(`Restored as /${restored.path}`, undefined, undoFor({ action: "copy" }, job.transferred) ?? undefined);
+      } else if (job.status === "failed") {
+        notify(job.error || "The restore failed", "error");
+      } else {
+        notify("Restore cancelled");
+      }
+    } else if (job.kind === "copy" || job.kind === "move") {
       const items = job.transferred ?? [];
       const copy = job.kind === "copy";
       if (job.status === "done") {
@@ -764,6 +789,16 @@ export function FileManager() {
     }, 1000);
     return () => window.clearTimeout(timer);
   }, [jobs]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Snapshots are offered only when the root is on ZFS.
+  useEffect(() => {
+    if (!auth.authenticated) return;
+    const controller = new AbortController();
+    requestJson<{ available: boolean }>("/api/fs/snapshots", { signal: controller.signal })
+      .then((result) => setSnapshotsAvailable(result.available))
+      .catch(() => setSnapshotsAvailable(false));
+    return () => controller.abort();
+  }, [auth.authenticated]);
 
   // Pick up this account's jobs still running from before a reload.
   useEffect(() => {
@@ -1007,6 +1042,9 @@ export function FileManager() {
       case "details":
         setDialog({ kind: "details", entry });
         break;
+      case "versions":
+        setDialog({ kind: "versions", entry });
+        break;
       case "delete":
         setDialog({ kind: "delete" });
         break;
@@ -1152,6 +1190,7 @@ export function FileManager() {
           <button className="nav-item" onClick={() => { setShowHidden(true); navigate(home); setSidebarOpen(false); }}><Eye size={18} /><span>Hidden files</span></button>
           {canWrite && <button className="nav-item" onClick={() => { setDialog({ kind: "trash" }); setSidebarOpen(false); }}><Trash2 size={18} /><span>Trash</span></button>}
           {isOwner && <button className="nav-item" onClick={() => { setDialog({ kind: "shares" }); setSidebarOpen(false); }}><Link2 size={18} /><span>Shared links</span>{sharedPaths.size > 0 && <em className="nav-count">{sharedPaths.size}</em>}</button>}
+          {snapshotsAvailable && <button className="nav-item" onClick={() => { setDialog({ kind: "snapshots" }); setSidebarOpen(false); }}><History size={18} /><span>Snapshots</span></button>}
           {isOwner && <button className="nav-item" onClick={() => { setDialog({ kind: "users" }); setSidebarOpen(false); }}><Users size={18} /><span>Users</span></button>}
         </nav>
 
@@ -1315,6 +1354,8 @@ export function FileManager() {
           onRefresh={() => loadDirectory()}
           onStartJob={startArchiveJob}
           onTransfer={transferEntries}
+          onJob={trackJob}
+          canWrite={canWrite}
           role={auth.role ?? "viewer"}
           home={home}
           onSharesChanged={() => loadFavorites()}
@@ -1326,7 +1367,7 @@ export function FileManager() {
         />
       )}
       {menu && createPortal(menu.kind === "entry"
-        ? <FileActionMenu entry={menu.entry} targets={menuTargets(menu.entry)} position={{ top: menu.top, left: menu.left }} menuRef={menuRef} favoritePaths={favoritePaths} canWrite={canWrite} isOwner={isOwner} canPaste={canWrite && Boolean(clipboard) && menu.entry.type === "directory"} onAction={(action, entry) => { setMenu(null); handleEntryAction(action, entry); }} />
+        ? <FileActionMenu entry={menu.entry} targets={menuTargets(menu.entry)} position={{ top: menu.top, left: menu.left }} menuRef={menuRef} favoritePaths={favoritePaths} canWrite={canWrite} isOwner={isOwner} snapshots={snapshotsAvailable} canPaste={canWrite && Boolean(clipboard) && menu.entry.type === "directory"} onAction={(action, entry) => { setMenu(null); handleEntryAction(action, entry); }} />
         : <BackgroundMenu canWrite={canWrite} position={{ top: menu.top, left: menu.left }} menuRef={menuRef} folder={currentPath ? currentPath.split("/").at(-1) || "" : "All files"} clipboardCount={clipboard?.paths.length ?? 0} canSelectAll={sortedEntries.length > 0} onChoose={chooseBackground} />,
       document.body)}
       {jobs.length > 0 && <div className="job-panels">{jobs.map((job) => <JobPanel key={job.id} job={job} onCancel={() => void cancelJob(job)} />)}</div>}
@@ -1474,7 +1515,7 @@ function FileTable({ entries, sort, onSort, selected, cursor, interactions, allS
   );
 }
 
-function FileActionMenu({ entry, targets, position, menuRef, favoritePaths, canWrite, isOwner, canPaste, onAction }: {
+function FileActionMenu({ entry, targets, position, menuRef, favoritePaths, canWrite, isOwner, snapshots, canPaste, onAction }: {
   entry: FileEntry;
   targets: FileEntry[];
   position: MenuPosition;
@@ -1482,6 +1523,7 @@ function FileActionMenu({ entry, targets, position, menuRef, favoritePaths, canW
   favoritePaths: Set<string>;
   canWrite: boolean;
   isOwner: boolean;
+  snapshots: boolean;
   canPaste: boolean;
   onAction: (action: EntryAction, entry: FileEntry) => void;
 }) {
@@ -1516,6 +1558,7 @@ function FileActionMenu({ entry, targets, position, menuRef, favoritePaths, canW
         {isOwner && item("permissions", "Change permissions", <KeyRound size={16} />)}
         {isOwner && item("ownership", "Change ownership", <UserRoundCog size={16} />)}
         {isOwner && !multiple && (entry.type === "file" || entry.type === "directory") && item("share", "Share link…", <Link2 size={16} />)}
+        {snapshots && !multiple && (entry.type === "file" || entry.type === "directory") && item("versions", "Previous versions", <History size={16} />)}
         {!multiple && item("details", "Properties", <Info size={16} />)}
       </div>
       {canWrite && <div className="file-menu-section">
@@ -1652,7 +1695,7 @@ function FileSkeleton() {
 }
 
 function JobPanel({ job, onCancel }: { job: JobState; onCancel: () => void }) {
-  const icons: Record<JobState["kind"], ReactNode> = { compress: <FileArchive size={17} />, extract: <PackageOpen size={17} />, copy: <Copy size={17} />, move: <FolderInput size={17} /> };
+  const icons: Record<JobState["kind"], ReactNode> = { compress: <FileArchive size={17} />, extract: <PackageOpen size={17} />, copy: <Copy size={17} />, move: <FolderInput size={17} />, restore: <History size={17} /> };
   const percent = job.progress.total ? Math.min(100, (job.progress.done / job.progress.total) * 100) : undefined;
   return (
     <div className="job-panel" role="status" aria-live="polite">
@@ -1662,7 +1705,7 @@ function JobPanel({ job, onCancel }: { job: JobState; onCancel: () => void }) {
   );
 }
 
-function DialogHost({ dialog, selected, currentPath, username, role, home, onClose, onRun, notify, onRefresh, onStartJob, onTransfer, onSharesChanged, onCredentialsUpdated, onTwoFactor, onReveal, onPreview }: {
+function DialogHost({ dialog, selected, currentPath, username, role, home, onClose, onRun, notify, onRefresh, onStartJob, onTransfer, onJob, canWrite, onSharesChanged, onCredentialsUpdated, onTwoFactor, onReveal, onPreview }: {
   dialog: NonNullable<DialogState>;
   selected: FileEntry[];
   currentPath: string;
@@ -1675,6 +1718,8 @@ function DialogHost({ dialog, selected, currentPath, username, role, home, onClo
   onRefresh: () => Promise<void>;
   onStartJob: (body: Record<string, unknown>) => Promise<boolean>;
   onTransfer: (mode: "copy" | "move", paths: string[], destination: string) => Promise<boolean>;
+  onJob: (job: JobState) => Promise<boolean>;
+  canWrite: boolean;
   onSharesChanged: () => Promise<void>;
   onCredentialsUpdated: () => Promise<void>;
   onTwoFactor: () => void;
@@ -1698,6 +1743,8 @@ function DialogHost({ dialog, selected, currentPath, username, role, home, onClo
   if (dialog.kind === "preview") return <PreviewDialog entry={dialog.entry} onClose={onClose} />;
   if (dialog.kind === "edit") return <EditDialog entry={dialog.entry} onClose={onClose} onRun={onRun} />;
   if (dialog.kind === "twoFactor") return <TwoFactorDialog onClose={onClose} notify={notify} />;
+  if (dialog.kind === "snapshots") return <SnapshotsDialog isOwner={role === "owner"} canWrite={canWrite} home={home} onClose={onClose} notify={notify} onJob={onJob} />;
+  if (dialog.kind === "versions") return <VersionsDialog entry={dialog.entry} canWrite={canWrite} isOwner={role === "owner"} onClose={onClose} notify={notify} onJob={onJob} />;
   if (dialog.kind === "preferences") return role === "owner"
     ? <PreferencesDialog username={username} onClose={onClose} onUpdated={onCredentialsUpdated} onTwoFactor={onTwoFactor} />
     : <AccountPasswordDialog username={username} role={role} home={home} onClose={onClose} onUpdated={onCredentialsUpdated} onTwoFactor={onTwoFactor} />;
@@ -1974,6 +2021,173 @@ function SharesDialog({ onClose, notify, onChanged }: { onClose: () => void; not
           : links.length === 0 ? <div className="storage-scan-state"><Link2 size={25} /><strong>Nothing is shared</strong><span>Right-click a file or folder and choose Share link to create one.</span></div>
           : <div className="share-links">{links.map((link) => <ShareLinkRow key={link.id} link={link} showLocation onCopy={copy} onRevoke={revoke} />)}</div>}
         <div className="storage-scan-foot"><span>Expired and used-up links are removed automatically.</span><button className="button primary" onClick={onClose}>Done</button></div>
+      </div>
+    </Modal>
+  );
+}
+
+const snapshotDownloadUrl = (snapshot: string, itemPath: string) => `/api/fs/snapshots/download?snapshot=${encodeURIComponent(snapshot)}&path=${encodePath(itemPath)}`;
+
+async function startRestore(snapshot: string, itemPath: string, onJob: (job: JobState) => Promise<boolean>, notify: (message: string, tone?: "error") => void) {
+  try {
+    const { job } = await requestJson<{ job: JobState }>("/api/fs/snapshots", { method: "POST", body: JSON.stringify({ action: "restore", snapshot, path: itemPath }) });
+    await onJob(job);
+  } catch (caught) {
+    notify((caught as Error).message, "error");
+  }
+}
+
+function SnapshotsDialog({ isOwner, canWrite, home, onClose, notify, onJob }: { isOwner: boolean; canWrite: boolean; home: string; onClose: () => void; notify: (message: string, tone?: "error") => void; onJob: (job: JobState) => Promise<boolean> }) {
+  const [snapshots, setSnapshots] = useState<SnapshotInfo[] | null>(null);
+  const [schedule, setSchedule] = useState<SnapshotSchedule>({ frequency: "off", keep: 24 });
+  const [savedSchedule, setSavedSchedule] = useState<SnapshotSchedule | null>(null);
+  const [chosen, setChosen] = useState<string | null>(null);
+  const [browsePath, setBrowsePath] = useState(home);
+  const [entries, setEntries] = useState<SnapshotEntry[] | null>(null);
+  const [removing, setRemoving] = useState<SnapshotInfo | null>(null);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    requestJson<{ available: boolean; snapshots?: SnapshotInfo[]; schedule?: SnapshotSchedule }>("/api/fs/snapshots", { signal: controller.signal })
+      .then((result) => {
+        setSnapshots(result.snapshots ?? []);
+        if (result.schedule) {
+          setSchedule(result.schedule);
+          setSavedSchedule(result.schedule);
+        }
+      })
+      .catch((caught) => { if ((caught as Error).name !== "AbortError") setError((caught as Error).message); });
+    return () => controller.abort();
+  }, []);
+
+  useEffect(() => {
+    if (!chosen) return;
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => {
+      setEntries(null);
+      requestJson<{ entries: SnapshotEntry[] }>(`/api/fs/snapshots?view=browse&snapshot=${encodeURIComponent(chosen)}&path=${encodePath(browsePath)}`, { signal: controller.signal })
+        .then((result) => setEntries(result.entries))
+        .catch((caught) => {
+          if ((caught as Error).name === "AbortError") return;
+          setEntries([]);
+          setError((caught as Error).message);
+        });
+    }, 0);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [chosen, browsePath]);
+
+  const send = async (body: Record<string, unknown>, success: string) => {
+    setBusy(true);
+    setError("");
+    try {
+      const result = await requestJson<{ snapshots: SnapshotInfo[]; schedule?: SnapshotSchedule }>("/api/fs/snapshots", { method: "POST", body: JSON.stringify(body) });
+      setSnapshots(result.snapshots);
+      if (result.schedule) setSavedSchedule(result.schedule);
+      setRemoving(null);
+      notify(success);
+    } catch (caught) {
+      setError((caught as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const open = (name: string) => {
+    setChosen(name);
+    setBrowsePath(home);
+    setError("");
+  };
+  const crumbs = browsePath === home ? [] : browsePath.slice(home ? home.length + 1 : 0).split("/");
+  const scheduleChanged = savedSchedule !== null && (schedule.frequency !== savedSchedule.frequency || schedule.keep !== savedSchedule.keep);
+  const chosenSnapshot = snapshots?.find((snapshot) => snapshot.name === chosen);
+
+  return (
+    <Modal title="Snapshots" subtitle="Earlier versions of your files, kept by ZFS" icon={<History size={19} />} onClose={onClose} wide>
+      <div className="storage-browser snapshots-dialog">
+        {isOwner && <div className="snapshot-controls">
+          <div className="snapshot-schedule">
+            <FormField label="Automatic snapshots"><select value={schedule.frequency} onChange={(event) => setSchedule({ frequency: event.target.value as SnapshotSchedule["frequency"], keep: event.target.value === "daily" && schedule.keep === 24 ? 14 : event.target.value === "hourly" && schedule.keep === 14 ? 24 : schedule.keep })} disabled={savedSchedule === null}><option value="off">Off</option><option value="hourly">Every hour</option><option value="daily">Every day</option></select></FormField>
+            {schedule.frequency !== "off" && <FormField label="Keep the newest"><input type="number" min={1} max={1000} value={schedule.keep} onChange={(event) => setSchedule({ ...schedule, keep: Number(event.target.value) })} /></FormField>}
+            {scheduleChanged && <button className="button primary" disabled={busy} onClick={() => void send({ action: "schedule", schedule }, schedule.frequency === "off" ? "Automatic snapshots turned off" : "Snapshot schedule saved")}>Save</button>}
+          </div>
+          <button className="button secondary" disabled={busy || snapshots === null} onClick={() => void send({ action: "create" }, "Snapshot taken")}>{busy ? <LoaderCircle className="spin" size={15} /> : <Camera size={15} />} Take snapshot now</button>
+        </div>}
+        {removing && <div className="storage-delete-confirm trash-confirm" role="alert"><div><Trash2 size={19} /><span><strong>Delete the snapshot from {formatDateTime(removing.createdAt)}?</strong><small>The earlier versions it holds can no longer be restored. Current files aren&apos;t affected.</small></span></div><div><button className="button secondary" disabled={busy} onClick={() => setRemoving(null)}>Cancel</button><button className="button danger" disabled={busy} onClick={() => void send({ action: "delete", name: removing.name }, "Snapshot deleted")}>Delete snapshot</button></div></div>}
+        {error && <div className="form-error"><CircleAlert size={16} />{error}</div>}
+        <div className="snapshots-layout">
+          <div className="snapshot-list" role="list" aria-label="Snapshots">
+            {snapshots === null ? <div className="ownership-loading"><LoaderCircle className="spin" size={18} /> Loading…</div>
+              : snapshots.length === 0 ? <div className="snapshot-empty"><History size={22} /><strong>No snapshots yet</strong><span>{isOwner ? "Take one now, or turn on automatic snapshots above." : "The owner hasn't taken any snapshots yet."}</span></div>
+                : snapshots.map((snapshot) => (
+                  <div key={snapshot.name} role="listitem" className={`snapshot-row ${snapshot.name === chosen ? "active" : ""}`}>
+                    <button className="snapshot-open" onClick={() => open(snapshot.name)}><strong>{formatDateTime(snapshot.createdAt)}</strong><small>{SNAPSHOT_KIND_LABELS[snapshot.kind]}{snapshot.used !== undefined ? ` · ${formatBytes(snapshot.used)} unique` : ""}</small></button>
+                    {isOwner && snapshot.kind !== "other" && <button className="icon-button delete" title="Delete snapshot" aria-label={`Delete the snapshot from ${formatDateTime(snapshot.createdAt)}`} disabled={busy} onClick={() => setRemoving(snapshot)}><Trash2 size={15} /></button>}
+                  </div>
+                ))}
+          </div>
+          <div className="snapshot-browser">
+            {!chosenSnapshot ? <div className="snapshot-empty"><FolderOpen size={22} /><strong>Choose a snapshot</strong><span>Browse your files as they were, then download or restore what you need.</span></div> : <>
+              <div className="snapshot-crumbs"><button onClick={() => setBrowsePath(home)}>Home</button>{crumbs.map((part, index) => <span key={index}><ChevronRight size={13} /><button onClick={() => setBrowsePath([home, ...crumbs.slice(0, index + 1)].filter(Boolean).join("/"))}>{part}</button></span>)}</div>
+              {entries === null ? <div className="ownership-loading"><LoaderCircle className="spin" size={18} /> Loading…</div>
+                : entries.length === 0 ? <div className="snapshot-empty"><span>This folder was empty.</span></div>
+                  : <div className="snapshot-entries" role="table" aria-label="Items in the snapshot">{entries.map((entry) => (
+                    <div key={entry.path} className="snapshot-entry" role="row">
+                      <span className={`file-icon ${entry.type}`}>{fileIcon({ type: entry.type === "directory" ? "directory" : entry.type === "symlink" ? "symlink" : "file", mime: entry.mime }, 16)}</span>
+                      {entry.type === "directory" ? <button className="snapshot-entry-name" role="cell" onClick={() => setBrowsePath(entry.path)}>{entry.name}</button> : <span className="snapshot-entry-name" role="cell" title={entry.name}>{entry.name}</span>}
+                      <span className="muted" role="cell">{entry.type === "directory" ? "—" : formatBytes(entry.size)}</span>
+                      <span className="muted" role="cell">{formatDate(entry.modified)}</span>
+                      <span className="largest-actions" role="cell">
+                        {(entry.type === "file" || entry.type === "directory") && <button className="icon-button" title={entry.type === "directory" ? "Download as ZIP" : "Download"} aria-label={`Download ${entry.name}`} onClick={() => downloadFrom(snapshotDownloadUrl(chosenSnapshot.name, entry.path))}><ArrowDownToLine size={15} /></button>}
+                        {canWrite && entry.type !== "other" && <button className="icon-button" title="Restore next to the current version" aria-label={`Restore ${entry.name}`} onClick={() => void startRestore(chosenSnapshot.name, entry.path, onJob, notify)}><RotateCcw size={15} /></button>}
+                      </span>
+                    </div>
+                  ))}</div>}
+            </>}
+          </div>
+        </div>
+        <div className="storage-scan-foot"><span className="muted">{canWrite ? "Restoring never replaces anything: an item whose name is taken comes back as “name (restored …)”." : "You can download earlier versions; an editor or the owner can restore them."}</span><button className="button primary" onClick={onClose}>Done</button></div>
+      </div>
+    </Modal>
+  );
+}
+
+function VersionsDialog({ entry, canWrite, isOwner, onClose, notify, onJob }: { entry: FileEntry; canWrite: boolean; isOwner: boolean; onClose: () => void; notify: (message: string, tone?: "error") => void; onJob: (job: JobState) => Promise<boolean> }) {
+  const [versions, setVersions] = useState<SnapshotVersion[] | null>(null);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    const controller = new AbortController();
+    requestJson<{ versions: SnapshotVersion[] }>(`/api/fs/snapshots?view=versions&path=${encodePath(entry.path)}`, { signal: controller.signal })
+      .then((result) => setVersions(result.versions))
+      .catch((caught) => { if ((caught as Error).name !== "AbortError") setError((caught as Error).message); });
+    return () => controller.abort();
+  }, [entry.path]);
+  return (
+    <Modal title="Previous versions" subtitle={entry.name} icon={<History size={19} />} onClose={onClose} wide>
+      <div className="storage-browser">
+        {error ? <div className="form-error"><CircleAlert size={16} />{error}</div>
+          : versions === null ? <div className="ownership-loading"><LoaderCircle className="spin" size={18} /> Looking through snapshots…</div>
+            : versions.length === 0 ? <div className="snapshot-empty"><History size={22} /><strong>No earlier versions</strong><span>{entry.type === "directory" ? "This folder isn't in any snapshot yet." : "No snapshot holds a different version of this file."} {isOwner ? "Take a snapshot or turn on automatic snapshots under Snapshots." : ""}</span></div>
+              : <div className="snapshot-entries" role="table" aria-label="Earlier versions">
+                <div className="snapshot-entry snapshot-entry-header" role="row"><span /><span role="columnheader">Snapshot</span><span role="columnheader">Size</span><span role="columnheader">Modified</span><span /></div>
+                {versions.map((version) => (
+                  <div key={version.snapshot} className="snapshot-entry" role="row">
+                    <span className={`file-icon ${version.type}`}><History size={16} /></span>
+                    <span className="snapshot-entry-name" role="cell">{formatDateTime(version.snapshotCreatedAt)}</span>
+                    <span className="muted" role="cell">{version.type === "directory" ? "—" : formatBytes(version.size)}</span>
+                    <span className="muted" role="cell" title={new Date(version.modified).toLocaleString()}>{formatDate(version.modified)}</span>
+                    <span className="largest-actions" role="cell">
+                      {(version.type === "file" || version.type === "directory") && <button className="icon-button" title="Download this version" aria-label={`Download the version from ${formatDateTime(version.snapshotCreatedAt)}`} onClick={() => downloadFrom(snapshotDownloadUrl(version.snapshot, entry.path))}><ArrowDownToLine size={15} /></button>}
+                      {canWrite && <button className="icon-button" title="Restore next to the current version" aria-label={`Restore the version from ${formatDateTime(version.snapshotCreatedAt)}`} onClick={() => void startRestore(version.snapshot, entry.path, onJob, notify)}><RotateCcw size={15} /></button>}
+                    </span>
+                  </div>
+                ))}
+              </div>}
+        <div className="storage-scan-foot"><span className="muted">{canWrite ? "A restored version is saved beside the current one as “name (restored …)”." : "You can download earlier versions."}</span><button className="button primary" onClick={onClose}>Done</button></div>
       </div>
     </Modal>
   );

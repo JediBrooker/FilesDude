@@ -27,6 +27,7 @@ FilesDude is a secure, self-hosted web file manager designed for a Proxmox host,
 - Signed, expiring, HTTP-only, SameSite login sessions; scrypt password hashes; login throttling; same-origin mutation checks; and hardened response headers
 - Account preferences for changing the username and password; credential changes invalidate other sessions
 - Optional two-factor sign-in for every account with an authenticator app (6-digit codes), with one-time recovery codes
+- ZFS snapshots: when the root is a ZFS dataset, browse earlier versions of files ("Previous versions" or **Snapshots**), download them, and restore them beside the current version; the owner can take snapshots or schedule them hourly or daily
 - User accounts: the owner (the installer's login) can add editors (view and change files) and viewers (view and download only), each confined to one folder, from **Users** in the sidebar
 - Multi-selection toolbar actions, responsive UI, dark mode, keyboard shortcuts, and no external analytics or storage services
 
@@ -225,6 +226,29 @@ copy and revoke buttons.
   anyone on the network path; use HTTPS for anything sensitive.
 - Set `FILEDUDE_SHARING_ENABLED=false` to turn sharing off entirely.
 
+## Snapshots (ZFS)
+
+When `FILEDUDE_ROOT` is on a ZFS dataset (such as a Proxmox container's
+`subvol-<id>-disk-<n>`), **Snapshots** appears in the sidebar and **Previous versions** in
+each item's menu. FilesDude finds the dataset itself; set `FILEDUDE_ZFS_PATH` if the `zfs`
+command isn't in `/usr/sbin`, `/sbin`, or `/usr/local/sbin`.
+
+- **Everyone** can browse snapshots and download earlier versions, within their own folder.
+  Editors and the owner can also restore an item: it is copied back beside the current
+  one as `name (restored <date>)` (or under its own name if that is free), so nothing is
+  ever replaced.
+- **The owner** can take a snapshot at any time, or turn on automatic snapshots every
+  hour or every day, keeping the newest so many. Automatic snapshots are off by default.
+- FilesDude names its snapshots `filesdude-auto-...` and `filesdude-manual-...`, and only
+  ever deletes those: automatic ones beyond the number to keep, or ones the owner
+  deletes. Other snapshots, such as Proxmox's, are listed and browsable but never
+  touched.
+- Snapshots take no space at first, then hold on to data that later changes or is
+  deleted; each one's "unique" size shows what deleting it would free.
+- These are plain ZFS snapshots that Proxmox doesn't know about. Delete FilesDude's
+  snapshots before moving or migrating the container's disk if Proxmox complains about
+  them.
+
 ## Version
 
 The running version (from `package.json`) and the commit it was built from appear
@@ -314,7 +338,6 @@ The safest default set is already included. These are strong next additions when
 - OIDC single sign-on, and passkeys for installations served over HTTPS
 - Duplicate detection, video thumbnails, media metadata, and an index for searching file contents on very large trees
 - Antivirus scanning and upload quarantine for environments with untrusted uploaders
-- ZFS snapshot shortcuts and a version-history browser for Proxmox storage
 - SFTP/SMB/NFS connection profiles for managing remote roots without mounting them into the app container
 
 ## Development checks
