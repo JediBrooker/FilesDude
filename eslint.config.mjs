@@ -12,6 +12,8 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Stray copies ("name 2.ext") that .gitignore also excludes.
+    "**/* 2.*",
   ]),
 ]);
 
