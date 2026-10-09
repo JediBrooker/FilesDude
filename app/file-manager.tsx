@@ -3656,10 +3656,47 @@ function MediaPanel({ entry }: { entry: FileEntry }) {
   );
 }
 
+type FolderSize = { bytes: number; allocated: number; files: number; folders: number; complete: boolean; reason?: "limit" | "time" | "unreadable" };
+
+const FOLDER_SIZE_SHORTFALL: Record<NonNullable<FolderSize["reason"]>, string> = {
+  limit: "Counting stopped at 2 million items, so the real totals are larger.",
+  time: "Counting stopped after a minute, so the real totals are larger.",
+  unreadable: "Some folders couldn't be read and aren't included.",
+};
+
+// A folder's contents and size, counted when Properties opens; closing it stops the count.
+function FolderSizePanel({ entry }: { entry: FileEntry }) {
+  const [state, setState] = useState<{ size?: FolderSize; error?: string } | null>(null);
+  useEffect(() => {
+    const controller = new AbortController();
+    requestJson<FolderSize>(`/api/fs/folder-size?path=${encodePath(entry.path)}`, { signal: controller.signal })
+      .then((size) => setState({ size }))
+      .catch((error: Error) => { if (error.name !== "AbortError") setState({ error: error.message }); });
+    return () => controller.abort();
+  }, [entry.path]);
+  const size = state?.size;
+  return (
+    <section className="media-panel" aria-label="Folder contents">
+      <div className="checksum-heading"><strong>Contents</strong></div>
+      {!state && <p className="checksum-note"><LoaderCircle className="spin" size={14} /> Counting files and folders…</p>}
+      {state?.error && <p className="checksum-note error"><CircleAlert size={14} /> {state.error}</p>}
+      {size && <>
+        <dl className="details-list">
+          <div><dt>Items</dt><dd>{size.files.toLocaleString()} {size.files === 1 ? "file" : "files"} in {size.folders.toLocaleString()} {size.folders === 1 ? "folder" : "folders"}</dd></div>
+          <div><dt>Size</dt><dd>{formatBytes(size.bytes)} ({size.bytes.toLocaleString()} bytes)</dd></div>
+          <div><dt>On disk</dt><dd>{formatBytes(size.allocated)}{size.bytes > 0 && size.allocated < size.bytes * 0.95 ? ` · ${Math.round((1 - size.allocated / size.bytes) * 100)}% saved by compression` : ""}</dd></div>
+        </dl>
+        {!size.complete && size.reason && <p className="checksum-note"><Info size={14} /> {FOLDER_SIZE_SHORTFALL[size.reason]}</p>}
+      </>}
+    </section>
+  );
+}
+
 function DetailsDialog({ entry, onClose }: { entry: FileEntry; onClose: () => void }) {
   const media = entry.type === "file" && MEDIA_INFO_MIME.has(entry.mime) && (!THUMBNAIL_MIME.has(entry.mime) || entry.size <= MAX_THUMBNAIL_SOURCE_BYTES);
-  const rows = [["Type", entry.type === "directory" ? "Folder" : entry.mime], ["Size", entry.type === "directory" ? "—" : `${formatBytes(entry.size)} (${entry.size.toLocaleString()} bytes)`], ["Location", `/${entry.path}`], ["Owner", `${entry.owner}:${entry.group} (${entry.uid}:${entry.gid})`], ["Permissions", entry.mode], ["Modified", new Date(entry.modified).toLocaleString()], ["Created", new Date(entry.created).toLocaleString()]];
-  return <Modal title="Item details" subtitle={entry.name} icon={<Info size={19} />} onClose={onClose}><div className="details-hero"><span className={`file-icon ${entry.type}`}>{fileIcon(entry, 32)}</span><div><strong>{entry.name}</strong><span>{entry.type === "directory" ? "Folder" : extension(entry.name)}</span></div></div><dl className="details-list">{rows.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{label === "Permissions" ? <code className="mode-chip">{value}</code> : value}</dd></div>)}</dl>{media && <MediaPanel entry={entry} />}{entry.type === "file" && <ChecksumPanel entry={entry} />}<div className="modal-actions"><button className="button primary" onClick={onClose}>Done</button></div></Modal>;
+  // A folder's size is counted in its Contents section below.
+  const rows = [["Type", entry.type === "directory" ? "Folder" : entry.mime], ...(entry.type === "directory" ? [] : [["Size", `${formatBytes(entry.size)} (${entry.size.toLocaleString()} bytes)`]]), ["Location", `/${entry.path}`], ["Owner", `${entry.owner}:${entry.group} (${entry.uid}:${entry.gid})`], ["Permissions", entry.mode], ["Modified", new Date(entry.modified).toLocaleString()], ["Created", new Date(entry.created).toLocaleString()]];
+  return <Modal title="Item details" subtitle={entry.name} icon={<Info size={19} />} onClose={onClose}><div className="details-hero"><span className={`file-icon ${entry.type}`}>{fileIcon(entry, 32)}</span><div><strong>{entry.name}</strong><span>{entry.type === "directory" ? "Folder" : extension(entry.name)}</span></div></div><dl className="details-list">{rows.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{label === "Permissions" ? <code className="mode-chip">{value}</code> : value}</dd></div>)}</dl>{media && <MediaPanel entry={entry} />}{entry.type === "directory" && <FolderSizePanel entry={entry} />}{entry.type === "file" && <ChecksumPanel entry={entry} />}<div className="modal-actions"><button className="button primary" onClick={onClose}>Done</button></div></Modal>;
 }
 
 function FormField({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
