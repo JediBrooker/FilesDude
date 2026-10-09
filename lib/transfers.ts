@@ -14,17 +14,21 @@ export async function rewriteLinkedPaths(changes: Array<{ from: string; to?: str
 }
 
 /**
- * Starts copying or moving items as a background job. When it finishes, moved items' favourites and
- * share links are updated (including items moved before a failure) and the outcome is audited.
+ * Starts copying or moving items as a background job. Each moved item's favourites and share links
+ * are updated as soon as it is in place, and the outcome is audited when the job ends. `awaited`
+ * marks a job a request waits for, which has its own allowance.
  */
-export function startTransferJob(username: string, action: "copy" | "move", paths: string[], destination: string) {
+export function startTransferJob(username: string, action: "copy" | "move", paths: string[], destination: string, awaited = false) {
   const move = action === "move";
   const subject = paths.length === 1 ? path.posix.basename(paths[0]) : `${paths.length} items`;
   return startJob(action, `${move ? "Moving" : "Copying"} ${subject}`, { done: 0, unit: move ? "entries" : "bytes" },
-    (report, signal) => copyOrMove(paths, destination, move, { report, signal }),
+    (report, signal) => copyOrMove(paths, destination, move, {
+      report,
+      signal,
+      moved: (item) => rewriteLinkedPaths([{ from: item.source, to: item.path }], username),
+    }),
     async (job) => {
-      const transferred = job.transferred ?? [];
-      if (move) await rewriteLinkedPaths(transferred.map((item) => ({ from: item.source, to: item.path })), username);
-      await audit(`fs.${action}`, { username, paths, destination, status: job.status, transferred: transferred.length, error: job.error });
-    });
+      await audit(`fs.${action}`, { username, paths, destination, status: job.status, transferred: job.transferred?.length ?? 0, error: job.error });
+    },
+    { awaited });
 }

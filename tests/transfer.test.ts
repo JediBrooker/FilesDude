@@ -4,7 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { config } from "../lib/config";
-import { copyOrMove, deleteEntries, listTrash, PartialTransferError, renameEntry, restoreTrashItems, withFilesystemLock } from "../lib/files";
+import { acquireFilesystemLock, copyOrMove, createEntry, deleteEntries, listDirectory, listTrash, PartialTransferError, renameEntry, restoreTrashItems, withFilesystemLock } from "../lib/files";
+import { listJobs, startJob } from "../lib/jobs";
 import type { JobProgress } from "../lib/types";
 
 const MB = 1024 * 1024;
@@ -145,6 +146,92 @@ test("copies report byte progress and don't hold the filesystem lock while copyi
     assert.equal((await fs.stat(path.join(root, "dest", "big", "a.bin"))).size, 12 * MB);
     assert.deepEqual((await fs.readdir(path.join(root, "dest"))).sort(), ["big"]);
   });
+});
+
+test("a move between filesystems removes only what it copied and puts anything new back", async () => {
+  await withTempRoot(async (root) => {
+    await fs.mkdir(path.join(root, "src"));
+    await fs.writeFile(path.join(root, "src", "a.txt"), "a");
+    await fs.mkdir(path.join(root, "dest"));
+    const original = { rename: fs.rename, link: fs.link, readdir: fs.readdir };
+    let injected = false;
+    // Pretend dest is another filesystem, and have a file arrive in the original once the copy has
+    // listed it, as a process already working inside the folder could.
+    const crossDevice = (target: unknown) => {
+      if (String(target).includes(`${path.sep}dest`) || /\/proc\/self\/fd\/\d+\/src$/.test(String(target))) {
+        return Promise.reject(Object.assign(new Error("cross-device"), { code: "EXDEV" }));
+      }
+      return null;
+    };
+    Object.assign(fs, {
+      rename: (from: string, to: string) => (String(from).endsWith(`${path.sep}src`) || String(from).endsWith("/src")) && !String(to).includes(".filedude-move-") ? crossDevice(to) ?? original.rename(from, to) : original.rename(from, to),
+      link: (from: string, to: string) => crossDevice(to) ?? original.link(from, to),
+      readdir: async (...args: Parameters<typeof fs.readdir>) => {
+        const result = await (original.readdir as (...a: unknown[]) => Promise<unknown>)(...args);
+        const staged = (await original.readdir(root)).find((name) => name.startsWith(".filedude-move-"));
+        if (staged && !injected && Array.isArray(result) && result.includes("a.txt")) {
+          injected = true;
+          await fs.writeFile(path.join(root, staged, "late.txt"), "late");
+        }
+        return result;
+      },
+    });
+    try {
+      const moved = await copyOrMove(["src"], "dest", true);
+      assert.deepEqual(moved, [{ source: "src", path: "dest/src", renamed: false }]);
+    } finally {
+      Object.assign(fs, original);
+    }
+    assert.ok(injected);
+    assert.deepEqual(await fs.readdir(path.join(root, "dest", "src")), ["a.txt"]);
+    assert.deepEqual(await fs.readdir(path.join(root, "src")), ["late.txt"]);
+    assert.deepEqual((await fs.readdir(root)).sort(), ["dest", "src"]);
+  });
+});
+
+test("a copy cancelled while waiting to be put in place is removed", async () => {
+  await withTempRoot(async (root) => {
+    await fs.mkdir(path.join(root, "dest"));
+    await fs.writeFile(path.join(root, "file.bin"), Buffer.alloc(2 * MB));
+    const controller = new AbortController();
+    let held = false;
+    await assert.rejects(copyOrMove(["file.bin"], "dest", false, {
+      signal: controller.signal,
+      report: (progress) => {
+        // Take the lock as the copy finishes, cancel while the job waits for it, then let it go.
+        if (progress.total && progress.done >= progress.total && !held) {
+          held = true;
+          void acquireFilesystemLock().then((release) => {
+            controller.abort();
+            setTimeout(release, 20);
+          });
+        }
+      },
+    }), /cancelled/);
+    assert.deepEqual(await fs.readdir(path.join(root, "dest")), []);
+  });
+});
+
+test("FilesDude's temporary names are hidden and can't be created", async () => {
+  await withTempRoot(async (root) => {
+    await fs.writeFile(path.join(root, ".filedude-copy-leftover"), "x");
+    await fs.writeFile(path.join(root, ".visible"), "x");
+    assert.deepEqual((await listDirectory("", true)).entries.map((entry) => entry.name), [".visible"]);
+    await assert.rejects(createEntry("", ".filedude-move-x", "file"), /reserved/);
+    await assert.rejects(listDirectory(".filedude-copy-leftover"), /reserved/);
+  });
+});
+
+test("each account keeps only its most recent finished jobs", async () => {
+  for (let index = 0; index < 30; index += 1) {
+    startJob("move", `job ${index}`, { done: 0, unit: "entries" }, async () => []);
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  startJob("move", "last", { done: 0, unit: "entries" }, async () => []);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const finished = listJobs().filter((job) => job.status === "done");
+  assert.ok(finished.length <= 21, `${finished.length} finished jobs kept`);
+  assert.ok(finished.every((job) => job.transferred === undefined));
 });
 
 test("a cancelled copy leaves nothing behind", async () => {

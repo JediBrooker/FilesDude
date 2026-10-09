@@ -5,8 +5,10 @@ import type { ArchiveResult, JobProgress, JobState, TransferResult } from "./typ
 
 // Long archive, copy, and move work runs in the background so it outlives a single HTTP request
 // (and any proxy timeout); the browser polls for progress. Jobs live in memory and do not survive
-// a restart. `done` settles once the job has finished, including its onFinish step.
-type Job = JobState & { controller: AbortController; accountKey: string; done: Promise<void>; failure?: unknown };
+// a restart. `done` settles once the job has finished, including its onFinish step. A failure keeps
+// only its status and code, so it can be reported as it was raised without holding on to the error.
+type JobFamily = keyof typeof FAMILY_LIMITS;
+type Job = JobState & { controller: AbortController; accountKey: string; family: JobFamily; done: Promise<void>; errorStatus?: number; errorCode?: string };
 
 // Each account sees and cancels only its own jobs; the owner sees all of them.
 function visible(job: Job) {
@@ -16,12 +18,13 @@ function visible(job: Job) {
 type JobRunner = (report: (progress: JobProgress) => void, signal: AbortSignal) => Promise<ArchiveResult | TransferResult[]>;
 
 // Each account runs one archive job at a time, so large archives don't compete for the disk, and a
-// few copies or moves, so a long copy doesn't block a quick move.
-const FAMILY_LIMITS = { archive: 1, transfer: 4 };
-const familyOf = (kind: JobState["kind"]) => (kind === "copy" || kind === "move" ? "transfer" : "archive");
+// few copies or moves, so a long copy doesn't block a quick move. Copies and moves that a request
+// waits for (such as undo) have their own allowance, so background transfers can't block them.
+const FAMILY_LIMITS = { archive: 1, transfer: 4, request: 4 };
 
 const jobs = new Map<string, Job>();
 const KEEP_FINISHED_MS = 15 * 60_000;
+const KEEP_FINISHED_PER_ACCOUNT = 20;
 
 function snapshot(job: Job): JobState {
   const { id, kind, label, status, startedAt, finishedAt, result, error } = job;
@@ -30,19 +33,25 @@ function snapshot(job: Job): JobState {
   return { id, kind, label, status, startedAt, finishedAt, progress: { ...job.progress }, result, transferred: job.transferred && [...job.transferred], error, own };
 }
 
+// Finished jobs are kept for a while so the browser can collect their outcome, but each account
+// keeps only its most recent ones (Map order is the order jobs started).
 function prune() {
   const cutoff = Date.now() - KEEP_FINISHED_MS;
-  for (const [id, job] of jobs) {
-    if (job.finishedAt && Date.parse(job.finishedAt) < cutoff) jobs.delete(id);
+  const kept = new Map<string, number>();
+  for (const [id, job] of [...jobs].reverse()) {
+    if (!job.finishedAt) continue;
+    const count = (kept.get(job.accountKey) ?? 0) + 1;
+    kept.set(job.accountKey, count);
+    if (Date.parse(job.finishedAt) < cutoff || count > KEEP_FINISHED_PER_ACCOUNT) jobs.delete(id);
   }
 }
 
 /** Starts a job, within per-account limits so one account's jobs never block another's. */
-export function startJob(kind: JobState["kind"], label: string, initial: JobProgress, run: JobRunner, onFinish?: (job: JobState) => void | Promise<void>) {
+export function startJob(kind: JobState["kind"], label: string, initial: JobProgress, run: JobRunner, onFinish?: (job: JobState) => void | Promise<void>, options: { awaited?: boolean } = {}) {
   prune();
   const accountKey = currentScope()?.accountKey ?? "owner";
-  const family = familyOf(kind);
-  const running = [...jobs.values()].filter((job) => job.status === "running" && job.accountKey === accountKey && familyOf(job.kind) === family);
+  const family: JobFamily = kind === "compress" || kind === "extract" ? "archive" : options.awaited ? "request" : "transfer";
+  const running = [...jobs.values()].filter((job) => job.status === "running" && job.accountKey === accountKey && job.family === family);
   if (running.length >= FAMILY_LIMITS[family]) {
     throw new AppError(family === "archive"
       ? "Another archive job is still running. Wait for it to finish or cancel it first."
@@ -50,7 +59,7 @@ export function startJob(kind: JobState["kind"], label: string, initial: JobProg
   }
   let settle!: () => void;
   const done = new Promise<void>((resolve) => { settle = resolve; });
-  const job: Job = { id: crypto.randomUUID(), kind, label, status: "running", startedAt: new Date().toISOString(), progress: initial, controller: new AbortController(), accountKey, done };
+  const job: Job = { id: crypto.randomUUID(), kind, label, status: "running", startedAt: new Date().toISOString(), progress: initial, controller: new AbortController(), accountKey, family, done };
   jobs.set(job.id, job);
   void run((progress) => { job.progress = progress; }, job.controller.signal)
     .then((result) => {
@@ -59,7 +68,7 @@ export function startJob(kind: JobState["kind"], label: string, initial: JobProg
       else job.result = result;
     })
     .catch((error: unknown) => {
-      job.failure = error;
+      if (error instanceof AppError) Object.assign(job, { errorStatus: error.status, errorCode: error.code });
       // A transfer that stops part-way reports what it already finished.
       const completed = (error as { completed?: unknown }).completed;
       if (Array.isArray(completed)) job.transferred = completed as TransferResult[];
@@ -87,8 +96,8 @@ export function startJob(kind: JobState["kind"], label: string, initial: JobProg
 }
 
 /**
- * Waits for a job to finish, or for `timeoutMs` if given, and returns its state. `failure` is the
- * original error of a failed job, so callers can report it with its own status and code.
+ * Waits for a job to finish, or for `timeoutMs` if given, and returns its state. `failure` is an
+ * error for a failed job with the original message, status, and code.
  */
 export async function waitForJob(id: string, timeoutMs?: number) {
   const job = jobs.get(id);
@@ -99,7 +108,8 @@ export async function waitForJob(id: string, timeoutMs?: number) {
     await Promise.race([job.done, new Promise<void>((resolve) => { timer = setTimeout(resolve, timeoutMs); })]);
     clearTimeout(timer);
   }
-  return { state: snapshot(job), failure: job.status === "failed" ? job.failure : undefined };
+  const failure = job.status === "failed" ? new AppError(job.error ?? "The job failed unexpectedly", job.errorStatus ?? 500, job.errorCode) : undefined;
+  return { state: snapshot(job), failure };
 }
 
 export function getJob(id: string) {
@@ -107,9 +117,10 @@ export function getJob(id: string) {
   return job && visible(job) ? snapshot(job) : null;
 }
 
+/** Every job the account can see, without transfer results (those come with each job by id). */
 export function listJobs() {
   prune();
-  return [...jobs.values()].filter(visible).map(snapshot);
+  return [...jobs.values()].filter(visible).map((job) => ({ ...snapshot(job), transferred: undefined }));
 }
 
 /** Stops an account's running jobs, used when the account is changed or deleted. */

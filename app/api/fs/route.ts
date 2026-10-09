@@ -86,7 +86,7 @@ export async function POST(request: Request) {
     // the job, which takes the filesystem lock only for its quick steps.
     if (body.action === "copy" || body.action === "move") {
       if (body.destination === undefined) throw new AppError("Destination is required");
-      const finished = await waitForJob(startTransferJob(session.username, body.action, paths, body.destination).id);
+      const finished = await waitForJob(startTransferJob(session.username, body.action, paths, body.destination, true).id);
       if (finished.failure) throw finished.failure;
       if (finished.state.status !== "done") throw new AppError("The transfer was cancelled", 409, "JOB_CANCELLED");
       return NextResponse.json({ ok: true, result: finished.state.transferred ?? [] }, { headers: { "Cache-Control": "no-store" } });

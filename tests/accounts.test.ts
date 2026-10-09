@@ -308,6 +308,20 @@ test("each account runs its own jobs, which stop when the account changes", asyn
   });
 });
 
+test("undo-style moves still work while background transfers fill the allowance", async () => {
+  await withAccounts(async ({ root, bob, ids }) => {
+    const scope: AccessScope = { accountKey: ids.bob, username: "bob", role: "editor", root: "home/bob" };
+    const waitForCancel = (_report: unknown, signal: AbortSignal) => new Promise<never>((_resolve, reject) => {
+      signal.addEventListener("abort", () => reject(new Error("stopped")), { once: true });
+    });
+    for (let index = 0; index < 4; index += 1) runInScope(scope, () => startJob("copy", `copy ${index}`, { done: 0, unit: "bytes" }, waitForCancel));
+    await fs.mkdir(path.join(root, "home", "bob", "elsewhere"));
+    assert.equal(await status(call(jobsAction, "/api/fs/jobs", bob, { action: "copy", paths: ["home/bob/docs"], destination: "home/bob/elsewhere" })), 409);
+    assert.equal(await status(call(fsAction, "/api/fs", bob, { action: "move", paths: ["home/bob/docs"], destination: "home/bob/elsewhere" })), 200);
+    cancelAccountJobs(ids.bob);
+  });
+});
+
 test("copy and move jobs respect accounts and keep favourites following moved items", async () => {
   await withAccounts(async ({ root, bob, alice, viewer }) => {
     const start = (cookie: string, body: Record<string, unknown>) => call(jobsAction, "/api/fs/jobs", cookie, body);
