@@ -1,32 +1,26 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import sharp from "sharp";
 import { reservedPathCheck } from "./archives";
 import { config } from "./config";
 import { acquireFilesystemLock, getMime, openVerifiedFile } from "./files";
 import { AppError } from "./http";
+import { THUMBNAIL_SIZE, imageThumbnailsAvailable, resizeImage } from "./image-resize";
 import { videoFrame, videoThumbnailsAvailable } from "./video-frames";
 
-// Image decoding is CPU- and memory-heavy and shares libuv's small thread pool with file I/O, so
-// sharp keeps no cache, uses one thread per image, and at most two images (and one video) are
-// thumbnailed at once.
-sharp.cache(false);
-sharp.concurrency(1);
+// Images are decoded outside FilesDude (see image-resize.ts), which is CPU- and memory-heavy, so at
+// most two images (and one video) are thumbnailed at once.
 
 /**
  * Formats thumbnails are made for. sharp picks a decoder from a file's contents, not its name, so
- * the leading bytes are checked too (and the detected format afterwards): an SVG, TIFF, or PDF
- * renamed to .png never reaches its decoder.
+ * the leading bytes are checked too (and the detected format afterwards, by the decoding process):
+ * an SVG, TIFF, or PDF renamed to .png never reaches its decoder.
  */
 export const THUMBNAIL_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp", "image/avif"]);
 export const DECODED_FORMATS = new Set(["jpeg", "png", "gif", "webp", "heif"]);
 /** Videos get a thumbnail from one frame, taken in a sandbox (see video-frames.ts), when available. */
 export const VIDEO_THUMBNAIL_TYPES = new Set(["video/mp4", "video/webm", "video/x-matroska", "video/quicktime", "video/x-msvideo"]);
-const DECODE_TIMEOUT_SECONDS = 10;
 export const MAX_THUMBNAIL_SOURCE_BYTES = 64 * 1024 * 1024;
-const MAX_SOURCE_PIXELS = 100_000_000;
-const THUMBNAIL_SIZE = 320;
 const CACHE_MAX_FILES = 4_000;
 // Videos for which no frame could be taken (often slowly) aren't tried again for a while.
 const FAILED_VIDEOS_MAX = 2_000;
@@ -145,7 +139,8 @@ async function storeThumbnail(name: string, data: Buffer) {
   }
 }
 
-// A video's thumbnail: one frame (a PNG from the sandbox), checked and resized like an image.
+// A video's thumbnail: one frame (a PNG from the sandbox), checked and resized like an image (and,
+// like an image, never decoded here).
 async function videoThumbnail(fd: number, key: string) {
   const noFrame = () => new AppError("No frame could be taken from this video", 422, "INVALID_VIDEO");
   if (videoFailed(key)) throw noFrame();
@@ -158,14 +153,8 @@ async function videoThumbnail(fd: number, key: string) {
       rememberFailedVideo(key);
       throw noFrame();
     }
-    let output: Buffer;
-    try {
-      output = await sharp(frame, { limitInputPixels: MAX_SOURCE_PIXELS, failOn: "error" })
-        .timeout({ seconds: DECODE_TIMEOUT_SECONDS })
-        .resize(THUMBNAIL_SIZE, THUMBNAIL_SIZE, { fit: "inside", withoutEnlargement: true })
-        .webp({ quality: 72 })
-        .toBuffer();
-    } catch {
+    const output = await resizeImage(frame, { formats: ["png"], orient: false, maxBytes: frame.length });
+    if (!output) {
       rememberFailedVideo(key);
       throw noFrame();
     }
@@ -186,7 +175,8 @@ export async function thumbnailFor(relativePath: string, knownEtag?: string | nu
   // Refuse other names before opening anything.
   const video = VIDEO_THUMBNAIL_TYPES.has(getMime(relativePath));
   if (!THUMBNAIL_TYPES.has(getMime(relativePath)) && !video) throw new AppError("This file type has no thumbnail", 415, "NO_THUMBNAIL");
-  if (video && !(await videoThumbnailsAvailable())) throw new AppError("Video thumbnails aren't available on this server", 415, "NO_THUMBNAIL");
+  if (video && !(await videoThumbnailsAvailable() && await imageThumbnailsAvailable())) throw new AppError("Video thumbnails aren't available on this server", 415, "NO_THUMBNAIL");
+  if (!video && !(await imageThumbnailsAvailable())) throw new AppError("Image thumbnails aren't available on this server", 415, "NO_THUMBNAIL");
   const isReserved = await reservedPathCheck();
   const unlock = await acquireFilesystemLock();
   let opened: Awaited<ReturnType<typeof openVerifiedFile>>;
@@ -200,8 +190,8 @@ export async function thumbnailFor(relativePath: string, knownEtag?: string | nu
     if (!stat.isFile() || isReserved(openedPath)) throw new AppError("Only images and videos have thumbnails", 415, "NO_THUMBNAIL");
     if (video ? !VIDEO_THUMBNAIL_TYPES.has(getMime(openedPath)) : !THUMBNAIL_TYPES.has(getMime(openedPath))) throw new AppError("This file type has no thumbnail", 415, "NO_THUMBNAIL");
     const identity = await handle.stat({ bigint: true });
-    // A video frame is found by seeking, so a large video is fine; an image is read whole, at the
-    // size measured here (the one that is read), not the one from opening it.
+    // A video frame is found by seeking, so a large video is fine; an image is read whole, at most at
+    // the size measured here (the one that is read), not the one from opening it.
     if (!video && identity.size > BigInt(MAX_THUMBNAIL_SOURCE_BYTES)) throw new AppError("This image is too large for a thumbnail", 413, "IMAGE_TOO_LARGE");
     const key = crypto.createHash("sha256").update(`${config.root}:${identity.dev}:${identity.ino}:${identity.size}:${identity.mtimeNs}:${identity.ctimeNs}:${THUMBNAIL_SIZE}`).digest("hex");
     const etag = `"${key.slice(0, 32)}"`;
@@ -216,21 +206,9 @@ export async function thumbnailFor(relativePath: string, knownEtag?: string | nu
 
     await imageSlots.take();
     try {
-      const source = await readExactly(handle, Number(identity.size));
-      let output: Buffer;
-      try {
-        const options = { limitInputPixels: MAX_SOURCE_PIXELS, failOn: "error", animated: false } as const;
-        const { format } = await sharp(source, options).metadata();
-        if (!format || !DECODED_FORMATS.has(format)) throw new Error(`Unexpected format ${format}`);
-        output = await sharp(source, options)
-          .timeout({ seconds: DECODE_TIMEOUT_SECONDS })
-          .rotate()
-          .resize(THUMBNAIL_SIZE, THUMBNAIL_SIZE, { fit: "inside", withoutEnlargement: true })
-          .webp({ quality: 72 })
-          .toBuffer();
-      } catch {
-        throw new AppError("This image couldn't be read", 422, "INVALID_IMAGE");
-      }
+      // The decoding process is given the open file itself, never its path.
+      const output = await resizeImage(handle.fd, { formats: [...DECODED_FORMATS], orient: true, maxBytes: Number(identity.size) });
+      if (!output) throw new AppError("This image couldn't be read", 422, "INVALID_IMAGE");
       await storeThumbnail(`${key}.webp`, output);
       return { data: output, etag };
     } finally {
