@@ -10,16 +10,15 @@ import { config } from "@/lib/config";
 import { acquireFilesystemLock, removeIfSame, type AnchoredDirectory } from "@/lib/files";
 import { assertMutationRequest, AppError, jsonError } from "@/lib/http";
 import { bytesInProgress, isUploadShare, openUploadFolder, reserveUpload, resolveShareToken, type UploadShare } from "@/lib/shares";
-import { addressGroup, publicName, reservePublicTarget } from "@/lib/upload-target";
+import { accountBytesStillComing } from "@/lib/chunked-uploads";
+import { claimLinkSlot } from "@/lib/link-slots";
+import { publicName, reservePublicTarget } from "@/lib/upload-target";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 // Public and unauthenticated: one file per request, into the link's folder, within the link's limits.
 // Uploads never replace anything and the response never says what's in the folder.
-const MAX_PUBLIC_UPLOADS = 8;
-const MAX_UPLOADS_PER_ADDRESS = 3;
-const MAX_UPLOADS_PER_LINK = 3;
 // An upload that sends nothing for this long is dropped, and every upload has a deadline (a minute
 // plus its size at a slow 64 KB/s), so none can hold a slot forever.
 const IDLE_MS = 60_000;
@@ -31,37 +30,9 @@ const KEEP_FREE_BYTES = 2 * 1024 ** 3;
 // Room for the multipart wrapping around the file in the request body.
 const MULTIPART_ALLOWANCE = 64 * 1024;
 
-type Saved = { name: string; bytes: number; created: Stats; into: AnchoredDirectory };
-
-let activeUploads = 0;
-const uploadsByAddress = new Map<string, number>();
-const uploadsByLink = new Map<string, number>();
-
-function adjust(counts: Map<string, number>, key: string, change: number) {
-  const next = (counts.get(key) ?? 0) + change;
-  if (next <= 0) counts.delete(key);
-  else counts.set(key, next);
-}
-
 const unavailable = () => new AppError("This link is invalid, has expired, or the folder is no longer available.", 404, "NOT_FOUND");
 
-function takeSlot(address: string, link: string) {
-  const group = addressGroup(address);
-  if (activeUploads >= MAX_PUBLIC_UPLOADS) throw new AppError("The server is busy with other uploads. Try again in a minute.", 503, "BUSY");
-  if ((uploadsByLink.get(link) ?? 0) >= MAX_UPLOADS_PER_LINK) throw new AppError("This link is busy with other uploads. Try again in a minute.", 503, "BUSY");
-  if ((uploadsByAddress.get(group) ?? 0) >= MAX_UPLOADS_PER_ADDRESS) throw new AppError(`Upload at most ${MAX_UPLOADS_PER_ADDRESS} files at a time`, 429, "TOO_MANY_UPLOADS");
-  activeUploads += 1;
-  adjust(uploadsByAddress, group, 1);
-  adjust(uploadsByLink, link, 1);
-  let released = false;
-  return () => {
-    if (released) return;
-    released = true;
-    activeUploads -= 1;
-    adjust(uploadsByAddress, group, -1);
-    adjust(uploadsByLink, link, -1);
-  };
-}
+type Saved = { name: string; bytes: number; created: Stats; into: AnchoredDirectory };
 
 export async function POST(request: Request, { params }: { params: Promise<{ token: string }> }) {
   let releaseSlot: (() => void) | null = null;
@@ -77,7 +48,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ tok
     if (!request.headers.get("content-length") || !Number.isInteger(declared) || declared <= 0) throw new AppError("The upload's size is missing", 411, "LENGTH_REQUIRED");
     if (declared > config.maxUploadBytes + MULTIPART_ALLOWANCE) throw new AppError(`Files can be at most ${Math.floor(config.maxUploadBytes / 1024 ** 2)} MB each`, 413, "UPLOAD_TOO_LARGE");
     if (!request.body) throw new AppError("Upload body is missing", 400);
-    releaseSlot = takeSlot(address, share.id);
+    releaseSlot = claimLinkSlot(share.id, address);
     // The whole request is counted against the link while it uploads; only the file's bytes are kept.
     settle = await reserveUpload(share.id, Math.max(declared, MIN_FILE_COST));
 
@@ -143,7 +114,7 @@ async function receiveFile(request: Request, share: UploadShare, declared: numbe
         }
         // The folder's own disk keeps its floor of free space, counting other uploads in progress.
         const disk = await fsp.statfs(into.base);
-        if (Number(disk.bavail) * Number(disk.bsize) - bytesInProgress() < KEEP_FREE_BYTES) throw new AppError("The server doesn't have room for this file", 507, "DISK_FULL");
+        if (Number(disk.bavail) * Number(disk.bsize) - bytesInProgress() - accountBytesStillComing() < KEEP_FREE_BYTES) throw new AppError("The server doesn't have room for this file", 507, "DISK_FULL");
         const target: { name: string; handle: FileHandle; created: Stats } = await reservePublicTarget(into, name);
         let bytes = 0;
         const meter = new Transform({

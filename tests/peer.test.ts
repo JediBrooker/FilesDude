@@ -4,7 +4,7 @@ import type { AddressInfo } from "node:net";
 import test from "node:test";
 import { clientAddress, reachedOverHttps } from "../lib/auth";
 import { config } from "../lib/config";
-import { installPeerStamp, REQUEST_TIMEOUT_MS } from "../lib/peer";
+import { allowLongRequests, DEFAULT_REQUEST_TIMEOUT_MS, installPeerStamp, REQUEST_TIMEOUT_MS } from "../lib/peer";
 
 // A real server, so requests arrive over a real connection with whatever headers the client sends.
 async function withServer<T>(run: (send: (headers: Record<string, string>) => Promise<{ address: string; https: boolean }>) => Promise<T>) {
@@ -36,15 +36,20 @@ test("a direct connection is its own address, whatever it claims", async () => {
   });
 });
 
-test("the server lets a request take up to an hour, for uploads sent in one request", async () => {
+test("requests may take up to an hour only while uploads go in one request", async () => {
   installPeerStamp();
   const server = http.createServer((_request, response) => response.end("ok"));
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const request = async () => (await fetch(`http://127.0.0.1:${(server.address() as AddressInfo).port}/`)).text();
   try {
-    assert.equal(server.requestTimeout, 300_000);
-    await (await fetch(`http://127.0.0.1:${(server.address() as AddressInfo).port}/`)).text();
+    allowLongRequests(false);
+    await request();
+    assert.equal(server.requestTimeout, DEFAULT_REQUEST_TIMEOUT_MS);
+    allowLongRequests(true);
+    await request();
     assert.equal(server.requestTimeout, REQUEST_TIMEOUT_MS);
   } finally {
+    allowLongRequests(false);
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 });

@@ -104,6 +104,19 @@ test("link uploads in pieces keep to the link's limits and the link itself", asy
   });
 });
 
+test("starting many link uploads at the same moment still keeps to the limits", async () => {
+  await withRoot(async (root) => {
+    const link = await createUploadLink("inbox", 24, 1024 * 1024 * 1024, null);
+    const token = tokenOf(link.url);
+    const results = await Promise.all(Array.from({ length: 60 }, (_, index) => post(token, { action: "start", name: `f${index}.bin`, size: 1024 })));
+    assert.equal(results.filter((result) => result.status === 200).length, 3);
+    assert.equal((await fs.readdir(path.join(root, "inbox"))).length, 3);
+    await cancelLinkUploads(link.id);
+    assert.deepEqual(await fs.readdir(path.join(root, "inbox")), []);
+    assert.equal(uploadRoom((await resolveShareToken(token)) as UploadShare).bytes, 1024 * 1024 * 1024);
+  });
+});
+
 test("one sender can only run a few link uploads at once", async () => {
   await withRoot(async () => {
     const links = await Promise.all([1, 2].map(() => createUploadLink("inbox", 24, 10 * 1024 * 1024, null)));
