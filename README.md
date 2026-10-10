@@ -343,7 +343,8 @@ again.
 The first connection shows the server's host key fingerprint to confirm (check it with
 `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on that server); after that, a changed key
 is refused. A server can be browsed within its starting folder, previewed, downloaded from,
-uploaded to, and organised (new folder, rename, delete: the server has no trash). Items copy
+uploaded to (files over 64 MB in pieces, like uploads to FilesDude, unless that's turned
+off under **Preferences → Large uploads**), and organised (new folder, rename, delete: the server has no trash). Items copy
 both ways as background jobs with progress and cancel: select items there and choose **Copy
 to** the folder open in FilesDude, or select items in FilesDude and choose **Copy to server**.
 The other server is treated as untrusted: unsafe names, links, and special files are skipped;

@@ -102,7 +102,11 @@ export async function startSftpServer(root: string, auth: { username: string; pa
             if (entry?.kind === "file") await entry.handle.close();
             sftp.status(reqid, STATUS_CODE.OK);
           });
-          sftp.on("SETSTAT", (reqid) => sftp.status(reqid, STATUS_CODE.OK));
+          // Only a size change (truncation) is acted on; the rest is accepted and ignored.
+          sftp.on("SETSTAT", (reqid, requested, attrs) => {
+            if (typeof attrs.size !== "number") return sftp.status(reqid, STATUS_CODE.OK);
+            fs.truncate(local(requested), attrs.size).then(() => sftp.status(reqid, STATUS_CODE.OK), (error) => fail(reqid, error));
+          });
           sftp.on("FSETSTAT", (reqid) => sftp.status(reqid, STATUS_CODE.OK));
           sftp.on("MKDIR", (reqid, requested) => { fs.mkdir(local(requested)).then(() => sftp.status(reqid, STATUS_CODE.OK), (error) => fail(reqid, error)); });
           sftp.on("RMDIR", (reqid, requested) => { fs.rmdir(local(requested)).then(() => sftp.status(reqid, STATUS_CODE.OK), (error) => fail(reqid, error)); });

@@ -1592,7 +1592,7 @@ export function FileManager() {
 
       {sidebarOpen && <button className="sidebar-backdrop" aria-label="Close navigation" onClick={() => setSidebarOpen(false)} />}
       {dialog?.kind === "server" && connections.some((item) => item.id === dialog.id) && (
-        <RemoteBrowserDialog key={dialog.id} connection={connections.find((item) => item.id === dialog.id)!} localFolder={currentPath} onClose={() => setDialog(null)} onEdit={() => setDialog({ kind: "serverSettings", id: dialog.id })} onJob={trackJob} notify={notify} />
+        <RemoteBrowserDialog key={dialog.id} connection={connections.find((item) => item.id === dialog.id)!} localFolder={currentPath} inPieces={auth.features?.uploadInPieces ?? true} onClose={() => setDialog(null)} onEdit={() => setDialog({ kind: "serverSettings", id: dialog.id })} onJob={trackJob} notify={notify} />
       )}
       {dialog?.kind === "serverSettings" && (
         <ServerSettingsDialog
