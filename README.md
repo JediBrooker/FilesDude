@@ -262,8 +262,10 @@ copy and revoke buttons.
 - **Passwords:** any download or upload link can also need a password (8 characters or
   more), entered in the Share dialog. People opening the link see only a password box,
   not what's shared, until they enter it; it then works in that browser for 12 hours.
-  Only a scrypt hash is stored. Wrong guesses are limited to 10 per visitor and 50 per
-  link every 15 minutes, and each is recorded in Activity. Send the password separately
+  Only a scrypt hash is stored, in `protected-shares.json` (so an older version, if rolled
+  back to, doesn't serve those links). Wrong guesses are limited to 10 per visitor and 50
+  per link every 15 minutes (right passwords don't count); each is recorded in Activity, as
+  is a link being closed for 15 minutes after too many. Send the password separately
   from the link. Protected links show a lock in **Shared links**.
 
 ### Upload links

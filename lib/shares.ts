@@ -113,30 +113,46 @@ export function isUnlocked(share: StoredShare, cookieHeader: string | null) {
   return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
 }
 
-function countGuess(key: string, limit: number, now: number) {
-  if (guesses.size > 10_000) for (const [stored, entry] of guesses) if (entry.resetAt <= now) guesses.delete(stored);
+function currentGuesses(key: string, now: number) {
   const entry = guesses.get(key);
-  if (!entry || entry.resetAt <= now) {
-    guesses.set(key, { count: 1, resetAt: now + GUESS_WINDOW_MS });
-    return;
-  }
-  if (entry.count >= limit) throw new AppError("Too many wrong passwords. Try again in 15 minutes.", 429, "TOO_MANY_GUESSES");
-  entry.count += 1;
+  return entry && entry.resetAt > now ? entry : null;
+}
+
+function startGuesses(key: string, now: number) {
+  if (guesses.size > 10_000) for (const [stored, entry] of guesses) if (entry.resetAt <= now) guesses.delete(stored);
+  const entry = { count: 0, resetAt: now + GUESS_WINDOW_MS };
+  guesses.set(key, entry);
+  return entry;
 }
 
 /**
- * Checks a password for a link, within its limits on guesses (counted before checking, so guesses
- * sent together can't get past them). Returns the Set-Cookie value that unlocks it for 12 hours.
+ * Checks a password for a link, within its limits on wrong guesses: per visitor first, so one visitor
+ * past theirs doesn't use up the link's, then per link. A try is counted before checking (so tries
+ * sent together can't get past the limits) and given back if the password is right. Returns the
+ * Set-Cookie value that unlocks the link for 12 hours.
  */
 export async function unlockShare(share: StoredShare, password: unknown, address: string, token: string, secure: boolean) {
   if (!share.passwordHash) throw new AppError("This link doesn't need a password", 400, "NOT_PROTECTED");
   const now = Date.now();
-  const visitor = `${share.id}|${address}`;
-  countGuess(`${share.id}|*`, GUESSES_PER_LINK, now);
-  countGuess(visitor, GUESSES_PER_VISITOR, now);
+  const visitorKey = `${share.id}|${address}`;
+  const linkKey = `${share.id}|*`;
+  const visitorSoFar = currentGuesses(visitorKey, now);
+  if (visitorSoFar && visitorSoFar.count >= GUESSES_PER_VISITOR) throw new AppError("Too many wrong passwords. Try again in 15 minutes.", 429, "TOO_MANY_GUESSES");
+  const link = currentGuesses(linkKey, now) ?? startGuesses(linkKey, now);
+  if (link.count >= GUESSES_PER_LINK) {
+    // The owner hears about it once each time a link is locked.
+    const firstLock = !(link as { notified?: boolean }).notified;
+    (link as { notified?: boolean }).notified = true;
+    throw Object.assign(new AppError("Too many wrong passwords have been tried on this link. Try again in 15 minutes.", 429, "LINK_LOCKED"), { firstLock });
+  }
+  const visitor = visitorSoFar ?? startGuesses(visitorKey, now);
+  visitor.count += 1;
+  link.count += 1;
   const valid = typeof password === "string" && password.length <= 256 && (await verifyPassword(password, share.passwordHash));
   if (!valid) throw new AppError("That password isn't right", 401, "WRONG_PASSWORD");
-  guesses.delete(visitor);
+  // Only wrong guesses count: the right password gives its try back.
+  guesses.delete(visitorKey);
+  link.count = Math.max(0, link.count - 1);
   const expires = Math.floor(now / 1000) + UNLOCK_SECONDS;
   return `${unlockCookieName(share)}=${expires}.${unlockSignature(share, expires)}; Path=/s/${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Max-Age=${UNLOCK_SECONDS}${secure ? "; Secure" : ""}`;
 }
@@ -153,9 +169,21 @@ const isCount = (value: unknown) => Number.isInteger(value) && (value as number)
 const validUploadFields = (item: StoredShare) => item.kind === undefined
   || (item.kind === "upload" && item.type === "directory" && isCount(item.maxBytes) && (item.maxFiles === null || isCount(item.maxFiles)) && isCount(item.uploadedBytes) && isCount(item.uploadedFiles));
 
+// Links with a password are kept in a file of their own, which versions of FilesDude from before
+// passwords don't read: rolled back, they lose those links rather than serve them to anyone.
+function protectedSharesFile() {
+  return path.join(config.stateDir, "protected-shares.json");
+}
+
 async function readShares(): Promise<StoredShare[]> {
+  const [open, locked] = await Promise.all([readShareFile(sharesFile()), readShareFile(protectedSharesFile())]);
+  const protectedIds = new Set(locked.filter((share) => share.passwordHash).map((share) => share.id));
+  return [...open.filter((share) => !protectedIds.has(share.id)), ...locked.filter((share) => share.passwordHash)];
+}
+
+async function readShareFile(file: string): Promise<StoredShare[]> {
   try {
-    const parsed = JSON.parse(await fs.readFile(sharesFile(), "utf8"));
+    const parsed = JSON.parse(await fs.readFile(file, "utf8"));
     if (!Array.isArray(parsed)) return [];
     return parsed.filter((item): item is StoredShare => Boolean(item) && typeof item.id === "string" && ID_PATTERN.test(item.id)
       && typeof item.path === "string" && typeof item.name === "string" && (item.type === "file" || item.type === "directory")
@@ -171,6 +199,11 @@ async function readShares(): Promise<StoredShare[]> {
 }
 
 async function writeShares(shares: StoredShare[]) {
+  await writeShareFile(protectedSharesFile(), shares.filter((share) => share.passwordHash));
+  await writeShareFile(sharesFile(), shares.filter((share) => !share.passwordHash));
+}
+
+async function writeShareFile(file: string, shares: StoredShare[]) {
   await fs.mkdir(config.stateDir, { recursive: true, mode: 0o700 });
   const temporary = path.join(config.stateDir, `shares-${crypto.randomUUID()}.tmp`);
   const handle = await fs.open(temporary, "wx", 0o600);
@@ -180,7 +213,7 @@ async function writeShares(shares: StoredShare[]) {
   } finally {
     await handle.close();
   }
-  await fs.rename(temporary, sharesFile());
+  await fs.rename(temporary, file);
 }
 
 // Serializes read-modify-write cycles; expired and used-up links are dropped on every write.

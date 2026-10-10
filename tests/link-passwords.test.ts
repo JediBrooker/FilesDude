@@ -38,9 +38,11 @@ test("a link with a password opens only after the password is entered, in that b
     await assert.rejects(createShare("report.pdf", 24, null, "short"), /8 to 256 characters/);
     const link = await createShare("report.pdf", 24, null, "correct horse battery");
     assert.equal(link.protected, true);
-    const stored = JSON.parse(await fs.readFile(path.join(config.stateDir, "shares.json"), "utf8"));
+    // Kept apart from open links, where versions without passwords would serve it.
+    const stored = JSON.parse(await fs.readFile(path.join(config.stateDir, "protected-shares.json"), "utf8"));
     assert.match(stored[0].passwordHash, /^scrypt\$/);
     assert.doesNotMatch(JSON.stringify(stored), /correct horse/);
+    assert.deepEqual(JSON.parse(await fs.readFile(path.join(config.stateDir, "shares.json"), "utf8")), []);
     // The owner's list never includes the hash.
     assert.equal("passwordHash" in (await listShares())[0], false);
 
@@ -85,6 +87,31 @@ test("wrong passwords are limited and recorded", async () => {
     const second = await createShare("report.pdf", 24, null, "another long password");
     const results = await Promise.all(Array.from({ length: 30 }, () => tryPassword(tokenOf(second.url), "nope nope nope")));
     assert.equal(results.filter((response) => response.status === 401).length, 10);
+  });
+});
+
+test("one visitor's guesses don't lock others out, and right passwords don't count", async () => {
+  await withRoot(async () => {
+    const original = config.trustProxy;
+    config.trustProxy = true;
+    try {
+      const link = await createShare("report.pdf", 24, null, "correct horse battery");
+      const token = tokenOf(link.url);
+      const from = (address: string, password: string) => unlock(new Request(`http://localhost/s/${token}/unlock`, { method: "POST", headers: { ...base, "content-type": "application/json", "x-forwarded-for": address }, body: JSON.stringify({ password }) }), context(token));
+      // One address past its own limit doesn't use up the link's.
+      for (let attempt = 0; attempt < 50; attempt += 1) await from("203.0.113.1", `guess ${attempt}`);
+      assert.equal((await from("203.0.113.2", "correct horse battery")).status, 200);
+      // Many people entering the right password are all let in.
+      for (let person = 0; person < 60; person += 1) assert.equal((await from(`198.51.100.${person}`, "correct horse battery")).status, 200);
+      // Enough wrong guesses from many addresses close the link, and the owner is told once.
+      for (let address = 10; address < 20; address += 1) for (let attempt = 0; attempt < 5; attempt += 1) await from(`192.0.2.${address}`, "wrong wrong");
+      assert.equal((await from("192.0.2.99", "correct horse battery")).status, 429);
+      assert.equal((await from("192.0.2.98", "correct horse battery")).status, 429);
+      const audit = await fs.readFile(path.join(config.stateDir, "audit.jsonl"), "utf8");
+      assert.equal(audit.split("\n").filter((line) => line.includes("share.unlock_locked")).length, 1);
+    } finally {
+      config.trustProxy = original;
+    }
   });
 });
 

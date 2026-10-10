@@ -21,6 +21,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ tok
       cookie = await unlockShare(share, body && typeof body === "object" ? body.password : undefined, address, token, reachedOverHttps(request));
     } catch (error) {
       if (error instanceof AppError && error.code === "WRONG_PASSWORD") await audit("share.unlock_failed", { id: share.id, path: share.path, address });
+      if (error instanceof AppError && error.code === "LINK_LOCKED" && (error as { firstLock?: boolean }).firstLock) await audit("share.unlock_locked", { id: share.id, path: share.path, address });
       throw error;
     }
     const response = NextResponse.json({ ok: true }, { headers: { "Cache-Control": "no-store" } });
