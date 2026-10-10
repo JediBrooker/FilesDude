@@ -699,6 +699,24 @@ export async function listDirectory(relativePath = "", showHidden = false) {
   return { path: normalizeRelative(relativePath), entries, disk: await diskInfo() };
 }
 
+/** Folders listed at most for one folder in the folder tree. */
+export const MAX_TREE_FOLDERS = 2_000;
+
+/**
+ * The folders directly inside a folder, by name, for the folder tree: read from the folder's own
+ * listing (no look at each item, so a folder of thousands of files is quick), and only real folders
+ * (not links to them).
+ */
+export async function listFolders(relativePath = "", showHidden = false) {
+  const relative = cleanRelative(relativePath);
+  const names = await withOpen(openDirectory(relative), async (directory) => {
+    const items = await fs.readdir(directory.base, { withFileTypes: true });
+    return items.filter((item) => item.isDirectory() && !INTERNAL_NAMES.has(item.name) && (showHidden || !item.name.startsWith("."))).map((item) => item.name);
+  });
+  names.sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }));
+  return { path: relative, folders: names.slice(0, MAX_TREE_FOLDERS).map((name) => ({ name, path: childOf(relative, name) })), truncated: names.length > MAX_TREE_FOLDERS };
+}
+
 export function validateName(name: string) {
   const trimmed = name.trim();
   if (!trimmed || trimmed === "." || trimmed === ".." || trimmed.includes("/") || trimmed.includes("\\") || trimmed.includes("\0")) {

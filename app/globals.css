@@ -88,6 +88,27 @@ a { color: inherit; text-decoration: none; }
 .nav-item span { flex: 1; }
 .sidebar-section { margin-top: 20px; }
 .favorites-section { margin-top: 20px; }
+/* The folder tree. */
+.folder-tree-section { margin-top: 16px; }
+/* Open, the tree takes the room the sidebar has left (at least a few rows) and scrolls inside it. */
+.folder-tree-section:has(.folder-tree) { display: flex; min-height: 120px; flex: 1 1 0; flex-direction: column; }
+.folder-tree-section:has(.folder-tree) ~ .storage-card { margin-top: 14px; }
+.folder-tree-section .sidebar-section-toggle { margin-bottom: 4px; }
+.sidebar-section-toggle { display: flex; width: 100%; align-items: center; gap: 4px; padding: 0; border: 0; background: none; cursor: pointer; font-family: inherit; text-align: left; }
+.sidebar-section-toggle svg, .tree-toggle svg { transition: transform .15s ease; }
+.sidebar-section-toggle .tree-open, .tree-toggle .tree-open { transform: rotate(90deg); }
+.folder-tree { min-height: 0; flex: 1 1 0; margin: 0; padding: 0; overflow: auto; list-style: none; }
+.folder-tree ul { margin: 0; padding: 0; list-style: none; }
+.tree-row { display: flex; min-height: 30px; align-items: center; border-radius: 7px; color: var(--ink-soft); }
+.tree-row:hover { background: var(--panel-soft); color: var(--ink); }
+.tree-row.active { background: var(--brand-soft); color: var(--brand-strong); }
+.tree-row.drop-target { outline: 2px solid var(--brand); outline-offset: -2px; }
+.tree-toggle { display: grid; width: 20px; height: 24px; flex: 0 0 20px; place-items: center; padding: 0; border: 0; background: none; color: var(--ink-faint); cursor: pointer; }
+.tree-toggle:disabled { cursor: default; }
+.tree-name { display: flex; min-width: 0; flex: 1; align-items: center; gap: 7px; padding: 5px 6px 5px 2px; border: 0; background: none; color: inherit; cursor: pointer; font-family: inherit; font-size: 11px; font-weight: 600; text-align: left; }
+.tree-name span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tree-name svg { flex: 0 0 auto; color: var(--brand); }
+.tree-note { margin: 3px 0; color: var(--ink-faint); font-size: 10px; }
 .favorite-list { display: grid; max-height: 172px; gap: 3px; overflow-y: auto; scrollbar-width: thin; }
 .favorite-item { display: flex; min-width: 0; align-items: center; border-radius: 8px; color: var(--ink-soft); }
 .favorite-item:hover, .favorite-item.active { background: var(--panel-soft); color: var(--ink); }
