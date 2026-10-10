@@ -190,7 +190,7 @@ function openFailure(error: unknown): never {
   throw error;
 }
 
-async function isReservedLocation(real: string) {
+export async function isReservedLocation(real: string) {
   if (path.relative(canonicalRoot || config.root, real).split(path.sep).some((part) => INTERNAL_NAMES.has(part))) return true;
   const state = await fs.realpath(config.stateDir).catch(() => path.resolve(config.stateDir));
   return real === state || real.startsWith(`${state}${path.sep}`);

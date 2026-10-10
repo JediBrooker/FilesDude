@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { withAccess } from "@/lib/access";
 import { audit } from "@/lib/audit";
 import { assertMutationRequest, AppError, jsonError, readJsonBody } from "@/lib/http";
+import { cancelAccountUploads } from "@/lib/chunked-uploads";
 import { cancelAccountJobs } from "@/lib/jobs";
 import { removeAccountPasskeys } from "@/lib/passkeys";
 import { resetTwoFactor } from "@/lib/two-factor";
@@ -39,6 +40,7 @@ export async function POST(request: Request) {
           user = await updateUser(id, { role: body.role, root: body.root, password: body.password });
           // Jobs keep the role and folder they started with, so they stop along with the old sessions.
           cancelAccountJobs(id);
+          await cancelAccountUploads(id);
           // A password reset is for a forgotten or exposed password: passkeys added with it go too.
           const passkeysRemoved = body.password !== undefined ? await removeAccountPasskeys(id) : 0;
           await audit("users.update", { username: session.username, account: user.username, role: user.role, root: user.root, passwordReset: body.password !== undefined, passkeysRemoved: passkeysRemoved || undefined });
@@ -49,6 +51,7 @@ export async function POST(request: Request) {
           if (!id) throw new AppError("Choose an account", 400, "INVALID_REQUEST");
           await resetTwoFactor(id);
           cancelAccountJobs(id);
+          await cancelAccountUploads(id);
           // A synced passkey usually lives on the same lost phone, so it goes too.
           const passkeysRemoved = await removeAccountPasskeys(id);
           user = (await listUsers()).find((item) => item.id === id);
@@ -59,6 +62,7 @@ export async function POST(request: Request) {
           if (!id) throw new AppError("Choose an account", 400, "INVALID_REQUEST");
           user = await deleteUser(id);
           cancelAccountJobs(id);
+          await cancelAccountUploads(id);
           await removeAccountPasskeys(id);
           await audit("users.delete", { username: session.username, account: user.username });
           break;

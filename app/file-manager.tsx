@@ -475,6 +475,78 @@ export function uploadFile<T>(url: string, file: File, onProgress: (loaded: numb
   });
 }
 
+// Files larger than this are sent in pieces, so no request is bigger than a proxy such as
+// Cloudflare allows (100 MB), and a dropped connection only costs the piece in flight.
+const PIECES_ABOVE_BYTES = 64 * 1024 * 1024;
+
+function sendPiece(url: string, piece: Blob, onProgress: (loaded: number) => void, signal: AbortSignal) {
+  return new Promise<{ received: number }>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const abort = () => xhr.abort();
+    const settle = () => signal.removeEventListener("abort", abort);
+    signal.addEventListener("abort", abort, { once: true });
+    xhr.upload.onprogress = (event) => onProgress(Math.min(piece.size, event.loaded));
+    xhr.onload = () => {
+      settle();
+      let data: { error?: string; code?: string; received?: number } = {};
+      try {
+        data = JSON.parse(xhr.responseText || "{}");
+      } catch {
+        // Non-JSON error pages fall back to the status message below.
+      }
+      if (xhr.status >= 200 && xhr.status < 300) resolve(data as { received: number });
+      else reject(Object.assign(new Error(data.error || `Request failed (${xhr.status})`), { status: xhr.status, code: data.code, received: data.received }));
+    };
+    xhr.onerror = () => { settle(); reject(new Error("The connection was interrupted during the upload")); };
+    xhr.onabort = () => { settle(); reject(new DOMException("The upload was cancelled", "AbortError")); };
+    xhr.open("PUT", url);
+    xhr.setRequestHeader("x-filedude-request", "1");
+    xhr.setRequestHeader("Content-Type", "application/octet-stream");
+    xhr.send(piece);
+  });
+}
+
+const pause = (ms: number, signal: AbortSignal) => new Promise<void>((resolve, reject) => {
+  const timer = window.setTimeout(resolve, ms);
+  signal.addEventListener("abort", () => { window.clearTimeout(timer); reject(new DOMException("The upload was cancelled", "AbortError")); }, { once: true });
+});
+
+/**
+ * Uploads a large file in pieces. A piece that fails for a lost connection or a busy server is sent
+ * again (after asking the server where to carry on), up to a few times in a row before giving up.
+ */
+export async function uploadInPieces(query: URLSearchParams, file: File, onProgress: (loaded: number) => void, signal: AbortSignal) {
+  const base = "/api/fs/upload/chunks";
+  const { id, chunkBytes } = await requestJson<{ id: string; chunkBytes: number }>(`${base}?${query}`, { method: "POST", body: JSON.stringify({ action: "start", name: file.name, size: file.size }), signal });
+  let received = 0;
+  let failures = 0;
+  try {
+    while (received < file.size) {
+      const from = received;
+      try {
+        const result = await sendPiece(`${base}?id=${encodeURIComponent(id)}&offset=${from}`, file.slice(from, Math.min(file.size, from + chunkBytes)), (loaded) => onProgress(from + loaded), signal);
+        received = result.received;
+        failures = 0;
+      } catch (caught) {
+        const typed = caught as Error & { status?: number; received?: number };
+        if (typed.name === "AbortError") throw caught;
+        // Only a lost connection, a busy or restarting server, or a piece out of step is worth retrying.
+        const retryable = typed.status === undefined || typed.status === 409 || typed.status === 429 || typed.status >= 500;
+        failures += 1;
+        if (!retryable || failures > 5) throw caught;
+        await pause(Math.min(30_000, 1_000 * 2 ** failures), signal);
+        received = typed.received ?? (await requestJson<{ received: number }>(`${base}?id=${encodeURIComponent(id)}`, { signal }).then((status) => status.received, () => received));
+        onProgress(received);
+      }
+    }
+    return await requestJson<{ uploaded: string[] }>(base, { method: "POST", body: JSON.stringify({ action: "finish", id }), signal });
+  } catch (caught) {
+    // The server would remove it after a while anyway; this frees the space now.
+    void requestJson(base, { method: "POST", body: JSON.stringify({ action: "cancel", id }) }).catch(() => undefined);
+    throw caught;
+  }
+}
+
 export async function requestJson<T>(url: string, options: RequestInit = {}): Promise<T> {
   const headers = new Headers(options.headers);
   if (options.method && options.method !== "GET") headers.set("x-filedude-request", "1");
@@ -3089,7 +3161,8 @@ function UploadDialog({ items, folders, currentPath, chooseOwnership, onClose, n
       for (let index = uploadedCount; index < files.length; index += 1) {
         report(index, 0);
         const destination = items[index].folder ? folderParams(items[index].folder) : params;
-        await uploadFile<{ uploaded: string[] }>(`/api/fs/upload?${destination}`, files[index], (loaded) => report(index, loaded), controller.signal);
+        if (files[index].size > PIECES_ABOVE_BYTES) await uploadInPieces(destination, files[index], (loaded) => report(index, loaded), controller.signal);
+        else await uploadFile<{ uploaded: string[] }>(`/api/fs/upload?${destination}`, files[index], (loaded) => report(index, loaded), controller.signal);
         completedCount = index + 1;
         setUploadedCount(completedCount);
       }
