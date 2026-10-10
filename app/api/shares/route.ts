@@ -3,6 +3,7 @@ import { audit } from "@/lib/audit";
 import { withAccess } from "@/lib/access";
 import { config } from "@/lib/config";
 import { assertMutationRequest, AppError, jsonError, readJsonBody } from "@/lib/http";
+import { cancelLinkUploads } from "@/lib/chunked-uploads";
 import { createShare, createUploadLink, listShares, revokeShare } from "@/lib/shares";
 
 export const runtime = "nodejs";
@@ -40,6 +41,8 @@ export async function POST(request: Request) {
     if (body.action === "revoke") {
       if (typeof body.id !== "string" || body.id.length > 64) throw new AppError("Link id is invalid", 400, "INVALID_REQUEST");
       await revokeShare(body.id);
+      // Uploads in progress through a revoked upload link stop now.
+      await cancelLinkUploads(body.id);
       await audit("share.revoke", { username: session.username, id: body.id });
       return NextResponse.json({ ok: true }, { headers: { "Cache-Control": "no-store" } });
     }

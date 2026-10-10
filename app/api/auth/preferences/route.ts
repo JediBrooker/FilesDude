@@ -25,6 +25,7 @@ export async function GET(request: Request) {
         root: session.root,
         uploadOwnership: preferences.uploadOwnership,
         trashRetentionDays: preferences.trashRetentionDays,
+        uploadInPieces: preferences.uploadInPieces,
         identities,
       }, { headers: { "Cache-Control": "no-store" } });
     });
@@ -39,14 +40,14 @@ export async function POST(request: Request) {
     return await withAccess(request, "read", async (session) => {
     const parsed = await readJsonBody<unknown>(request, 16 * 1024);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new AppError("Request body is invalid", 400, "INVALID_REQUEST");
-    const body = parsed as { currentPassword?: unknown; username?: unknown; newPassword?: unknown; uploadOwnership?: UploadOwnershipPreference; trashRetentionDays?: unknown };
+    const body = parsed as { currentPassword?: unknown; username?: unknown; newPassword?: unknown; uploadOwnership?: UploadOwnershipPreference; trashRetentionDays?: unknown; uploadInPieces?: unknown };
     if (body.currentPassword !== undefined && typeof body.currentPassword !== "string") throw new AppError("Current password is invalid", 400, "INVALID_REQUEST");
     if (body.username !== undefined && typeof body.username !== "string") throw new AppError("Username is invalid", 400, "INVALID_REQUEST");
     if (body.newPassword !== undefined && typeof body.newPassword !== "string") throw new AppError("New password is invalid", 400, "INVALID_REQUEST");
 
     // Editors and viewers can only change their own password; the owner manages everything else.
     if (session.role !== "owner") {
-      if (body.username !== undefined || body.uploadOwnership !== undefined || body.trashRetentionDays !== undefined) throw new AppError("Only the owner account can change that", 403, "FORBIDDEN");
+      if (body.username !== undefined || body.uploadOwnership !== undefined || body.trashRetentionDays !== undefined || body.uploadInPieces !== undefined) throw new AppError("Only the owner account can change that", 403, "FORBIDDEN");
       if (!body.newPassword) throw new AppError("No preference changes to save", 400, "NO_CHANGES");
       const user = await findUserById(session.accountKey);
       if (!user) throw new AppError("Sign in required", 401, "UNAUTHORIZED");
@@ -73,6 +74,9 @@ export async function POST(request: Request) {
     const ownershipChanged = JSON.stringify(uploadOwnership) !== JSON.stringify(storedPreferences.uploadOwnership);
     const trashRetentionDays = body.trashRetentionDays === undefined ? storedPreferences.trashRetentionDays : parseTrashRetention(body.trashRetentionDays);
     const retentionChanged = trashRetentionDays !== storedPreferences.trashRetentionDays;
+    if (body.uploadInPieces !== undefined && typeof body.uploadInPieces !== "boolean") throw new AppError("Choose whether large files upload in pieces", 400, "INVALID_REQUEST");
+    const uploadInPieces = body.uploadInPieces ?? storedPreferences.uploadInPieces;
+    const piecesChanged = uploadInPieces !== storedPreferences.uploadInPieces;
 
     if (credentialsChanged) {
       if (!body.currentPassword) throw new AppError("Current password is required to change sign-in details", 400, "CURRENT_PASSWORD_REQUIRED");
@@ -86,7 +90,7 @@ export async function POST(request: Request) {
     if (ownershipChanged && uploadOwnership.mode === "fixed" && !(await isKnownIdentityPair(uploadOwnership.uid, uploadOwnership.gid))) {
       throw new AppError("Choose an owner and group available on this server", 400, "INVALID_UPLOAD_OWNERSHIP");
     }
-    if (!credentialsChanged && !ownershipChanged && !retentionChanged) throw new AppError("No preference changes to save", 400, "NO_CHANGES");
+    if (!credentialsChanged && !ownershipChanged && !retentionChanged && !piecesChanged) throw new AppError("No preference changes to save", 400, "NO_CHANGES");
 
     const updatedAt = new Date().toISOString();
     let credentialVersion = current.version;
@@ -99,18 +103,19 @@ export async function POST(request: Request) {
         return { next, result: next.version };
       });
     }
-    if (ownershipChanged || retentionChanged) await savePreferences({ ...storedPreferences, uploadOwnership, trashRetentionDays, updatedAt });
+    if (ownershipChanged || retentionChanged || piecesChanged) await savePreferences({ ...storedPreferences, uploadOwnership, trashRetentionDays, uploadInPieces, updatedAt });
     await audit("settings.preferences.updated", {
       previousUsername: current.username,
       username,
       passwordChanged,
       uploadOwnership: ownershipChanged ? uploadOwnership : undefined,
       trashRetentionDays: retentionChanged ? trashRetentionDays : undefined,
+      uploadInPieces: piecesChanged ? uploadInPieces : undefined,
     });
     // A shorter retention takes effect straight away rather than at the next hourly check.
     if (retentionChanged && trashRetentionDays) void runTrashRetention().catch((error: unknown) => console.error("Could not purge expired trash", error));
 
-    const response = NextResponse.json({ ok: true, username, uploadOwnership, trashRetentionDays });
+    const response = NextResponse.json({ ok: true, username, uploadOwnership, trashRetentionDays, uploadInPieces });
     if (credentialsChanged) response.headers.set("Set-Cookie", sessionCookie(createSession(username, credentialVersion), request));
     response.headers.set("Cache-Control", "no-store");
     return response;

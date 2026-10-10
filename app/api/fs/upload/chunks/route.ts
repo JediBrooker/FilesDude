@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { withAccess } from "@/lib/access";
 import { getSession } from "@/lib/auth";
 import { audit } from "@/lib/audit";
-import { appendChunk, cancelChunkedUpload, chunkedUploadStatus, finishChunkedUpload, startChunkedUpload } from "@/lib/chunked-uploads";
+import { accountOwner, appendChunk, cancelChunkedUpload, chunkedUploadStatus, finishChunkedUpload, startChunkedUpload } from "@/lib/chunked-uploads";
 import { acquireFilesystemLock } from "@/lib/files";
 import { assertMutationRequest, AppError, jsonError, readJsonBody } from "@/lib/http";
 import { openUploadDestination } from "@/lib/upload-destination";
@@ -26,7 +26,7 @@ function withReceived(error: unknown) {
 
 export async function GET(request: Request) {
   try {
-    return await withAccess(request, "write", async (session) => NextResponse.json(chunkedUploadStatus(session, new URL(request.url).searchParams.get("id")), noStore));
+    return await withAccess(request, "write", async (session) => NextResponse.json(chunkedUploadStatus(accountOwner(session), new URL(request.url).searchParams.get("id")), noStore));
   } catch (error) {
     return jsonError(error);
   }
@@ -38,7 +38,7 @@ export async function PUT(request: Request) {
     return await withAccess(request, "write", async (session) => {
       const url = new URL(request.url);
       const length = request.headers.get("content-length");
-      const result = await appendChunk(session, url.searchParams.get("id"), url.searchParams.get("offset"), length === null ? null : Number(length), request.body, request.signal);
+      const result = await appendChunk(accountOwner(session), url.searchParams.get("id"), url.searchParams.get("offset"), length === null ? null : Number(length), request.body, request.signal);
       return NextResponse.json(result, noStore);
     });
   } catch (error) {
@@ -71,12 +71,12 @@ export async function POST(request: Request) {
         }
       }
       if (body.action === "finish") {
-        const done = await finishChunkedUpload(session, body.id);
+        const done = await finishChunkedUpload(accountOwner(session), body.id);
         await audit("fs.upload", { username: session.username, directory: done.directory, files: [done.relative], bytes: done.bytes, ownership: done.ownership || "service", batch: done.batch, pieces: true });
         return NextResponse.json({ ok: true, uploaded: [done.relative], ownership: done.ownership }, noStore);
       }
       if (body.action === "cancel") {
-        await cancelChunkedUpload(session, body.id);
+        await cancelChunkedUpload(accountOwner(session), body.id);
         return NextResponse.json({ ok: true }, noStore);
       }
       throw new AppError("Unknown upload operation", 400, "UNKNOWN_ACTION");

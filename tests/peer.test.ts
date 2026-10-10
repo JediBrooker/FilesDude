@@ -4,7 +4,7 @@ import type { AddressInfo } from "node:net";
 import test from "node:test";
 import { clientAddress, reachedOverHttps } from "../lib/auth";
 import { config } from "../lib/config";
-import { installPeerStamp } from "../lib/peer";
+import { installPeerStamp, REQUEST_TIMEOUT_MS } from "../lib/peer";
 
 // A real server, so requests arrive over a real connection with whatever headers the client sends.
 async function withServer<T>(run: (send: (headers: Record<string, string>) => Promise<{ address: string; https: boolean }>) => Promise<T>) {
@@ -34,6 +34,19 @@ test("a direct connection is its own address, whatever it claims", async () => {
     // Even a forged copy of FilesDude's own stamp is overwritten.
     assert.deepEqual(await send({ ...forged, "x-filesdude-peer": "anything:192.168.0.3" }), { address: "127.0.0.1", https: false });
   });
+});
+
+test("the server lets a request take up to an hour, for uploads sent in one request", async () => {
+  installPeerStamp();
+  const server = http.createServer((_request, response) => response.end("ok"));
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    assert.equal(server.requestTimeout, 300_000);
+    await (await fetch(`http://127.0.0.1:${(server.address() as AddressInfo).port}/`)).text();
+    assert.equal(server.requestTimeout, REQUEST_TIMEOUT_MS);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
 });
 
 test("behind a trusted proxy, the client address it reports is used", async () => {

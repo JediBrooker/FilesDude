@@ -2,6 +2,7 @@
 
 import { CheckCircle2, CircleAlert, LoaderCircle, Upload, User } from "lucide-react";
 import { useRef, useState, type DragEvent } from "react";
+import { PIECES_ABOVE_BYTES, uploadInPieces } from "../../upload-pieces";
 
 type Item = { id: number; file: File; status: "waiting" | "uploading" | "done" | "failed"; sent: number; error?: string };
 
@@ -37,7 +38,7 @@ function send(token: string, file: File, from: string, onProgress: (sent: number
 }
 
 /** The page someone with an upload link sees: choose or drop files and send them, one at a time. */
-export function UploadDrop({ token, folderName, perFileBytes, roomBytes, roomFiles }: { token: string; folderName: string; perFileBytes: number; roomBytes: number; roomFiles: number | null }) {
+export function UploadDrop({ pieces, token, folderName, perFileBytes, roomBytes, roomFiles }: { pieces: boolean; token: string; folderName: string; perFileBytes: number; roomBytes: number; roomFiles: number | null }) {
   const [items, setItems] = useState<Item[]>([]);
   const [from, setFrom] = useState("");
   const [dragging, setDragging] = useState(false);
@@ -63,7 +64,10 @@ export function UploadDrop({ token, folderName, perFileBytes, roomBytes, roomFil
       }
       update(item.id, { status: "uploading" });
       try {
-        await send(token, item.file, from.trim(), (sent) => update(item.id, { sent }));
+        const progress = (sent: number) => update(item.id, { sent });
+        // Large files go in pieces, so they get through proxies with a request size limit.
+        if (pieces && item.file.size > PIECES_ABOVE_BYTES) await uploadInPieces({ base: `/s/${encodeURIComponent(token)}/upload/pieces`, start: { from: from.trim() } }, item.file, progress, new AbortController().signal);
+        else await send(token, item.file, from.trim(), progress);
         room.current = { bytes: room.current.bytes - item.file.size, files: room.current.files === null ? null : room.current.files - 1 };
         update(item.id, { status: "done", sent: item.file.size });
       } catch (error) {
