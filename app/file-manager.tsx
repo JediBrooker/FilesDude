@@ -6,6 +6,7 @@ import {
   ArrowDownWideNarrow,
   ArrowLeft,
   ArrowRight,
+  ArrowUp,
   ArrowUpNarrowWide,
   Bell,
   Camera,
@@ -19,6 +20,7 @@ import {
   CircleCheck,
   ClipboardCopy,
   ClipboardPaste,
+  Columns2,
   Copy,
   Download,
   Eye,
@@ -161,7 +163,7 @@ type SnapshotEntry = { name: string; path: string; type: "file" | "directory" | 
 type SnapshotVersion = { snapshot: string; snapshotCreatedAt: string; type: SnapshotEntry["type"]; size: number; modified: string };
 const SNAPSHOT_KIND_LABELS: Record<SnapshotInfo["kind"], string> = { auto: "Scheduled", manual: "Manual", other: "Other" };
 
-type EntryAction = "versions" | "open" | "edit" | "download" | "favorite" | "rename" | "cut" | "clipboard" | "paste" | "copy" | "move" | "compress" | "extract" | "share" | "permissions" | "ownership" | "details" | "delete";
+type EntryAction = "versions" | "open" | "edit" | "download" | "favorite" | "openOther" | "rename" | "cut" | "clipboard" | "paste" | "copy" | "move" | "compress" | "extract" | "share" | "permissions" | "ownership" | "details" | "delete";
 type FavoriteLocation = { path: string; name: string; createdAt: string };
 type SelectOptions = { additive?: boolean; range?: boolean };
 type MenuPosition = { top: number; left: number };
@@ -278,6 +280,17 @@ function storedSort() {
     return parseSort(window.localStorage.getItem(SORT_STORAGE_KEY));
   } catch {
     return parseSort(null);
+  }
+}
+
+// The split view's second folder, remembered per browser (absent when the split view is closed).
+const SPLIT_STORAGE_KEY = "filesdude-split";
+
+function storedSplit() {
+  try {
+    return typeof window === "undefined" ? null : window.localStorage.getItem(SPLIT_STORAGE_KEY);
+  } catch {
+    return null;
   }
 }
 
@@ -536,6 +549,8 @@ export function FileManager() {
   const [contentSearch, setContentSearch] = useState<{ status: "running" | "done" | "error"; result?: ContentSearchResult; error?: string } | null>(null);
   const contentControllerRef = useRef<AbortController | null>(null);
   const [view, setView] = useState<ViewMode>("list");
+  // The split view's second folder, or null when it's closed.
+  const [splitPath, setSplitPath] = useState<string | null>(storedSplit);
   const [sort, setSort] = useState<SortState>(() => (typeof window !== "undefined" ? storedSort() : parseSort(null)));
   const [loading, setLoading] = useState(false);
   const [dialog, setDialog] = useState<DialogState>(null);
@@ -1061,6 +1076,23 @@ export function FileManager() {
     }
   };
 
+  const openSplit = useCallback((target: string) => {
+    setSplitPath(target);
+    try {
+      window.localStorage.setItem(SPLIT_STORAGE_KEY, target);
+    } catch {
+      // Not remembered in this browser.
+    }
+  }, []);
+  const closeSplit = () => {
+    setSplitPath(null);
+    try {
+      window.localStorage.removeItem(SPLIT_STORAGE_KEY);
+    } catch {
+      // Nothing was remembered.
+    }
+  };
+
   const clip = (mode: ClipboardState["mode"], paths: string[]) => {
     if (!paths.length) return;
     setClipboard({ mode, paths });
@@ -1087,6 +1119,12 @@ export function FileManager() {
       anchorRef.current = entry.path;
     }
     setCursor(entry.path);
+    beginDrag(paths, event);
+  };
+
+  // Shared by both sides of the split view: the paths being dragged are kept here, never read from
+  // the drop, so only drags that started in this tab are accepted.
+  const beginDrag = (paths: string[], event: React.DragEvent<HTMLElement>) => {
     dragPathsRef.current = paths;
     event.dataTransfer.effectAllowed = "copyMove";
     event.dataTransfer.setData(DRAG_TYPE, JSON.stringify(paths));
@@ -1260,6 +1298,9 @@ export function FileManager() {
         break;
       case "favorite":
         void toggleFavorite(entry.path);
+        break;
+      case "openOther":
+        openSplit(entry.path);
         break;
       case "rename":
         setDialog({ kind: "rename", entry });
@@ -1515,6 +1556,7 @@ export function FileManager() {
           </div>
         </header>
 
+        <div className={`workspaces ${splitPath !== null ? "split" : ""}`}>
         <section className="workspace">
           <div className="workspace-heading">
             <div>
@@ -1554,6 +1596,7 @@ export function FileManager() {
             </div>
             <button className={`toolbar-button ${showFolderSizes ? "active" : ""}`} aria-pressed={showFolderSizes} onClick={toggleFolderSizes} title="Show how much each folder holds"><HardDrive size={16} /> Sizes</button>
             <button className={`toolbar-button ${showHidden ? "active" : ""}`} onClick={() => setShowHidden(!showHidden)} title="Show hidden files">{showHidden ? <Eye size={17} /> : <EyeOff size={17} />}<span>Hidden</span></button>
+            <button className={`toolbar-button split-view-toggle ${splitPath !== null ? "active" : ""}`} aria-pressed={splitPath !== null} onClick={() => (splitPath === null ? openSplit(currentPath) : closeSplit())} title="Show a second folder side by side, to copy or move between them"><Columns2 size={16} /><span>Split</span></button>
             <div className="view-switch" role="group" aria-label="View style">
               <button className={view === "list" ? "active" : ""} aria-label="List view" onClick={() => setView("list")}><List size={17} /></button>
               <button className={view === "grid" ? "active" : ""} aria-label="Grid view" onClick={() => setView("grid")}><LayoutGrid size={17} /></button>
@@ -1593,7 +1636,8 @@ export function FileManager() {
             </div>
           )}
 
-          <div className={`files-surface ${view === "grid" ? "grid-mode" : ""}`} onContextMenu={openBackgroundMenu}>
+          {/* In the split view, items dragged from the other side can be dropped anywhere on this list. */}
+          <div className={`files-surface ${view === "grid" ? "grid-mode" : ""} ${splitPath !== null && dropTarget === currentPath ? "drop-target" : ""}`} onContextMenu={openBackgroundMenu} {...(splitPath !== null && canWrite && !nameSearching && !(searchMode === "contents" && activeSearch) ? { "data-drop-path": currentPath, ...dropHandlers } : {})}>
             {searchMode === "contents" && activeSearch ? (
               <ContentResults
                 state={contentSearch}
@@ -1626,6 +1670,27 @@ export function FileManager() {
           </div>
           <div className="drop-hint"><Upload size={15} /> Drop files anywhere to upload to this folder</div>
         </section>
+        {splitPath !== null && auth.authenticated && (
+          <OtherPane
+            key={auth.username ?? ""}
+            path={splitPath}
+            home={home}
+            showHidden={showHidden}
+            canWrite={canWrite}
+            reloadSignal={entries}
+            mainPath={currentPath}
+            mainSelection={selectedEntries.map((entry) => entry.path)}
+            dropTarget={dropTarget}
+            dropHandlers={dropHandlers}
+            onPath={openSplit}
+            onOpenFile={(entry, siblings) => setDialog({ kind: "preview", entry, siblings })}
+            onDragPaths={beginDrag}
+            onDragEnd={endDrag}
+            onTransfer={transferEntries}
+            onClose={closeSplit}
+          />
+        )}
+        </div>
       </main>
 
       {sidebarOpen && <button className="sidebar-backdrop" aria-label="Close navigation" onClick={() => setSidebarOpen(false)} />}
@@ -1680,6 +1745,142 @@ export function FileManager() {
       {jobs.length > 0 && <div className="job-panels">{jobs.map((job) => <JobPanel key={job.id} job={job} onCancel={() => void cancelJob(job)} />)}</div>}
       {toast && <div className={`toast ${toast.tone === "error" ? "toast-error" : ""}`} role="status">{toast.tone === "error" ? <CircleAlert size={18} /> : <Check size={18} />}<span>{toast.message}</span>{toast.undo && <button className="toast-action" onClick={() => void runUndo(toast.undo!)}><Undo2 size={14} /> Undo</button>}</div>}
     </div>
+  );
+}
+
+/**
+ * The split view's second folder, beside the main one: browse it, open its files, and copy or move
+ * between the two sides, with its buttons or by dragging either way (dropping on a folder, or
+ * anywhere on the other side's list).
+ */
+function OtherPane({ path, home, showHidden, canWrite, reloadSignal, mainPath, mainSelection, dropTarget, dropHandlers, onPath, onOpenFile, onDragPaths, onDragEnd, onTransfer, onClose }: {
+  path: string;
+  home: string;
+  showHidden: boolean;
+  canWrite: boolean;
+  /** Changes whenever the main folder reloads (after a copy or move finishes, for one), so this reloads too. */
+  reloadSignal: unknown;
+  mainPath: string;
+  mainSelection: string[];
+  dropTarget: string | null;
+  dropHandlers: DropHandlers;
+  onPath: (path: string) => void;
+  onOpenFile: (entry: FileEntry, siblings: FileEntry[]) => void;
+  onDragPaths: (paths: string[], event: React.DragEvent<HTMLElement>) => void;
+  onDragEnd: () => void;
+  onTransfer: (mode: "copy" | "move", paths: string[], destination: string) => Promise<boolean>;
+  onClose: () => void;
+}) {
+  const [listing, setListing] = useState<{ path: string; entries: FileEntry[] } | null>(null);
+  const [error, setError] = useState("");
+  // The selection belongs to the folder it was made in.
+  const [selection, setSelection] = useState<{ path: string; paths: Set<string> }>({ path, paths: new Set() });
+  const selected = selection.path === path ? selection.paths : new Set<string>();
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    requestJson<{ entries: FileEntry[] }>(`/api/fs?path=${encodePath(path)}&hidden=${showHidden}`, { signal: controller.signal })
+      .then((result) => setListing({ path, entries: result.entries }))
+      .catch((caught: Error) => {
+        if (caught.name === "AbortError") return;
+        // A folder that's gone (or out of reach) gives way to the account's own.
+        setError(`${folderLabel(path)} couldn't be opened: ${caught.message}`);
+        if (path !== home) onPath(home);
+      });
+    return () => controller.abort();
+  }, [path, home, showHidden, reloadSignal, onPath]);
+
+  const entries = useMemo(() => (listing?.path === path ? [...listing.entries] : [])
+    .sort((a, b) => Number(b.type === "directory") - Number(a.type === "directory") || a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" })), [listing, path]);
+  const loading = listing?.path !== path && !error;
+  const chosen = entries.filter((entry) => selected.has(entry.path)).map((entry) => entry.path);
+  const crumbs = [{ path: home, label: home ? "My files" : "All files" }];
+  for (const part of path.slice(home ? home.length + 1 : 0).split("/").filter(Boolean)) crumbs.push({ path: crumbs.at(-1)!.path ? `${crumbs.at(-1)!.path}/${part}` : part, label: part });
+  const mainName = mainPath ? mainPath.split("/").at(-1)! : home ? "My files" : "All files";
+  const hereName = path ? path.split("/").at(-1)! : "All files";
+
+  // Going somewhere else clears the message about a folder that couldn't be opened.
+  const go = (target: string) => {
+    setError("");
+    onPath(target);
+  };
+  const select = (entry: FileEntry, additive: boolean) => {
+    const next = new Set(additive ? selected : []);
+    if (additive && next.has(entry.path)) next.delete(entry.path);
+    else next.add(entry.path);
+    setSelection({ path, paths: next });
+  };
+  const open = (entry: FileEntry) => {
+    if (entry.type === "directory") go(entry.path);
+    else if (!entry.symlinkBlocked) onOpenFile(entry, entries.filter((item) => item.type === "file" && !item.symlinkBlocked));
+  };
+  const transfer = async (mode: "copy" | "move", paths: string[], destination: string) => {
+    setBusy(true);
+    try {
+      if (await onTransfer(mode, paths, destination)) setSelection({ path, paths: new Set() });
+    } finally {
+      setBusy(false);
+    }
+  };
+  const dropProps = (destination: string) => (canWrite ? { "data-drop-path": destination, ...dropHandlers } : {});
+
+  return (
+    <aside className="other-pane" aria-label={`Split view: ${hereName}`}>
+      <header className="other-pane-header">
+        <button type="button" className="icon-button" aria-label="Up a folder" title="Up a folder" disabled={path === home} onClick={() => go(parentOf(path))}><ArrowUp size={16} /></button>
+        <div className="breadcrumb" aria-label="Split view path">
+          {crumbs.map((crumb, index) => (
+            <span key={crumb.path || "root"}>
+              {index > 0 && <ChevronRight size={13} />}
+              <button type="button" className={dropTarget === crumb.path ? "drop-target" : ""} {...dropProps(crumb.path)} onClick={() => go(crumb.path)}>{crumb.label}</button>
+            </span>
+          ))}
+        </div>
+        <button type="button" className="icon-button" aria-label="Close the split view" title="Close the split view" onClick={onClose}><X size={16} /></button>
+      </header>
+      {canWrite && (
+        <div className="other-pane-actions">
+          {mainSelection.length > 0 && <>
+            <button type="button" className="button secondary" disabled={busy || !canDropInto(path, mainSelection, true)} title={`Copy the ${itemCount(mainSelection.length)} selected on the left into ${hereName}`} onClick={() => void transfer("copy", mainSelection, path)}><Copy size={14} /> Copy {itemCount(mainSelection.length)} here</button>
+            <button type="button" className="button secondary" disabled={busy || !canDropInto(path, mainSelection, false)} title={`Move the ${itemCount(mainSelection.length)} selected on the left into ${hereName}`} onClick={() => void transfer("move", mainSelection, path)}><FolderInput size={14} /> Move here</button>
+          </>}
+          {chosen.length > 0 && <>
+            <button type="button" className="button secondary" disabled={busy || !canDropInto(mainPath, chosen, true)} title={`Copy the ${itemCount(chosen.length)} selected here into ${mainName}`} onClick={() => void transfer("copy", chosen, mainPath)}><ArrowLeft size={14} /> Copy {itemCount(chosen.length)} to {mainName}</button>
+            <button type="button" className="button secondary" disabled={busy || !canDropInto(mainPath, chosen, false)} title={`Move the ${itemCount(chosen.length)} selected here into ${mainName}`} onClick={() => void transfer("move", chosen, mainPath)}><FolderInput size={14} /> Move to {mainName}</button>
+          </>}
+          {!mainSelection.length && !chosen.length && <small>Select items on either side to copy or move them across, or drag them over.</small>}
+        </div>
+      )}
+      <div className={`other-pane-list ${dropTarget === path ? "drop-target" : ""}`} role="table" aria-label={`Files in ${hereName}`} {...dropProps(path)}>
+        {error && <p className="form-error other-pane-error"><CircleAlert size={14} />{error}</p>}
+        {loading ? <div className="other-pane-empty"><LoaderCircle className="spin" size={18} /></div>
+          : !entries.length ? <div className="other-pane-empty">This folder is empty.</div>
+          : entries.map((entry) => (
+            <div
+              key={entry.path}
+              role="row"
+              aria-selected={selected.has(entry.path)}
+              className={`pane-row ${selected.has(entry.path) ? "selected" : ""} ${dropTarget === entry.path ? "drop-target" : ""}`}
+              draggable={canWrite}
+              onDragStart={(event) => {
+                const paths = selected.has(entry.path) ? chosen : [entry.path];
+                if (!selected.has(entry.path)) setSelection({ path, paths: new Set([entry.path]) });
+                onDragPaths(paths, event);
+              }}
+              onDragEnd={onDragEnd}
+              {...(entry.type === "directory" ? dropProps(entry.path) : {})}
+              onClick={(event) => select(entry, event.metaKey || event.ctrlKey)}
+              onDoubleClick={() => open(entry)}
+            >
+              <span className={`file-icon ${entry.type}`} role="cell">{fileIcon(entry)}</span>
+              <span role="cell" className="pane-name-cell"><button type="button" className="pane-name" title={entry.name} onClick={(event) => { event.stopPropagation(); open(entry); }}>{entry.name}</button></span>
+              <span role="cell" className="muted">{entry.type === "directory" ? "" : formatBytes(entry.size)}</span>
+              <span role="cell" className="muted">{formatDate(entry.modified)}</span>
+            </div>
+          ))}
+      </div>
+    </aside>
   );
 }
 
@@ -1910,6 +2111,7 @@ function FileActionMenu({ entry, targets, position, menuRef, favoritePaths, canW
       <div className="file-menu-section">
         {canWrite && !multiple && item("rename", "Rename", <Pencil size={16} />)}
         {!multiple && entry.type === "directory" && item("favorite", favoritePaths.has(entry.path) ? "Remove from favourites" : "Add to favourites", <Star size={16} fill={favoritePaths.has(entry.path) ? "currentColor" : "none"} />)}
+        {!multiple && entry.type === "directory" && item("openOther", "Open in split view", <Columns2 size={16} />)}
         {canWrite && item("cut", "Cut", <Scissors size={16} />)}
         {canWrite && item("clipboard", "Copy", <ClipboardCopy size={16} />)}
         {!multiple && canPaste && item("paste", "Paste into folder", <ClipboardPaste size={16} />)}
