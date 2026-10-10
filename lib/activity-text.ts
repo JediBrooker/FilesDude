@@ -105,9 +105,10 @@ function describe(entry: Entry): Omit<ActivityText, "text"> {
     case "login.two_factor.failed": return { parts: ["entered a wrong two-factor code"], detail: client, tone: "danger" };
     case "logout": return { parts: ["signed out"] };
     case "fs.upload": {
-      const files = Array.isArray(entry.files) ? entry.files.length : 0;
+      const files = typeof entry.fileCount === "number" ? entry.fileCount : Array.isArray(entry.files) ? entry.files.length : 0;
       const size = typeof entry.bytes === "number" ? ` (${formatSize(entry.bytes)})` : "";
-      return { parts: t`uploaded ${count(files, "file")}${size} to ${v(slash(entry.directory))}` };
+      const folders = typeof entry.foldersMade === "number" && entry.foldersMade ? `, making ${count(entry.foldersMade, "folder")}` : "";
+      return { parts: t`uploaded ${count(files, "file")}${size} to ${v(slash(entry.directory))}${folders}`, detail: typeof entry.fileCount === "number" ? undefined : pathDetail(list(entry.files)) };
     }
     case "fs.download": return typeof entry.items === "number"
       ? { parts: [`downloaded ${count(entry.items, "item")} as a ZIP`], detail: pathDetail(paths) }
@@ -167,6 +168,53 @@ function describe(entry: Entry): Omit<ActivityText, "text"> {
     case "audit.dropped": return { parts: [`couldn't record ${count(typeof entry.count === "number" ? entry.count : 0, "event")} during a flood of activity`], tone: "warning" };
     default: return { parts: [v(entry.event)] };
   }
+}
+
+// The deepest folder all of these share: what an upload went into.
+function sharedFolder(folders: string[]) {
+  const [first = [], ...others] = folders.map((folder) => folder.split("/").filter(Boolean));
+  let length = first.length;
+  for (const parts of others) {
+    let index = 0;
+    while (index < length && parts[index] === first[index]) index += 1;
+    length = index;
+  }
+  return first.slice(0, length).join("/");
+}
+
+/**
+ * Folds each upload (its files' entries, and the folders it made, all sharing a batch id) into one
+ * entry with the totals, for the Activity view; entries arrive newest first, and a batch split across
+ * pages simply shows once per page.
+ */
+export function groupUploads<T extends Entry>(entries: T[]): T[] {
+  const grouped: T[] = [];
+  const batches = new Map<string, { entry: T; files: number; bytes: number; folders: number; directories: string[] }>();
+  for (const entry of entries) {
+    const batch = typeof entry.batch === "string" ? entry.batch : "";
+    const isUpload = entry.event === "fs.upload" || (entry.event === "fs.create" && entry.upload === true);
+    if (!batch || !isUpload) {
+      grouped.push(entry);
+      continue;
+    }
+    const key = `${String(entry.username ?? "")}|${batch}`;
+    let group = batches.get(key);
+    if (!group) {
+      group = { entry: { ...entry, event: "fs.upload" }, files: 0, bytes: 0, folders: 0, directories: [] };
+      batches.set(key, group);
+      grouped.push(group.entry);
+    }
+    if (entry.event === "fs.upload") {
+      group.files += Array.isArray(entry.files) ? entry.files.length : 0;
+      group.bytes += typeof entry.bytes === "number" ? entry.bytes : 0;
+      group.directories.push(str(entry.directory));
+    } else {
+      group.folders += 1;
+      group.directories.push(str(entry.path));
+    }
+    Object.assign(group.entry, { directory: sharedFolder(group.directories), fileCount: group.files, bytes: group.bytes, foldersMade: group.folders, grouped: true });
+  }
+  return grouped;
 }
 
 /** What happened, in words ("moved 3 items to /Media"), with any long detail on a second line. */

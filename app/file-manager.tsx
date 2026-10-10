@@ -74,7 +74,7 @@ import {
 } from "lucide-react";
 import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { ACTIVITY_CATEGORIES, activityCategory, activityUser, describeActivity, SHARE_LINK_ACTOR, SYSTEM_ACTOR, visibleText, type ActivityCategory } from "@/lib/activity-text";
+import { ACTIVITY_CATEGORIES, activityCategory, activityUser, describeActivity, groupUploads, SHARE_LINK_ACTOR, SYSTEM_ACTOR, visibleText, type ActivityCategory } from "@/lib/activity-text";
 import { isNewerBuild as differsFrom, type BuildIdentity } from "@/lib/build";
 import { CopyToServerDialog, RemoteBrowserDialog, ServerSettingsDialog, type ServerConnection } from "./remote-servers";
 import { moveCursor, selectionRange } from "@/lib/selection";
@@ -2416,7 +2416,7 @@ function ActivityDialog({ owner, onClose }: { owner: string; onClose: () => void
           : page.error && !page.entries.length ? <div className="storage-scan-state error"><CircleAlert size={25} /><strong>Activity couldn&apos;t be loaded</strong><span>{page.error}</span></div>
           : !page.entries.length ? <div className="storage-scan-state"><Activity size={25} /><strong>{page.cursor ? "Nothing found in recent activity" : "No matching activity"}</strong><span>{page.cursor ? "Older activity hasn't been searched yet." : "Try another filter."}</span></div>
           : <div className="activity-list">
-            {page.entries.map((entry, index) => {
+            {groupUploads(page.entries).map((entry, index) => {
               const at = new Date(entry.at);
               const day = activityDay(at);
               const heading = day !== lastDay ? <h3 className="activity-day">{day}</h3> : null;
@@ -2952,6 +2952,7 @@ function UploadDialog({ items, folders, currentPath, chooseOwnership, onClose, n
   // folders exist already, kept so trying again after a failure carries on in the same folders.
   const topFoldersRef = useRef(new Map<string, string>());
   const madeFoldersRef = useRef(new Set<string>());
+  const batchRef = useRef("");
   const [options, setOptions] = useState<UploadOwnershipOptions | null>(null);
   const [selectedOwnership, setSelectedOwnership] = useState("service");
   const [error, setError] = useState("");
@@ -3005,7 +3006,10 @@ function UploadDialog({ items, folders, currentPath, chooseOwnership, onClose, n
     if (chooseOwnership && !options) return;
     setBusy(true);
     setError("");
-    const params = new URLSearchParams({ path: currentPath });
+    // One id for every request of this upload (kept if it's tried again), so Activity shows it as a
+    // single entry.
+    batchRef.current ||= crypto.randomUUID();
+    const params = new URLSearchParams({ path: currentPath, batch: batchRef.current });
     if (selectedOwnership !== "service") {
       const [uid, gid] = selectedOwnership.split(":");
       params.set("uid", uid);
