@@ -204,3 +204,23 @@ export function refundLoginAttempt(key: string) {
 export function clearLoginFailures(key: string) {
   loginAttempts.delete(key);
 }
+
+// Checks of the current password from a signed-in session (before adding a passkey or changing
+// two-factor sign-in) are limited per account, so a session left open can't be used to guess it.
+// A try is counted as it starts; the right password clears the count.
+const CURRENT_PASSWORD_LIMIT = 10;
+const currentPasswordChecks = new Map<string, { count: number; resetAt: number }>();
+
+export async function verifyCurrentPassword(accountKey: string, password: unknown, encoded: string) {
+  const now = Date.now();
+  let attempt = currentPasswordChecks.get(accountKey);
+  if (!attempt || attempt.resetAt <= now) {
+    attempt = { count: 0, resetAt: now + 15 * 60 * 1000 };
+    currentPasswordChecks.set(accountKey, attempt);
+  }
+  if (attempt.count >= CURRENT_PASSWORD_LIMIT) throw new AppError("Too many wrong passwords. Try again in 15 minutes.", 429, "PASSWORD_LOCKED");
+  attempt.count += 1;
+  const valid = typeof password === "string" && password.length <= 512 && (await verifyPassword(password, encoded));
+  if (valid) currentPasswordChecks.delete(accountKey);
+  return valid;
+}

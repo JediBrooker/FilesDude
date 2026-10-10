@@ -97,7 +97,7 @@ test("every API route authenticates through the access wrapper", async () => {
     }
   }
   await collect(path.join(process.cwd(), "app", "api"));
-  const unauthenticated = new Set(["auth/login", "auth/logout", "auth/status"].map((route) => path.join(process.cwd(), "app", "api", route, "route.ts")));
+  const unauthenticated = new Set(["auth/login", "auth/passkey-login", "auth/logout", "auth/status"].map((route) => path.join(process.cwd(), "app", "api", route, "route.ts")));
   assert.ok(routes.length >= 15);
   for (const route of routes) {
     const source = await fs.readFile(route, "utf8");

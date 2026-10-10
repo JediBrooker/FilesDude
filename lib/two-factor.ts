@@ -231,6 +231,19 @@ export async function regenerateRecoveryCodes(accountKey: string, code: unknown)
 }
 
 /**
+ * Checks and consumes a code for an account that has two-factor sign-in, within its limit on wrong
+ * codes, without changing anything else. Used before adding a passkey, which signs in without a code.
+ */
+export async function confirmWithCode(accountKey: string, code: unknown) {
+  await withCodeAttempt(accountKey, () => changeTwoFactor(accountKey, (account) => {
+    if (!account.twoFactor) return { result: undefined };
+    const used = consumeCode(account.twoFactor, code);
+    if (!used) throw wrongCode();
+    return { twoFactor: used.twoFactor, result: undefined };
+  }));
+}
+
+/**
  * Removes another account's two-factor sign-in (the owner's reset for a lost device) and signs it
  * out. The owner's own can only be turned off with a code, or cleared on the server.
  */

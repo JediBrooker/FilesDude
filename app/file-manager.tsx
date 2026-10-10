@@ -29,6 +29,7 @@ import {
   FilePenLine,
   FileText,
   FileVideo,
+  Fingerprint,
   Folder,
   Files,
   FolderInput,
@@ -72,8 +73,9 @@ import {
   Users,
   X,
 } from "lucide-react";
-import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { createPortal } from "react-dom";
+import { browserSupportsWebAuthn, startAuthentication, startRegistration, type PublicKeyCredentialCreationOptionsJSON, type PublicKeyCredentialRequestOptionsJSON } from "@simplewebauthn/browser";
 import { ACTIVITY_CATEGORIES, activityCategory, activityUser, describeActivity, groupUploads, SHARE_LINK_ACTOR, SYSTEM_ACTOR, visibleText, type ActivityCategory } from "@/lib/activity-text";
 import { isNewerBuild as differsFrom, type BuildIdentity } from "@/lib/build";
 import { CopyToServerDialog, RemoteBrowserDialog, ServerSettingsDialog, type ServerConnection } from "./remote-servers";
@@ -130,6 +132,7 @@ type DialogState =
   | { kind: "edit"; entry: FileEntry }
   | { kind: "preferences" }
   | { kind: "twoFactor" }
+  | { kind: "passkeys" }
   | { kind: "snapshots" }
   | { kind: "duplicates" }
   | { kind: "versions"; entry: FileEntry }
@@ -1622,6 +1625,7 @@ export function FileManager() {
           username={auth.username || ""}
           onCredentialsUpdated={async () => { setDialog(null); await refreshAuth(); notify("Account preferences updated"); }}
           onTwoFactor={() => setDialog({ kind: "twoFactor" })}
+          onPasskeys={() => setDialog({ kind: "passkeys" })}
           onReveal={(entry) => { setDialog(null); navigate(entry.path.split("/").slice(0, -1).join("/")); }}
           onPreview={showPreview}
         />
@@ -1686,6 +1690,22 @@ function LoginScreen({ auth, onSuccess, theme, onToggleTheme }: { auth: AuthStat
   // Set once the password is right for an account with two-factor sign-in; a code is then needed.
   const [challenge, setChallenge] = useState<string | null>(null);
   const [code, setCode] = useState("");
+  const passkeysSupported = usePasskeySupport();
+
+  const signInWithPasskey = async () => {
+    setSubmitting(true);
+    setError("");
+    try {
+      const { challengeId, options } = await requestJson<{ challengeId: string; options: PublicKeyCredentialRequestOptionsJSON }>("/api/auth/passkey-login", { method: "POST", body: JSON.stringify({ action: "options" }) });
+      const response = await startAuthentication({ optionsJSON: options });
+      await requestJson("/api/auth/passkey-login", { method: "POST", body: JSON.stringify({ action: "verify", challengeId, response }) });
+      await onSuccess();
+    } catch (caught) {
+      setError(passkeyError(caught));
+    } finally {
+      setSubmitting(false);
+    }
+  };
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -1735,6 +1755,7 @@ function LoginScreen({ auth, onSuccess, theme, onToggleTheme }: { auth: AuthStat
             <label><span>Password</span><div className="login-input"><LockKeyhole size={17} /><input type={showPassword ? "text" : "password"} autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} required autoFocus /><button type="button" aria-label={showPassword ? "Hide password" : "Show password"} onClick={() => setShowPassword(!showPassword)}>{showPassword ? <EyeOff size={17} /> : <Eye size={17} />}</button></div></label>
             {error && <div className="form-error"><CircleAlert size={16} />{error}</div>}
             <button className="button primary login-button" disabled={submitting}>{submitting ? <LoaderCircle className="spin" size={18} /> : <LockKeyhole size={17} />} Sign in securely</button>
+            {passkeysSupported && <><div className="login-divider"><span>or</span></div><button type="button" className="button secondary login-button" disabled={submitting} onClick={() => void signInWithPasskey()}><Fingerprint size={17} /> Sign in with a passkey</button></>}
           </form>
         )}
         <div className="login-foot"><ShieldCheck size={15} /><span>Credentials stay on your server. Sessions use secure, HTTP-only cookies.</span></div>
@@ -2011,7 +2032,7 @@ function JobPanel({ job, onCancel }: { job: JobState; onCancel: () => void }) {
   );
 }
 
-function DialogHost({ dialog, selected, currentPath, username, role, home, onClose, onRun, notify, onRefresh, onStartJob, onTransfer, onJob, canWrite, onSharesChanged, onCredentialsUpdated, onTwoFactor, onReveal, onPreview }: {
+function DialogHost({ dialog, selected, currentPath, username, role, home, onClose, onRun, notify, onRefresh, onStartJob, onTransfer, onJob, canWrite, onSharesChanged, onCredentialsUpdated, onTwoFactor, onPasskeys, onReveal, onPreview }: {
   dialog: NonNullable<DialogState>;
   selected: FileEntry[];
   currentPath: string;
@@ -2029,6 +2050,7 @@ function DialogHost({ dialog, selected, currentPath, username, role, home, onClo
   onSharesChanged: () => Promise<void>;
   onCredentialsUpdated: () => Promise<void>;
   onTwoFactor: () => void;
+  onPasskeys: () => void;
   onReveal: (entry: FileEntry) => void;
   onPreview: (entry: FileEntry, siblings?: FileEntry[]) => void;
 }) {
@@ -2056,11 +2078,12 @@ function DialogHost({ dialog, selected, currentPath, username, role, home, onClo
   }
   if (dialog.kind === "edit") return <EditDialog entry={dialog.entry} onClose={onClose} onRun={onRun} />;
   if (dialog.kind === "twoFactor") return <TwoFactorDialog onClose={onClose} notify={notify} />;
+  if (dialog.kind === "passkeys") return <PasskeysDialog onClose={onClose} notify={notify} />;
   if (dialog.kind === "snapshots") return <SnapshotsDialog isOwner={role === "owner"} canWrite={canWrite} home={home} onClose={onClose} notify={notify} onJob={onJob} />;
   if (dialog.kind === "versions") return <VersionsDialog entry={dialog.entry} canWrite={canWrite} isOwner={role === "owner"} onClose={onClose} notify={notify} onJob={onJob} />;
   if (dialog.kind === "preferences") return role === "owner"
-    ? <PreferencesDialog username={username} onClose={onClose} onUpdated={onCredentialsUpdated} onTwoFactor={onTwoFactor} />
-    : <AccountPasswordDialog username={username} role={role} home={home} onClose={onClose} onUpdated={onCredentialsUpdated} onTwoFactor={onTwoFactor} />;
+    ? <PreferencesDialog username={username} onClose={onClose} onUpdated={onCredentialsUpdated} onTwoFactor={onTwoFactor} onPasskeys={onPasskeys} />
+    : <AccountPasswordDialog username={username} role={role} home={home} onClose={onClose} onUpdated={onCredentialsUpdated} onTwoFactor={onTwoFactor} onPasskeys={onPasskeys} />;
   return <DetailsDialog entry={dialog.entry} onClose={onClose} />;
 }
 
@@ -3311,6 +3334,152 @@ function TwoFactorSummary({ onOpen }: { onOpen: () => void }) {
   return <div className="settings-section"><div className="settings-section-title"><span><Smartphone size={16} /></span><div><strong>Two-factor sign-in</strong><small>{status === null ? "Checking…" : status.enabled ? `On · ${status.recoveryCodesLeft} recovery ${status.recoveryCodesLeft === 1 ? "code" : "codes"} left` : "Off · ask for a code from an authenticator app as well as your password"}</small></div><button type="button" className="button secondary" onClick={onOpen}>{status?.enabled ? "Manage" : "Set up"}</button></div></div>;
 }
 
+type PasskeySummaryItem = { id: string; name: string; rpId: string; backedUp: boolean; createdAt: string; lastUsedAt: string | null };
+
+// Passkeys need a browser that supports them, on HTTPS (or localhost).
+const noSubscription = () => () => undefined;
+function usePasskeySupport() {
+  return useSyncExternalStore(noSubscription, () => window.isSecureContext && browserSupportsWebAuthn(), () => false);
+}
+
+function passkeyError(caught: unknown) {
+  const typed = caught as Error & { code?: string };
+  if (typed?.name === "NotAllowedError" || typed?.name === "AbortError" || typed?.code === "ERROR_CEREMONY_ABORTED") return "The passkey request was cancelled or timed out.";
+  if (typed?.code === "ERROR_AUTHENTICATOR_PREVIOUSLY_REGISTERED") return "This device already has a passkey for your account.";
+  return typed?.message || "Something went wrong with the passkey.";
+}
+
+function guessPasskeyName() {
+  const agent = navigator.userAgent;
+  if (/iPhone/.test(agent)) return "iPhone";
+  if (/iPad/.test(agent)) return "iPad";
+  if (/Android/.test(agent)) return "Android phone";
+  if (/Macintosh/.test(agent)) return "Mac";
+  if (/Windows/.test(agent)) return "Windows PC";
+  if (/Linux/.test(agent)) return "Linux computer";
+  return "Passkey";
+}
+
+// Opens the passkeys dialog from an account dialog; it shows how many passkeys the account has.
+function PasskeySummary({ onOpen }: { onOpen: () => void }) {
+  const [count, setCount] = useState<number | null>(null);
+  useEffect(() => {
+    const controller = new AbortController();
+    requestJson<{ passkeys: PasskeySummaryItem[] }>("/api/auth/passkeys", { signal: controller.signal }).then((result) => setCount(result.passkeys.length)).catch(() => undefined);
+    return () => controller.abort();
+  }, []);
+  return <div className="settings-section"><div className="settings-section-title"><span><Fingerprint size={16} /></span><div><strong>Passkeys</strong><small>{count === null ? "Checking…" : count ? `${count} ${count === 1 ? "passkey" : "passkeys"} · sign in with your fingerprint, face, or device PIN` : "None · sign in with your fingerprint, face, or device PIN instead of a password"}</small></div><button type="button" className="button secondary" onClick={onOpen}>{count ? "Manage" : "Add"}</button></div></div>;
+}
+
+function PasskeysDialog({ onClose, notify }: { onClose: () => void; notify: (message: string, tone?: "error") => void }) {
+  const supported = usePasskeySupport();
+  const [passkeys, setPasskeys] = useState<PasskeySummaryItem[] | null>(null);
+  const [twoFactor, setTwoFactor] = useState(false);
+  const [adding, setAdding] = useState(false);
+  const [name, setName] = useState("");
+  const [password, setPassword] = useState("");
+  const [code, setCode] = useState("");
+  const [renaming, setRenaming] = useState<{ id: string; name: string } | null>(null);
+  const [removing, setRemoving] = useState<string | null>(null);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      const [list, status] = await Promise.all([requestJson<{ passkeys: PasskeySummaryItem[] }>("/api/auth/passkeys"), requestJson<TwoFactorStatus>("/api/auth/two-factor")]);
+      setPasskeys(list.passkeys);
+      setTwoFactor(status.enabled);
+    } catch (caught) {
+      setError((caught as Error).message);
+    }
+  }, []);
+  useEffect(() => {
+    const timer = window.setTimeout(() => void load(), 0);
+    return () => window.clearTimeout(timer);
+  }, [load]);
+
+  const post = <T,>(body: Record<string, unknown>) => requestJson<T>("/api/auth/passkeys", { method: "POST", body: JSON.stringify(body) });
+  const run = async (work: () => Promise<void>) => {
+    setBusy(true);
+    setError("");
+    try {
+      await work();
+    } catch (caught) {
+      setError(passkeyError(caught));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const startAdding = () => {
+    setName(guessPasskeyName());
+    setPassword("");
+    setCode("");
+    setError("");
+    setAdding(true);
+  };
+  const add = (event: FormEvent) => {
+    event.preventDefault();
+    void run(async () => {
+      const { options } = await post<{ options: PublicKeyCredentialCreationOptionsJSON }>({ action: "options", currentPassword: password, code: twoFactor ? code : undefined });
+      setPassword("");
+      setCode("");
+      const response = await startRegistration({ optionsJSON: options });
+      const result = await post<{ passkeys: PasskeySummaryItem[] }>({ action: "register", response, name });
+      setPasskeys(result.passkeys);
+      setAdding(false);
+      notify("Passkey added");
+    });
+  };
+  const rename = (event: FormEvent) => {
+    event.preventDefault();
+    if (!renaming) return;
+    void run(async () => {
+      const result = await post<{ passkeys: PasskeySummaryItem[] }>({ action: "rename", id: renaming.id, name: renaming.name });
+      setPasskeys(result.passkeys);
+      setRenaming(null);
+    });
+  };
+  const remove = (id: string) => void run(async () => {
+    const result = await post<{ passkeys: PasskeySummaryItem[] }>({ action: "remove", id });
+    setPasskeys(result.passkeys);
+    setRemoving(null);
+    notify("Passkey removed");
+  });
+
+  const here = typeof window === "undefined" ? "" : window.location.hostname;
+  const errorBox = error && <div className="form-error"><CircleAlert size={16} />{error}</div>;
+  let body: ReactNode;
+  if (adding) {
+    body = <form className="preferences-form" onSubmit={add}>
+      <p className="muted">Your browser will ask you to create a passkey with your fingerprint, face, device PIN, or a security key. It works only at {here}.</p>
+      <FormField label="Name"><input value={name} onChange={(event) => setName(event.target.value)} maxLength={64} placeholder="MacBook" /></FormField>
+      <FormField label="Current password"><input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" required autoFocus /></FormField>
+      {twoFactor && <FormField label="Code from your authenticator app"><input value={code} onChange={(event) => setCode(event.target.value)} autoComplete="one-time-code" inputMode="text" maxLength={16} placeholder="123456" required /></FormField>}
+      {errorBox}
+      <div className="modal-actions"><button type="button" className="button secondary" onClick={() => { setAdding(false); setError(""); }}>Back</button><button className="button primary" disabled={busy}>{busy ? <LoaderCircle className="spin" size={16} /> : <Fingerprint size={16} />}Create passkey</button></div>
+    </form>;
+  } else if (!passkeys) {
+    body = errorBox || <div className="ownership-loading"><LoaderCircle className="spin" size={18} /> Loading…</div>;
+  } else {
+    body = <div className="preferences-form">
+      {passkeys.length === 0 ? <p className="muted">No passkeys yet. A passkey signs you in with your fingerprint, face, or device PIN, without typing a password or a two-factor code. Your password keeps working too.</p>
+        : <ul className="passkey-list">{passkeys.map((passkey) => <li key={passkey.id}>
+          <span className="passkey-icon"><Fingerprint size={16} /></span>
+          {renaming?.id === passkey.id
+            ? <form className="passkey-rename" onSubmit={rename}><input value={renaming.name} onChange={(event) => setRenaming({ id: passkey.id, name: event.target.value })} maxLength={64} aria-label="Passkey name" autoFocus /><button className="button primary" disabled={busy}>Save</button><button type="button" className="button secondary" onClick={() => setRenaming(null)}>Cancel</button></form>
+            : <div className="passkey-details"><strong>{passkey.name}{passkey.backedUp && <span className="two-factor-badge">Synced</span>}</strong><small>Added {formatDateTime(passkey.createdAt)} · {passkey.lastUsedAt ? `last used ${formatDateTime(passkey.lastUsedAt)}` : "not used yet"}{passkey.rpId !== here && ` · for ${passkey.rpId}`}</small></div>}
+          {renaming?.id !== passkey.id && (removing === passkey.id
+            ? <div className="passkey-actions"><button type="button" className="button danger" disabled={busy} onClick={() => remove(passkey.id)}>Remove</button><button type="button" className="button secondary" onClick={() => setRemoving(null)}>Keep</button></div>
+            : <div className="passkey-actions"><button type="button" className="icon-button" aria-label={`Rename ${passkey.name}`} title="Rename" onClick={() => { setRemoving(null); setRenaming({ id: passkey.id, name: passkey.name }); }}><Pencil size={15} /></button><button type="button" className="icon-button" aria-label={`Remove ${passkey.name}`} title="Remove" onClick={() => { setRenaming(null); setRemoving(passkey.id); }}><Trash2 size={15} /></button></div>)}
+        </li>)}</ul>}
+      {!supported && <div className="info-box"><Info size={17} /> To add a passkey, open FilesDude at its HTTPS address in a browser that supports passkeys.</div>}
+      {errorBox}
+      <div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Close</button><button type="button" className="button primary" disabled={!supported} onClick={startAdding}><Plus size={16} />Add a passkey</button></div>
+    </div>;
+  }
+  return <Modal title="Passkeys" subtitle="Sign in with your fingerprint, face, or device PIN" icon={<Fingerprint size={19} />} onClose={onClose}>{body}</Modal>;
+}
+
 function TwoFactorDialog({ onClose, notify }: { onClose: () => void; notify: (message: string, tone?: "error") => void }) {
   const [status, setStatus] = useState<TwoFactorStatus | null>(null);
   const [step, setStep] = useState<"overview" | "scan" | "codes">("overview");
@@ -3416,7 +3585,7 @@ function TwoFactorDialog({ onClose, notify }: { onClose: () => void; notify: (me
   return <Modal title="Two-factor sign-in" subtitle="A code from your phone as well as your password" icon={<Smartphone size={19} />} onClose={onClose}>{body}</Modal>;
 }
 
-function PreferencesDialog({ username: initialUsername, onClose, onUpdated, onTwoFactor }: { username: string; onClose: () => void; onUpdated: () => Promise<void>; onTwoFactor: () => void }) {
+function PreferencesDialog({ username: initialUsername, onClose, onUpdated, onTwoFactor, onPasskeys }: { username: string; onClose: () => void; onUpdated: () => Promise<void>; onTwoFactor: () => void; onPasskeys: () => void }) {
   const [username, setUsername] = useState(initialUsername);
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
@@ -3484,10 +3653,10 @@ function PreferencesDialog({ username: initialUsername, onClose, onUpdated, onTw
     }
   };
 
-  return <Modal title="Preferences" subtitle="Account, sign-in security, and upload defaults" icon={<Settings2 size={19} />} onClose={onClose}><form className="preferences-form" onSubmit={submit}><div className="preferences-intro"><div className="avatar large-avatar">{initialUsername.slice(0, 1).toUpperCase()}</div><div><strong>Administrator account</strong><span>Account changes invalidate other signed-in sessions.</span></div></div><div className="settings-section"><div className="settings-section-title"><span><Upload size={16} /></span><div><strong>Default upload ownership</strong><small>This choice is preselected for confirmation before every upload</small></div></div><FormField label="Default owner and group"><select value={uploadMode} onChange={(event) => setUploadMode(event.target.value as UploadOwnershipPreference["mode"])} disabled={!loaded}><option value="destination">Match the destination folder</option><option value="service">Keep FilesDude service ownership</option><option value="fixed">Use a fixed owner and group</option></select></FormField>{uploadMode === "fixed" && <div className="field-pair preference-identity-pair"><FormField label="Owner"><select value={fixedUid} onChange={(event) => setFixedUid(event.target.value)} required>{!users.some((user) => String(user.id) === fixedUid) && <option value={fixedUid}>UID {fixedUid}</option>}{users.map((user) => <option key={user.id} value={user.id}>{user.name} ({user.id})</option>)}</select></FormField><FormField label="Group"><select value={fixedGid} onChange={(event) => setFixedGid(event.target.value)} required>{!groups.some((group) => String(group.id) === fixedGid) && <option value={fixedGid}>GID {fixedGid}</option>}{groups.map((group) => <option key={group.id} value={group.id}>{group.name} ({group.id})</option>)}</select></FormField></div>}<div className="info-box"><Info size={17} /> FilesDude still shows the detected owner/group choices each time, so unusual folders can be handled safely.</div></div><div className="settings-section"><div className="settings-section-title"><span><Trash2 size={16} /></span><div><strong>Trash</strong><small>How long deleted items can be restored before they are removed for good</small></div></div><FormField label="Keep deleted items" hint={retentionDays ? `Items deleted more than ${retentionDays} ${retentionDays === 1 ? "day" : "days"} ago are removed automatically, for every account` : "Items stay until someone restores them, deletes them forever, or empties the trash"}><select value={retentionDays ?? ""} onChange={(event) => setRetentionDays(event.target.value ? Number(event.target.value) : null)} disabled={!loaded}><option value="">Until removed by hand</option>{retentionDays !== null && !RETENTION_CHOICES.includes(retentionDays) && <option value={retentionDays}>{retentionDays} days</option>}{RETENTION_CHOICES.map((days) => <option key={days} value={days}>{days === 365 ? "1 year" : `${days} days`}</option>)}</select></FormField></div><div className="settings-section"><div className="settings-section-title"><span><UserRoundCog size={16} /></span><div><strong>Username</strong><small>Used on the FilesDude sign-in screen</small></div></div><FormField label="Username"><input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" minLength={3} maxLength={64} pattern="[A-Za-z0-9._-]+" required /></FormField></div><div className="settings-section"><div className="settings-section-title"><span><LockKeyhole size={16} /></span><div><strong>Password</strong><small>Only required when changing the username or password</small></div></div><FormField label="Current password" hint={credentialsChanged ? "Required to save account changes" : "Not needed for upload preferences"}><div className="password-field"><input type={showPasswords ? "text" : "password"} value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} autoComplete="current-password" required={credentialsChanged} /><LockKeyhole size={15} /></div></FormField><div className="field-pair preferences-passwords"><FormField label="New password"><input type={showPasswords ? "text" : "password"} value={newPassword} onChange={(event) => setNewPassword(event.target.value)} autoComplete="new-password" minLength={newPassword ? 12 : undefined} placeholder="At least 12 characters" /></FormField><FormField label="Confirm new password"><input type={showPasswords ? "text" : "password"} value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} autoComplete="new-password" placeholder="Repeat new password" /></FormField></div><label className="show-passwords"><input type="checkbox" checked={showPasswords} onChange={(event) => setShowPasswords(event.target.checked)} />{showPasswords ? <EyeOff size={15} /> : <Eye size={15} />} Show passwords</label></div><TwoFactorSummary onOpen={onTwoFactor} />{error && <div className="form-error"><CircleAlert size={16} />{error}</div>}<div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy || !loaded}>{busy ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}Save preferences</button></div></form></Modal>;
+  return <Modal title="Preferences" subtitle="Account, sign-in security, and upload defaults" icon={<Settings2 size={19} />} onClose={onClose}><form className="preferences-form" onSubmit={submit}><div className="preferences-intro"><div className="avatar large-avatar">{initialUsername.slice(0, 1).toUpperCase()}</div><div><strong>Administrator account</strong><span>Account changes invalidate other signed-in sessions.</span></div></div><div className="settings-section"><div className="settings-section-title"><span><Upload size={16} /></span><div><strong>Default upload ownership</strong><small>This choice is preselected for confirmation before every upload</small></div></div><FormField label="Default owner and group"><select value={uploadMode} onChange={(event) => setUploadMode(event.target.value as UploadOwnershipPreference["mode"])} disabled={!loaded}><option value="destination">Match the destination folder</option><option value="service">Keep FilesDude service ownership</option><option value="fixed">Use a fixed owner and group</option></select></FormField>{uploadMode === "fixed" && <div className="field-pair preference-identity-pair"><FormField label="Owner"><select value={fixedUid} onChange={(event) => setFixedUid(event.target.value)} required>{!users.some((user) => String(user.id) === fixedUid) && <option value={fixedUid}>UID {fixedUid}</option>}{users.map((user) => <option key={user.id} value={user.id}>{user.name} ({user.id})</option>)}</select></FormField><FormField label="Group"><select value={fixedGid} onChange={(event) => setFixedGid(event.target.value)} required>{!groups.some((group) => String(group.id) === fixedGid) && <option value={fixedGid}>GID {fixedGid}</option>}{groups.map((group) => <option key={group.id} value={group.id}>{group.name} ({group.id})</option>)}</select></FormField></div>}<div className="info-box"><Info size={17} /> FilesDude still shows the detected owner/group choices each time, so unusual folders can be handled safely.</div></div><div className="settings-section"><div className="settings-section-title"><span><Trash2 size={16} /></span><div><strong>Trash</strong><small>How long deleted items can be restored before they are removed for good</small></div></div><FormField label="Keep deleted items" hint={retentionDays ? `Items deleted more than ${retentionDays} ${retentionDays === 1 ? "day" : "days"} ago are removed automatically, for every account` : "Items stay until someone restores them, deletes them forever, or empties the trash"}><select value={retentionDays ?? ""} onChange={(event) => setRetentionDays(event.target.value ? Number(event.target.value) : null)} disabled={!loaded}><option value="">Until removed by hand</option>{retentionDays !== null && !RETENTION_CHOICES.includes(retentionDays) && <option value={retentionDays}>{retentionDays} days</option>}{RETENTION_CHOICES.map((days) => <option key={days} value={days}>{days === 365 ? "1 year" : `${days} days`}</option>)}</select></FormField></div><div className="settings-section"><div className="settings-section-title"><span><UserRoundCog size={16} /></span><div><strong>Username</strong><small>Used on the FilesDude sign-in screen</small></div></div><FormField label="Username"><input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" minLength={3} maxLength={64} pattern="[A-Za-z0-9._-]+" required /></FormField></div><div className="settings-section"><div className="settings-section-title"><span><LockKeyhole size={16} /></span><div><strong>Password</strong><small>Only required when changing the username or password</small></div></div><FormField label="Current password" hint={credentialsChanged ? "Required to save account changes" : "Not needed for upload preferences"}><div className="password-field"><input type={showPasswords ? "text" : "password"} value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} autoComplete="current-password" required={credentialsChanged} /><LockKeyhole size={15} /></div></FormField><div className="field-pair preferences-passwords"><FormField label="New password"><input type={showPasswords ? "text" : "password"} value={newPassword} onChange={(event) => setNewPassword(event.target.value)} autoComplete="new-password" minLength={newPassword ? 12 : undefined} placeholder="At least 12 characters" /></FormField><FormField label="Confirm new password"><input type={showPasswords ? "text" : "password"} value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} autoComplete="new-password" placeholder="Repeat new password" /></FormField></div><label className="show-passwords"><input type="checkbox" checked={showPasswords} onChange={(event) => setShowPasswords(event.target.checked)} />{showPasswords ? <EyeOff size={15} /> : <Eye size={15} />} Show passwords</label></div><TwoFactorSummary onOpen={onTwoFactor} /><PasskeySummary onOpen={onPasskeys} />{error && <div className="form-error"><CircleAlert size={16} />{error}</div>}<div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy || !loaded}>{busy ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}Save preferences</button></div></form></Modal>;
 }
 
-function AccountPasswordDialog({ username, role, home, onClose, onUpdated, onTwoFactor }: { username: string; role: Role; home: string; onClose: () => void; onUpdated: () => Promise<void>; onTwoFactor: () => void }) {
+function AccountPasswordDialog({ username, role, home, onClose, onUpdated, onTwoFactor, onPasskeys }: { username: string; role: Role; home: string; onClose: () => void; onUpdated: () => Promise<void>; onTwoFactor: () => void; onPasskeys: () => void }) {
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
@@ -3510,7 +3679,7 @@ function AccountPasswordDialog({ username, role, home, onClose, onUpdated, onTwo
       setBusy(false);
     }
   };
-  return <Modal title="Your account" subtitle="Change your password" icon={<Settings2 size={19} />} onClose={onClose}><form className="preferences-form" onSubmit={submit}><div className="preferences-intro"><div className="avatar large-avatar">{username.slice(0, 1).toUpperCase()}</div><div><strong>{username} · {ROLE_LABELS[role]}</strong><span>{role === "viewer" ? "Can view and download" : "Can view and change"} files in {folderLabel(home)}. The owner manages your access.</span></div></div><FormField label="Current password"><input type="password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} autoComplete="current-password" required /></FormField><div className="field-pair preferences-passwords"><FormField label="New password"><input type="password" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} autoComplete="new-password" minLength={12} placeholder="At least 12 characters" required /></FormField><FormField label="Confirm new password"><input type="password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} autoComplete="new-password" required /></FormField></div><div className="info-box"><Info size={17} /> Changing your password signs you out on your other devices.</div><TwoFactorSummary onOpen={onTwoFactor} />{error && <div className="form-error"><CircleAlert size={16} />{error}</div>}<ModalActions onClose={onClose} submitLabel="Change password" busy={busy} /></form></Modal>;
+  return <Modal title="Your account" subtitle="Change your password" icon={<Settings2 size={19} />} onClose={onClose}><form className="preferences-form" onSubmit={submit}><div className="preferences-intro"><div className="avatar large-avatar">{username.slice(0, 1).toUpperCase()}</div><div><strong>{username} · {ROLE_LABELS[role]}</strong><span>{role === "viewer" ? "Can view and download" : "Can view and change"} files in {folderLabel(home)}. The owner manages your access.</span></div></div><FormField label="Current password"><input type="password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} autoComplete="current-password" required /></FormField><div className="field-pair preferences-passwords"><FormField label="New password"><input type="password" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} autoComplete="new-password" minLength={12} placeholder="At least 12 characters" required /></FormField><FormField label="Confirm new password"><input type="password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} autoComplete="new-password" required /></FormField></div><div className="info-box"><Info size={17} /> Changing your password signs you out on your other devices. Your passkeys keep working; remove any you don&apos;t recognise.</div><TwoFactorSummary onOpen={onTwoFactor} /><PasskeySummary onOpen={onPasskeys} />{error && <div className="form-error"><CircleAlert size={16} />{error}</div>}<ModalActions onClose={onClose} submitLabel="Change password" busy={busy} /></form></Modal>;
 }
 
 function UsersDialog({ onClose, notify }: { onClose: () => void; notify: (message: string, tone?: "error") => void }) {
@@ -3567,7 +3736,7 @@ function UsersDialog({ onClose, notify }: { onClose: () => void; notify: (messag
             <div key={user.id} className="user-row">
               <span className="avatar">{user.username.slice(0, 1).toUpperCase()}</span>
               <div><strong>{user.username}{user.twoFactor && <span className="two-factor-badge" title="Signs in with a code from an authenticator app"><Smartphone size={11} /> 2FA</span>}</strong><small>{ROLE_LABELS[user.role]} · {folderLabel(user.root)}</small></div>
-              {user.twoFactor && <button className="button secondary" disabled={busy} title="For a lost phone: they sign in with just their password and can set it up again" onClick={() => void send({ action: "resetTwoFactor", id: user.id }, `Two-factor sign-in reset for ${user.username}; they were signed out`)}><Smartphone size={14} /> Reset 2FA</button>}
+              {user.twoFactor && <button className="button secondary" disabled={busy} title="For a lost phone: they sign in with just their password and can set it up again; their passkeys are removed too" onClick={() => void send({ action: "resetTwoFactor", id: user.id }, `Two-factor sign-in reset for ${user.username}; they were signed out and their passkeys removed`)}><Smartphone size={14} /> Reset 2FA</button>}
               <button className="button secondary" disabled={busy} onClick={() => startEditing(user)}><Pencil size={14} /> Edit</button>
               <button className="button secondary danger-text" disabled={busy} onClick={() => { setEditing(null); setRemoving(user); }}><Trash2 size={14} /> Remove</button>
             </div>

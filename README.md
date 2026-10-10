@@ -34,6 +34,7 @@ FilesDude File Explorer is a secure, self-hosted web file manager designed for a
 - Signed, expiring, HTTP-only, SameSite login sessions; scrypt password hashes; login throttling; same-origin mutation checks; and hardened response headers
 - Account preferences for changing the username and password; credential changes invalidate other sessions
 - Optional two-factor sign-in for every account with an authenticator app (6-digit codes), with one-time recovery codes
+- Passkeys: sign in with a fingerprint, face, device PIN, or security key instead of a password, when FilesDude is opened over HTTPS
 - Duplicate finder (owner): scan a folder for files with identical contents, see which copies waste the most space, and move extra copies to the trash or replace them with hard links, always keeping one of each
 - ZFS snapshots: when the root is a ZFS dataset, browse earlier versions of files ("Previous versions" or **Snapshots**), download them, and restore them beside the current version; the owner can take snapshots or schedule them hourly or daily
 - Other servers (owner): connect to any machine you can SSH into over SFTP, then browse it, preview, download, upload, organise, and copy files and folders to and from FilesDude
@@ -92,7 +93,7 @@ sudo GITHUB_TOKEN="$(gh auth token)" filesdude-update
 ```
 
 To recover a forgotten login, generate a new bootstrap login and invalidate all
-sessions:
+sessions and passkeys:
 
 ```bash
 sudo filesdude-update --reset-credentials
@@ -212,8 +213,28 @@ you in once if you lose your phone; save them, as they aren't shown again.
   from `credentials.json` in the state directory as root (for example
   `/var/lib/filesdude/credentials.json`) and restart the service.
 
-Passkeys aren't offered because browsers only allow them over HTTPS, and FilesDude is
-often reached over plain HTTP on a LAN.
+## Passkeys
+
+When FilesDude is opened over HTTPS (for example through a Cloudflare Tunnel), any account
+can add passkeys and then choose **Sign in with a passkey** on the sign-in page, with no
+username or password. Open **Preferences** (or **Your account**), choose **Add** under
+Passkeys, confirm your password (and a two-factor code, if that is on), and follow your
+browser's prompt. Passwords keep working alongside them.
+
+- A passkey needs the device's fingerprint, face, PIN, or the security key's PIN, so it
+  counts as two factors on its own: signing in with one doesn't ask for a two-factor code.
+- Each passkey works only at the address it was added on (such as
+  `filesdude.example.com`); browsers don't offer passkeys over plain HTTP, except on
+  `localhost`, so the button doesn't appear on a LAN address like `http://192.168.0.2:3000`.
+- Only public keys are stored, in `passkeys.json` in the state directory; failed passkey
+  sign-ins count towards the same sign-in limit as passwords, and appear in Activity.
+- Rename or remove passkeys from the same place; removing one needs only your session.
+- Changing your own password keeps your passkeys; if you change it because it may have
+  been exposed, also check the list and remove any you don't recognise (renames and
+  removals appear in Activity).
+- When the owner resets another account's password or two-factor sign-in, or removes the
+  account, its passkeys are removed too. `filesdude-update --reset-credentials` removes
+  every passkey, or delete `passkeys.json` as root and restart.
 
 ## Share links
 
@@ -449,10 +470,10 @@ Shortcuts are ignored while you are typing in a field such as search.
 
 The safest default set is already included. These are strong next additions when you need them:
 
-- OIDC single sign-on, and passkeys for installations served over HTTPS
+- OIDC single sign-on
 - An index for searching file contents on very large trees
 - Antivirus scanning and upload quarantine for environments with untrusted uploaders
-- SFTP/SMB/NFS connection profiles for managing remote roots without mounting them into the app container
+- SMB/NFS connection profiles, alongside SFTP servers, for managing remote roots without mounting them into the app container
 
 ## Development checks
 
