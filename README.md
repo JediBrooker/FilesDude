@@ -262,7 +262,8 @@ The owner's **Activity** view (in the sidebar) reads the audit log, `audit.jsonl
 state directory, newest first: sign-ins (and failed attempts, with the address), uploads,
 downloads, changes, shares and their downloads, account changes, and snapshots. Filter by
 kind, by account (including share links and FilesDude's own upkeep), or by any text such as
-a file name or address, and load older entries as you scroll back. Looking at an item's
+a file name or address, and load older entries as you scroll back. Uploads show as one entry with their totals (every file is still recorded on its own).
+Looking at an item's
 Properties is logged but not shown. Names, paths, and addresses that came from users are
 shown set apart, with invisible or direction-changing characters spelled out, so a crafted
 file name can't read as part of the sentence around it.

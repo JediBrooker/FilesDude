@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { readActivity } from "../lib/activity";
-import { activityCategory, activityUser, describeActivity, SHARE_LINK_ACTOR, SYSTEM_ACTOR, visibleText } from "../lib/activity-text";
+import { activityCategory, activityUser, describeActivity, groupUploads, SHARE_LINK_ACTOR, SYSTEM_ACTOR, visibleText } from "../lib/activity-text";
 import { audit, isAuditArchive, MAX_AUDIT_BYTES } from "../lib/audit";
 import { config } from "../lib/config";
 
@@ -187,6 +187,23 @@ test("long lists and text are shortened, and malformed lines are skipped", async
     assert.ok((entries[0].note as string).length < 600);
     assert.deepEqual(await readActivity({}, null), { entries, cursor: null });
   });
+});
+
+test("each upload shows as one entry with its totals, every file still recorded", () => {
+  const at = "2026-10-10T00:00:00.000Z";
+  const entries = [
+    { at, event: "fs.upload", username: "bob", directory: "Docs/Holiday/day2", files: ["Docs/Holiday/day2/c.jpg"], bytes: 300, batch: "batch-one-1" },
+    { at, event: "login.succeeded", username: "alice" },
+    { at, event: "fs.upload", username: "bob", directory: "Docs/Holiday/day1", files: ["Docs/Holiday/day1/a.jpg", "Docs/Holiday/day1/b.jpg"], bytes: 700, batch: "batch-one-1" },
+    { at, event: "fs.create", username: "bob", path: "Docs", name: "Holiday", upload: true, batch: "batch-one-1" },
+    { at, event: "fs.upload", username: "bob", directory: "Other", files: ["Other/x.txt"], bytes: 5 },
+  ];
+  const grouped = groupUploads(entries);
+  assert.deepEqual(grouped.map((entry) => entry.event), ["fs.upload", "login.succeeded", "fs.upload"]);
+  assert.equal(describeActivity(grouped[0]).text, "uploaded 3 files (1000 B) to /Docs, making 1 folder");
+  assert.equal(describeActivity(grouped[2]).text, "uploaded 1 file (5 B) to /Other");
+  // Another account's upload with the same id is kept apart.
+  assert.equal(groupUploads([...entries, { at, event: "fs.upload", username: "carol", directory: "C", files: ["C/y"], bytes: 1, batch: "batch-one-1" }]).length, 4);
 });
 
 test("events read as plain sentences", () => {

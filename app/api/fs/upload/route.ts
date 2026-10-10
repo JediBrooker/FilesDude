@@ -94,6 +94,10 @@ export async function POST(request: Request) {
     const url = new URL(request.url);
     const baseDirectory = url.searchParams.get("path") || "";
     const subfolders = folderNames(url.searchParams.get("folder"));
+    // The upload this request is part of (each file is its own request), so Activity can show the
+    // whole upload as one entry. Every file is still recorded on its own.
+    const batchValue = url.searchParams.get("batch");
+    const batch = batchValue && /^[A-Za-z0-9-]{8,64}$/.test(batchValue) ? batchValue : undefined;
     folder = await openDirectory(baseDirectory).catch((error: unknown) => {
       if (error instanceof AppError && error.code === "NOT_A_DIRECTORY") throw new AppError("Upload destination is not a folder", 400);
       throw error;
@@ -136,7 +140,7 @@ export async function POST(request: Request) {
       if (inherit && requestedOwnership) requestedOwnership = { uid: target.stat.uid, gid: target.stat.gid };
       // Every folder made is recorded now, under its actual name, even if the upload then fails.
       for (const made of ensured.made) {
-        await audit("fs.create", { username: session.username, path: made.split("/").slice(0, -1).join("/"), name: made.split("/").at(-1), upload: true });
+        await audit("fs.create", { username: session.username, path: made.split("/").slice(0, -1).join("/"), name: made.split("/").at(-1), upload: true, batch });
       }
       if (url.searchParams.get("createFolder") === "1") return NextResponse.json({ ok: true, folder: directory });
     } else if (url.searchParams.get("createFolder") === "1") {
@@ -237,7 +241,7 @@ export async function POST(request: Request) {
     }
     if (!fileCount) throw new AppError("Choose at least one file to upload");
 
-    await audit("fs.upload", { username: session.username, directory, files: uploaded, bytes: totalBytes, ownership: requestedOwnership || "service" });
+    await audit("fs.upload", { username: session.username, directory, files: uploaded, bytes: totalBytes, ownership: requestedOwnership || "service", batch });
     return NextResponse.json({ ok: true, uploaded, ownership: requestedOwnership || null });
     } finally {
       await target?.handle.close().catch(() => undefined);
