@@ -12,6 +12,10 @@ import { getCredentials } from "../lib/credentials";
 import { withFilesystemLock } from "../lib/files";
 import { looksLikeRasterImage, thumbnailFor } from "../lib/thumbnails";
 import { GET as checksum } from "../app/api/fs/checksum/route";
+import { sandboxHelperForThisFile } from "./helpers/sandbox";
+
+// The real sandbox, where this host can have one, through a helper of the tests' own.
+sandboxHelperForThisFile();
 
 function scrypt(password: string, salt: Buffer) {
   return new Promise<Buffer>((resolve, reject) => {

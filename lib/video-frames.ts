@@ -16,7 +16,7 @@ export function setFrameRunner(replacement: FrameRunner | null | undefined) {
 
 async function sandboxedRunner(): Promise<FrameRunner | null> {
   if (process.env.FILEDUDE_VIDEO_THUMBNAILS === "false") return null;
-  const run = await sandboxRunner(process.env.FILEDUDE_FFMPEG_PATH || "/usr/bin/ffmpeg");
+  const run = await sandboxRunner("ffmpeg");
   if (!run) return null;
   return (fd, seconds) => run([
     "-nostdin", "-hide_banner", "-loglevel", "error", ...inputLimits(VIDEO_FORMATS),

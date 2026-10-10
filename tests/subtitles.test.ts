@@ -8,6 +8,10 @@ import test from "node:test";
 import { config } from "../lib/config";
 import { listSubtitles, plainVtt, setSubtitleRunners, srtToVtt, subtitleTrack } from "../lib/subtitles";
 import { runInScope } from "../lib/scope";
+import { realSandbox as sandboxHost, sandboxHelperForThisFile } from "./helpers/sandbox";
+
+// The real sandbox, where this host can have one, through a helper of the tests' own.
+sandboxHelperForThisFile();
 
 async function withRoot<T>(run: (root: string, state: string) => Promise<T>) {
   const base = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "filesdude-subs-")));
@@ -180,9 +184,9 @@ test("accounts only reach subtitles inside their own folder", async () => {
   });
 });
 
-const realSandbox = process.platform === "linux" && process.getuid?.() === 0 && existsSync("/usr/bin/ffmpeg") && existsSync("/usr/bin/ffprobe") && existsSync("/usr/bin/systemd-run");
+const realSandbox = sandboxHost && existsSync("/usr/bin/ffmpeg") && existsSync("/usr/bin/ffprobe");
 
-test("real embedded subtitles are extracted by ffmpeg in its sandbox", { skip: !realSandbox && "needs Linux, root, ffmpeg, and systemd" }, async () => {
+test("real embedded subtitles are extracted by ffmpeg in its sandbox", { skip: !realSandbox && "needs Linux, root, ffmpeg, systemd, and Python" }, async () => {
   await withRoot(async (root) => {
     setSubtitleRunners(undefined);
     await write(root, { "subs.srt": SRT });

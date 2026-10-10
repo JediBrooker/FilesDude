@@ -73,10 +73,31 @@ curl -fsSLo /tmp/filesdude-install.sh \
 sudo bash /tmp/filesdude-install.sh
 ```
 
-The installer asks for the folder FilesDude may manage, the initial username and
-password, and whether the service needs full root-level ownership management. It
-then installs a checksum-verified Node.js 22 runtime when necessary, builds an
+The installer asks for the folder FilesDude may manage and the initial username and
+password. It then installs a checksum-verified Node.js 22 runtime when necessary, builds an
 immutable release, writes a hardened systemd service, and starts FilesDude.
+
+FilesDude runs as its own `filesdude` account, not root. It holds just the file
+capabilities a file manager needs: changing owners, and reading and writing files
+whatever their permissions (FilesDude keeps its own accounts to their folders). The
+service only sees the system's programs and libraries, its release, its folder, and
+its state. Everything else is hidden or replaced with an empty folder: Proxmox's
+cluster configuration and keys, SSH host keys, password hashes, other storage, logs,
+and the sockets in `/run`. The one part that runs as root is a small helper,
+`filesdude-sandbox.service`. It is reached through a socket only FilesDude's account
+can use, and it does one job: start the media sandbox (below) for ffmpeg, ffprobe, or
+the image decoder, with its own fixed settings. Older installs that run as root can
+switch with `sudo filesdude-update --service-user filesdude`. That moves FilesDude's
+state to the new account; `--service-user root` switches back.
+
+To let only your reverse proxy or tunnel reach FilesDude's port, pass its address. Add
+any network interfaces that should also reach it, such as Tailscale's. The installer
+keeps a small nftables filter for this and remembers it across updates;
+`--allow-from any` removes it:
+
+```bash
+sudo filesdude-update --allow-from 192.168.0.3 --allow-interfaces tailscale0
+```
 
 The installer binds to `127.0.0.1:3000` by default. Put an HTTPS reverse proxy
 on the same host in front of it, or reach it through an SSH tunnel or VPN. To
@@ -130,9 +151,8 @@ From there you can:
 
 Before every upload, FilesDude shows the saved default alongside owner/group
 pairs detected from the destination folder and its existing contents. Applying
-ownership other than the service identity requires the systemd service to run
-as root; the installer offers this mode when full ownership administration is
-needed.
+ownership other than the service identity needs the ability to change owners,
+which the installed service has.
 
 ## Find and cull large files
 
@@ -206,7 +226,7 @@ can't hold up another, and an account's running jobs stop when it is changed or 
 File operations act through open folder handles rather than re-resolving paths, so a user
 who can also change the folder from inside the container can't redirect them elsewhere by
 swapping in a symlink. Copies keep each item's permissions (minus setuid/setgid) and, when
-running as root, its owner; FIFOs, sockets, and devices aren't copied. Changing an account's role,
+FilesDude can change owners (as installed), its owner; FIFOs, sockets, and devices aren't copied. Changing an account's role,
 folder, or password signs it out everywhere; accounts can change their own password from
 the account menu. Accounts are stored in `users.json` in the state directory.
 
@@ -310,7 +330,7 @@ name, and each file shows its progress as it uploads.
   request size limit doesn't apply. Each piece upload holds the link's room for its whole
   file until it finishes or is given up, ends if nothing arrives for 5 minutes or it runs
   past its deadline, and stops when the link is revoked.
-- When FilesDude runs as root, received files belong to the folder's owner.
+- When FilesDude can change owners (as installed), received files belong to the folder's owner.
 - Every file received is recorded in Activity, with the sender's address and the name
   they gave. **Shared links** shows how much each upload link has received.
 - Like download links, upload links follow the folder when it's renamed or moved, and
@@ -323,13 +343,13 @@ grid view, made by sharp, and their details (dimensions, format, colour, frames,
 camera and date taken from EXIF) under **Image** in Properties, read by sharp too. Decoders parse files other people control, anyone with an upload
 link included, so FilesDude never decodes images itself: a separate Node.js process does,
 handed the already-opened file (never its path) and returning only the thumbnail, or the
-details as a small JSON object that FilesDude checks field by field. When the
-service runs as root, that process runs in the same throwaway sandbox as ffmpeg (below),
-with Node.js and FilesDude's `node_modules` shown to it read-only, so it needs Linux,
-systemd, and those readable by other users (the installer sees to that); without the
-sandbox, a server running as root shows no image thumbnails or details rather than read
-images as root. Running as another account (a development machine, or `--service-user filesdude`),
-the process runs as that account with all of its access, so it only keeps a crash or
+details as a small JSON object that FilesDude checks field by field. Wherever the media
+sandbox helper is installed, that process runs in the same throwaway sandbox as ffmpeg
+(below). Node.js and FilesDude's `node_modules` are shown to it read-only, so they must be
+readable by other users; the installer sees to that. Without the helper, a service with
+privileges (root, or the installed account's file capabilities) shows no image thumbnails
+or details rather than decode images with those privileges. On a development machine, the
+process runs as your own account with all of its access, so it only keeps a crash or
 runaway decode from taking FilesDude down. Either way only the decoders for those formats
 are enabled, the process is stopped after 15 seconds, and two images are decoded at a
 time (details included). Next.js's built-in image optimizer, which would decode images inside FilesDude, is
@@ -338,14 +358,16 @@ turned off.
 ## Video thumbnails
 
 When the host has ffmpeg (`/usr/bin/ffmpeg`, or set `FILEDUDE_FFMPEG_PATH`) and the
-service runs as root under systemd, videos get thumbnails in grid view from a frame a few
+media sandbox helper (installed with FilesDude under systemd), videos get thumbnails in grid view from a frame a few
 seconds in. ffmpeg decodes files other users control, so it never runs inside FilesDude:
 each frame comes from a throwaway systemd unit running as a temporary unprivileged user,
 with no network, sockets, or capabilities, a system-call filter, memory, task, CPU, and
 time limits (15 seconds), and nothing of the filesystem but the system's programs and
 libraries: every other top-level folder is hidden, and `/etc` and `/run` are empty apart
 from what the dynamic linker needs. The video is passed in as the already-opened file,
-never by path, and ffmpeg may only read that file, as MP4/MOV, Matroska/WebM, or AVI, so a
+never by path. The helper, not FilesDude, decides which program runs and how it is
+sandboxed: FilesDude can only name ffmpeg, ffprobe, or the image decoder, and pass
+arguments. ffmpeg may only read that file, as MP4/MOV, Matroska/WebM, or AVI, so a
 crafted file can't make it open playlists, other files, or URLs. One video is worked on at
 a time, separately from images, the frame is resized like an image (above), and a video no frame could be taken from isn't tried
 again for six hours unless it changes. Set `FILEDUDE_VIDEO_THUMBNAILS=false` to turn this
@@ -520,14 +542,14 @@ When `FILEDUDE_ROOT` is on a ZFS dataset (such as a Proxmox container's
 each item's menu. FilesDude finds the dataset itself; set `FILEDUDE_ZFS_PATH` if the `zfs`
 command isn't in `/usr/sbin`, `/sbin`, or `/usr/local/sbin`.
 
-The installer sets this up when the service runs as root over a ZFS folder: it binds
-`/dev/zfs` into the service's otherwise private `/dev`, and delegates only the ZFS
-permissions snapshots need on that dataset (`zfs allow -u root snapshot,destroy,mount
+The installer sets this up over a ZFS folder: it binds `/dev/zfs` into the service's
+otherwise private `/dev`, and delegates only the ZFS permissions snapshots need on that
+dataset to the service's account (`zfs allow -u filesdude snapshot,destroy,mount
 <dataset>`) rather than giving the service `CAP_SYS_ADMIN`. ZFS can't limit `destroy` to
 snapshots, so the service could also destroy the dataset itself; it can already delete
 every file in it. If snapshots don't appear, check `journalctl -u filesdude` for a
 "zfs list failed" warning. To withdraw the access, run
-`zfs unallow -u root snapshot,destroy,mount <dataset>`.
+`zfs unallow -u filesdude snapshot,destroy,mount <dataset>`.
 
 - **Who can see them:** only the owner, until the owner shares snapshots with editors or
   with everyone (**Who can see snapshots** in the Snapshots dialog). Shared accounts see
@@ -621,8 +643,8 @@ The container runs as UID/GID `1001:1001` by default. Give that account access t
 - Behind a reverse proxy or tunnel (such as a Cloudflare Tunnel's `cloudflared`), set `FILEDUDE_TRUSTED_PROXIES` in `/etc/filesdude/filesdude.env` to its address, for example `FILEDUDE_TRUSTED_PROXIES=192.168.0.3`, and restart. Only connections that really come from that address (FilesDude checks the connection itself, not a header) have their client address (Cloudflare's `CF-Connecting-IP`, or `X-Forwarded-For`) and HTTPS believed, so sign-in limits apply per real visitor, Activity shows real addresses, and session cookies are marked secure. Anyone else is taken as their own address, whatever headers they send. `FILEDUDE_TRUST_PROXY=true` (believing every connection is a proxy) remains only for setups where FilesDude can't be reached except through one.
 - Back up the underlying data independently. Protected trash helps with mistakes but is not a backup.
 - Keep Proxmox, the container image, and reverse proxy patched. `filesdude-update --reset-credentials` signs everyone out; rotating the session secret also does, and ends every share link.
-- Behind a tunnel, consider letting only the tunnel reach FilesDude's port (a firewall rule allowing it from the tunnel's address alone), so nobody on the LAN signs in over plain HTTP.
-- When the service runs as root (as it must for the media sandbox and ownership changes), anyone who could run code inside FilesDude could act as root on the host: keep it patched, and run updates only from the repository you trust.
+- Behind a tunnel, let only the tunnel reach FilesDude's port (`--allow-from`, above), so nobody on the LAN signs in over plain HTTP.
+- FilesDude's account can read and change every file the host shows it, its folder included. Anyone who could run code inside FilesDude could do the same, but couldn't read the host's secrets or act as root. Keep it patched, and run updates only from the repository you trust: the updater itself runs as root.
 
 ## Useful keyboard shortcuts
 

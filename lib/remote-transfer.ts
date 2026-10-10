@@ -13,6 +13,7 @@ import { AppError } from "./http";
 import { startJob } from "./jobs";
 import { abortSession, availableRemoteName, readDirectory, remotePath, removeRemoteTree, sftpCall as call, statRemote, withSftp, writeRemote } from "./sftp";
 import type { JobProgress, TransferResult } from "./types";
+import { canChangeOwnership } from "./privileges";
 
 // Copies between FilesDude and the owner's other servers, as background jobs with progress and
 // cancel. A folder from a server is copied into a hidden placeholder that only this service can open
@@ -34,7 +35,6 @@ export function setStallTimeout(milliseconds?: number) {
   STALL_MS = milliseconds ?? 60_000;
 }
 const ON_LINUX = process.platform === "linux";
-const runningAsRoot = () => typeof process.getuid === "function" && process.getuid() === 0;
 
 type Local = { base: string; real: string };
 const cancelled = () => new AppError("The copy was cancelled", 409, "JOB_CANCELLED");
@@ -175,7 +175,7 @@ async function measureRemote(sftp: SFTPWrapper, absolutes: string[], track: Trac
 async function copyFromServer(id: string, paths: string[], destination: string, report: (progress: JobProgress) => void, jobSignal: AbortSignal): Promise<TransferResult[]> {
   const target = await withFilesystemLock(() => openDirectory(destination));
   // New items take the owner of the folder they're copied into, as other new items do.
-  const owner = runningAsRoot() ? { uid: target.stat.uid, gid: target.stat.gid } : null;
+  const owner = canChangeOwnership() ? { uid: target.stat.uid, gid: target.stat.gid } : null;
   const into: Local = { base: target.base, real: target.real };
   const results: TransferResult[] = [];
   const track = tracker(id, report, jobSignal);

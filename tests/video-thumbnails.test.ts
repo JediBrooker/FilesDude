@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, readSync } from "node:fs";
+import { existsSync, readdirSync, readSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -8,8 +8,11 @@ import test from "node:test";
 import sharp from "sharp";
 import { config } from "../lib/config";
 import { thumbnailFor } from "../lib/thumbnails";
-import { hiddenPaths } from "../lib/media-sandbox";
 import { setFrameRunner, videoThumbnailsAvailable } from "../lib/video-frames";
+import { HELPER, helperEnvironment, realSandbox as sandboxHost, sandboxHelperForThisFile } from "./helpers/sandbox";
+
+// The real sandbox, where this host can have one, through a helper of the tests' own.
+sandboxHelperForThisFile();
 
 async function withRoot<T>(run: (root: string) => Promise<T>) {
   const base = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "filesdude-video-")));
@@ -115,10 +118,14 @@ test("one video is worked on at a time, and videos never hold up images", async 
   });
 });
 
-test("the sandbox hides every top-level folder except the system's own", () => {
-  const entry = (name: string, link = false) => ({ name, isSymbolicLink: () => link }) as unknown as import("node:fs").Dirent;
-  const hidden = hiddenPaths([entry("usr"), entry("bin", true), entry("lib64", true), entry("etc"), entry("run"), entry("proc"), entry("dev"), entry("tmp"), entry("data"), entry("var"), entry("home"), entry("backup"), entry("sys"), entry("mylink", true)]);
-  assert.deepEqual(hidden, ["/data", "/var", "/home", "/backup", "/sys"]);
+test("the sandbox hides every top-level folder except the system's own, and FilesDude's folders", () => {
+  const env = { ...helperEnvironment(), FILEDUDE_ROOT: "/srv/my files", FILEDUDE_STATE_DIR: "/opt/state" };
+  const args = JSON.parse(execFileSync("python3", [HELPER, "--print-args", JSON.stringify({ tool: "ffmpeg", args: [] })], { env }).toString()) as string[];
+  const hidden = args.find((arg) => arg.startsWith("InaccessiblePaths="))!;
+  const kept = new Set(["usr", "bin", "sbin", "lib", "lib32", "lib64", "libx32", "proc", "dev", "tmp", "etc", "run"]);
+  const expected = readdirSync("/", { withFileTypes: true }).filter((entry) => !entry.isSymbolicLink() && !kept.has(entry.name)).map((entry) => `-/${entry.name}`).sort();
+  assert.equal(hidden, `InaccessiblePaths=${[...expected, "\"-/srv/my files\"", "-/opt/state"].join(" ")}`);
+  assert.ok(!["-/usr", "-/proc", "-/etc"].some((path) => hidden.split(" ").includes(path)));
 });
 
 test("without a sandbox to run ffmpeg in, videos have no thumbnails", async () => {
@@ -134,9 +141,9 @@ test("without a sandbox to run ffmpeg in, videos have no thumbnails", async () =
 });
 
 // On a Linux host with ffmpeg and systemd, as root (like the deployed service): the real sandbox.
-const realSandbox = process.platform === "linux" && process.getuid?.() === 0 && existsSync("/usr/bin/ffmpeg") && existsSync("/usr/bin/systemd-run");
+const realSandbox = sandboxHost && existsSync("/usr/bin/ffmpeg");
 
-test("a real video gets a thumbnail from ffmpeg in its sandbox", { skip: !realSandbox && "needs Linux, root, ffmpeg, and systemd" }, async () => {
+test("a real video gets a thumbnail from ffmpeg in its sandbox", { skip: !realSandbox && "needs Linux, root, ffmpeg, systemd, and Python" }, async () => {
   await withRoot(async (root) => {
     setFrameRunner(undefined);
     assert.equal(await videoThumbnailsAvailable(), true);

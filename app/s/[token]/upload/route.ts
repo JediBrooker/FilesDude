@@ -13,6 +13,7 @@ import { bytesInProgress, isUnlocked, isUploadShare, openUploadFolder, reserveUp
 import { accountBytesStillComing } from "@/lib/chunked-uploads";
 import { claimLinkSlot } from "@/lib/link-slots";
 import { publicName, reservePublicTarget } from "@/lib/upload-target";
+import { canChangeOwnership } from "@/lib/privileges";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -127,8 +128,8 @@ async function receiveFile(request: Request, share: UploadShare, declared: numbe
           },
         });
         try {
-          // When running as root, a stranger's file belongs to the folder's owner, like other new items.
-          if (typeof process.getuid === "function" && process.getuid() === 0) await target.handle.chown(into.stat.uid, into.stat.gid);
+          // When FilesDude can change owners, a stranger's file belongs to the folder's owner, like other new items.
+          if (canChangeOwnership()) await target.handle.chown(into.stat.uid, into.stat.gid);
           stream.resume();
           await pipeline(stream, meter, target.handle.createWriteStream());
           if (truncated) throw new AppError("The file is larger than allowed", 413, "UPLOAD_TOO_LARGE");

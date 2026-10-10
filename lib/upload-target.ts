@@ -13,7 +13,7 @@ export async function applyOwnership(handle: FileHandle, ownership: { uid: numbe
     await handle.chown(ownership.uid, ownership.gid);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
-    if (code === "EPERM" || code === "EACCES") throw new AppError("FilesDude cannot apply that ownership. Run the service as root or choose service ownership.", 403, "CHOWN_DENIED");
+    if (code === "EPERM" || code === "EACCES") throw new AppError("FilesDude cannot apply that ownership. Give the service the ability to change owners, or choose service ownership.", 403, "CHOWN_DENIED");
     throw error;
   }
 }

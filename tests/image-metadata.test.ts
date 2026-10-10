@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, readSync } from "node:fs";
+import { readSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -10,6 +10,10 @@ import { config } from "../lib/config";
 import { type MetadataJob, MAX_EXIF_BYTES, imageMetadataAvailable, readImageMetadata, setImageMetadataReader, setImageResizer } from "../lib/image-resize";
 import { mediaInfoFor, parseImageMetadata } from "../lib/media-info";
 import { thumbnailFor } from "../lib/thumbnails";
+import { realSandbox as sandboxHost, sandboxHelperForThisFile } from "./helpers/sandbox";
+
+// The real sandbox, where this host can have one, through a helper of the tests' own.
+sandboxHelperForThisFile();
 
 async function withRoot<T>(run: (root: string) => Promise<T>) {
   const base = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "filesdude-image-details-")));
@@ -233,9 +237,9 @@ test("the decoding process reads only the formats, amount, and pixels it is allo
 });
 
 // On a Linux host with systemd, as root (like the deployed service): the real sandbox.
-const realSandbox = process.platform === "linux" && process.getuid?.() === 0 && existsSync("/usr/bin/systemd-run");
+const realSandbox = sandboxHost;
 
-test("a real image's details are read in its sandbox", { skip: !realSandbox && "needs Linux, root, and systemd" }, async () => {
+test("a real image's details are read in its sandbox", { skip: !realSandbox && "needs Linux, root, systemd, and Python" }, async () => {
   await withRoot(async (root) => {
     setImageMetadataReader(undefined);
     assert.equal(await imageMetadataAvailable(), true);

@@ -23,6 +23,7 @@ function trashItemVisible(originalPath: string | null) {
   return originalPath !== null && withinScope(originalPath, scope.root);
 }
 import type { BulkRenameRule, DeleteResult, DiskInfo, EntryType, FileEntry, IdentityOption, JobProgress, LargestFilesResult, LargestFilesScanning, OwnershipPair, RenamePreview, TransferResult, TrashItem, TrashListing, TrashRestoreResult } from "./types";
+import { canChangeOwnership } from "./privileges";
 
 export const INTERNAL_NAMES = new Set([".filedude"]);
 const mimeTypes: Record<string, string> = {
@@ -184,7 +185,6 @@ export type AnchoredDirectory = { handle: FileHandle; base: string; real: string
 const ON_LINUX = process.platform === "linux";
 // Deeper trees are refused by delete and copy, which hold one handle per level.
 const MAX_TREE_DEPTH = 256;
-const runningAsRoot = () => typeof process.getuid === "function" && process.getuid() === 0;
 
 function openFailure(error: unknown): never {
   const code = (error as NodeJS.ErrnoException).code;
@@ -373,11 +373,11 @@ async function copyContents(input: FileHandle, output: FileHandle, context: Copy
   }
 }
 
-// Copies keep each item's permissions (without setuid/setgid) and, when the service runs as root,
+// Copies keep each item's permissions (without setuid/setgid) and, when FilesDude can change owners,
 // its owner, like `cp -a`. Attributes are applied through the new item's own handle, and a folder
 // is only used once it is confirmed to be the one this copy just made. Special files are refused.
 async function applyCopiedAttributes(handle: FileHandle, source: Stats) {
-  if (runningAsRoot()) await handle.chown(source.uid, source.gid);
+  if (canChangeOwnership()) await handle.chown(source.uid, source.gid);
   await handle.chmod(source.mode & 0o1777);
 }
 
@@ -640,7 +640,7 @@ export async function uploadOwnershipOptions(relativePath = "") {
     destination,
     detected,
     service: { ...(await namedOwnership(serviceUid, serviceGid)), source: "service" as const },
-    canChangeOwnership: typeof process.getuid === "function" && process.getuid() === 0,
+    canChangeOwnership: canChangeOwnership(),
     truncated: names.length > limit,
   };
 }
@@ -792,7 +792,7 @@ export const MAX_UPLOAD_FOLDER_DEPTH = 32;
  * open handle and never through a symlink, and checked against the account's folder and FilesDude's
  * reserved names. With `uniqueFirst`, the first folder is always new: "Photos (1)" if "Photos" is
  * taken (or is a link). New folders get `owner`, or with `inheritOwner` the owner of the folder each
- * is made in, as other new items do for confined accounts (when running as root). Returns the folder
+ * is made in, as other new items do for confined accounts (when FilesDude can change owners). Returns the folder
  * (which the caller closes) and the paths of the folders this call made.
  */
 export async function ensureFolders(base: AnchoredDirectory, baseRelative: string, names: string[], options: { owner?: { uid: number; gid: number } | null; inheritOwner?: boolean; uniqueFirst?: boolean } = {}) {
@@ -857,7 +857,7 @@ export async function ensureFolders(base: AnchoredDirectory, baseRelative: strin
       // Only a folder this call just made is given away: empty, with no subfolders, and born after
       // the mkdir (so an existing empty folder swapped in under the name isn't).
       const fresh = created && child.stat.nlink === 2 && (!child.stat.birthtimeMs || child.stat.birthtimeMs >= startedAt - 1_000);
-      if (fresh && owner && runningAsRoot() && (await isFreshFolder(child))) {
+      if (fresh && owner && canChangeOwnership() && (await isFreshFolder(child))) {
         await child.handle.chown(owner.uid, owner.gid);
         // Its new owner is what the next level inherits.
         child.stat = await child.handle.stat();
@@ -879,7 +879,7 @@ export async function createEntry(parentPath: string, name: string, type: "file"
     const location = inside(directory, entryName);
     // Confined accounts' new items take the folder's owner, as their uploads do.
     const scope = currentScope();
-    const owner = scope && scope.role !== "owner" && runningAsRoot() ? directory.stat : null;
+    const owner = scope && scope.role !== "owner" && canChangeOwnership() ? directory.stat : null;
     if (type === "directory") {
       await fs.mkdir(location);
       if (owner) {

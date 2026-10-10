@@ -3,6 +3,7 @@ import type { Session } from "./auth";
 import { ensureFolders, isAvailableUploadOwnership, MAX_UPLOAD_FOLDER_DEPTH, openDirectory, type AnchoredDirectory } from "./files";
 import { AppError } from "./http";
 import { getPreferences } from "./preferences";
+import { canChangeOwnership } from "./privileges";
 
 // The folder inside the destination a file goes into, when uploading a folder: "Photos/2024".
 function folderNames(raw: string | null) {
@@ -54,7 +55,7 @@ export async function openUploadDestination(url: URL, session: Session): Promise
       // Only the owner chooses ownership; other accounts' uploads take the destination folder's
       // owner, so files a root service writes stay usable by that folder's users.
       if (uidValue !== null || gidValue !== null) throw new AppError("Only the owner account can choose upload ownership", 403, "FORBIDDEN");
-      if (typeof process.getuid === "function" && process.getuid() === 0) ownership = { uid: folder.stat.uid, gid: folder.stat.gid };
+      if (canChangeOwnership()) ownership = { uid: folder.stat.uid, gid: folder.stat.gid };
     } else if (uidValue !== null && gidValue !== null) {
       const uid = Number(uidValue);
       const gid = Number(gidValue);
