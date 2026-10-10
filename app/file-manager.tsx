@@ -122,7 +122,7 @@ const ROLE_LABELS: Record<Role, string> = { owner: "Owner", editor: "Editor", vi
 type DialogState =
   // `folder` is where a file goes inside the destination when a folder is uploaded ("Photos/2024");
   // `folders` lists every folder in the upload, so empty ones are made too.
-  | { kind: "upload"; items: UploadItem[]; folders: string[] }
+  | { kind: "upload"; items: UploadItem[]; folders: string[]; destination?: string }
   | { kind: "storage" }
   | { kind: "trash" }
   | { kind: "compress" }
@@ -283,15 +283,24 @@ function storedSort() {
   }
 }
 
-// The split view's second folder, remembered per browser (absent when the split view is closed).
-const SPLIT_STORAGE_KEY = "filesdude-split";
+// The split view's second folder, remembered per account in this browser (absent when it's closed),
+// so another account signing in here never sees, or asks for, someone else's folder.
+const SPLIT_STORAGE_PREFIX = "filesdude-split:";
 
-function storedSplit() {
+function storedSplit(account: string) {
   try {
-    return typeof window === "undefined" ? null : window.localStorage.getItem(SPLIT_STORAGE_KEY);
+    return typeof window === "undefined" ? null : window.localStorage.getItem(`${SPLIT_STORAGE_PREFIX}${account}`);
   } catch {
     return null;
   }
+}
+
+// The split view only shows on screens wide enough for both sides (as in globals.css).
+const SPLIT_MEDIA = "(min-width: 1200px)";
+function subscribeSplitMedia(onChange: () => void) {
+  const query = window.matchMedia(SPLIT_MEDIA);
+  query.addEventListener("change", onChange);
+  return () => query.removeEventListener("change", onChange);
 }
 
 const initialAuth: AuthState = {
@@ -549,8 +558,14 @@ export function FileManager() {
   const [contentSearch, setContentSearch] = useState<{ status: "running" | "done" | "error"; result?: ContentSearchResult; error?: string } | null>(null);
   const contentControllerRef = useRef<AbortController | null>(null);
   const [view, setView] = useState<ViewMode>("list");
-  // The split view's second folder, or null when it's closed.
-  const [splitPath, setSplitPath] = useState<string | null>(storedSplit);
+  // The split view's second folder for the signed-in account, or null when it's closed.
+  const [split, setSplit] = useState<{ account: string; path: string | null } | null>(null);
+  const account = auth.authenticated ? auth.username ?? "" : null;
+  const splitPath = account === null ? null : split?.account === account ? split.path : storedSplit(account);
+  const wideScreen = useSyncExternalStore(subscribeSplitMedia, () => window.matchMedia(SPLIT_MEDIA).matches, () => false);
+  const splitShown = splitPath !== null && wideScreen;
+  // The folder whose listing is showing (it lags behind currentPath while a folder loads, or if it fails).
+  const [loadedPath, setLoadedPath] = useState<string | null>(null);
   const [sort, setSort] = useState<SortState>(() => (typeof window !== "undefined" ? storedSort() : parseSort(null)));
   const [loading, setLoading] = useState(false);
   const [dialog, setDialog] = useState<DialogState>(null);
@@ -580,7 +595,9 @@ export function FileManager() {
   const menuRef = useRef<HTMLDivElement>(null);
   const toastTimerRef = useRef<number | undefined>(undefined);
   const undoRef = useRef<UndoAction | null>(null);
-  const dragPathsRef = useRef<string[]>([]);
+  // The items being dragged, and a one-time token the drop must carry: only a drag that started in
+  // this tab knows it, so no other page can supply a drop (or reuse one left over).
+  const dragRef = useRef<{ token: string; paths: string[] } | null>(null);
   // Folder sizes for the Size column, counted for the folder being shown when switched on.
   const [showFolderSizes, setShowFolderSizes] = useState(() => {
     try {
@@ -671,6 +688,7 @@ export function FileManager() {
       }
       const result = await requestJson<{ entries: FileEntry[]; path: string; disk: DiskInfo; truncated?: boolean; stoppedBy?: string }>(`/api/fs?${params}`);
       setEntries(result.entries);
+      setLoadedPath(pathValue);
       setSearchInfo(params.has("search") || params.has("kind") || params.has("modifiedDays") || params.has("minBytes") ? { truncated: result.truncated, stoppedBy: result.stoppedBy } : null);
       setDisk(result.disk);
       setSelected(new Set());
@@ -1077,17 +1095,19 @@ export function FileManager() {
   };
 
   const openSplit = useCallback((target: string) => {
-    setSplitPath(target);
+    if (account === null) return;
+    setSplit({ account, path: target });
     try {
-      window.localStorage.setItem(SPLIT_STORAGE_KEY, target);
+      window.localStorage.setItem(`${SPLIT_STORAGE_PREFIX}${account}`, target);
     } catch {
       // Not remembered in this browser.
     }
-  }, []);
+  }, [account]);
   const closeSplit = () => {
-    setSplitPath(null);
+    if (account === null) return;
+    setSplit({ account, path: null });
     try {
-      window.localStorage.removeItem(SPLIT_STORAGE_KEY);
+      window.localStorage.removeItem(`${SPLIT_STORAGE_PREFIX}${account}`);
     } catch {
       // Nothing was remembered.
     }
@@ -1125,9 +1145,10 @@ export function FileManager() {
   // Shared by both sides of the split view: the paths being dragged are kept here, never read from
   // the drop, so only drags that started in this tab are accepted.
   const beginDrag = (paths: string[], event: React.DragEvent<HTMLElement>) => {
-    dragPathsRef.current = paths;
+    const token = Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, "0")).join("");
+    dragRef.current = { token, paths };
     event.dataTransfer.effectAllowed = "copyMove";
-    event.dataTransfer.setData(DRAG_TYPE, JSON.stringify(paths));
+    event.dataTransfer.setData(DRAG_TYPE, token);
     if (paths.length > 1) {
       const ghost = document.createElement("div");
       ghost.className = "drag-ghost";
@@ -1139,7 +1160,7 @@ export function FileManager() {
   };
 
   const endDrag = () => {
-    dragPathsRef.current = [];
+    dragRef.current = null;
     setDropTarget(null);
   };
 
@@ -1152,7 +1173,7 @@ export function FileManager() {
       const destination = event.currentTarget.dataset.dropPath ?? "";
       const copy = event.altKey;
       // Only drags that started in this tab are accepted, so another site cannot supply paths.
-      const allowed = canDropInto(destination, dragPathsRef.current, copy);
+      const allowed = canDropInto(destination, dragRef.current?.paths ?? [], copy);
       event.dataTransfer.dropEffect = allowed ? (copy ? "copy" : "move") : "none";
       setDropTarget(allowed ? destination : null);
     },
@@ -1166,8 +1187,11 @@ export function FileManager() {
       event.preventDefault();
       event.stopPropagation();
       const destination = event.currentTarget.dataset.dropPath ?? "";
-      const paths = dragPathsRef.current;
+      const drag = dragRef.current;
       setDropTarget(null);
+      if (!drag || event.dataTransfer.getData(DRAG_TYPE) !== drag.token) return;
+      dragRef.current = null;
+      const { paths } = drag;
       if (canDropInto(destination, paths, event.altKey)) void transferEntries(event.altKey ? "copy" : "move", paths, destination);
     },
   };
@@ -1219,6 +1243,10 @@ export function FileManager() {
     if (choice === "refresh") void loadDirectory();
   };
 
+  // The main side shows the folder it's on (not a search, and not still loading or failed), so the
+  // split view can copy or move into it.
+  const mainFolderReady = loadedPath === currentPath && !nameSearching && !(searchMode === "contents" && activeSearch);
+
   const interactions: EntryInteractions = {
     menuPath: menu?.kind === "entry" ? menu.entry.path : null,
     cutPaths,
@@ -1237,17 +1265,18 @@ export function FileManager() {
     watching,
   };
 
-  const queueUpload = ({ items, folders }: { items: UploadItem[]; folders: string[] }) => {
+  const queueUpload = ({ items, folders }: { items: UploadItem[]; folders: string[] }, destination?: string) => {
     if (uploadRef.current) uploadRef.current.value = "";
     if (folderUploadRef.current) folderUploadRef.current.value = "";
     if (!items.length && !folders.length) return;
     if (items.length > MAX_UPLOAD_ITEMS || folders.length > MAX_UPLOAD_ITEMS) return notify(`Upload at most ${MAX_UPLOAD_ITEMS.toLocaleString()} files and folders at once`, "error");
     if (folders.some((folder) => folder.split("/").length > MAX_UPLOAD_DEPTH)) return notify(`Folders nested more than ${MAX_UPLOAD_DEPTH} levels deep can't be uploaded`, "error");
-    setDialog({ kind: "upload", items, folders });
+    setDialog({ kind: "upload", items, folders, destination });
   };
 
-  const queueDrop = (transfer: DataTransfer) => {
-    uploadItemsFromDrop(transfer).then(queueUpload).catch((error: Error) => notify(error.message, "error"));
+  // Files dropped from the computer upload into this folder (the split view's, when dropped there).
+  const queueDrop = (transfer: DataTransfer, destination?: string) => {
+    uploadItemsFromDrop(transfer).then((found) => queueUpload(found, destination)).catch((error: Error) => notify(error.message, "error"));
   };
 
   // One item downloads as itself (a folder as a ZIP); several download together as one ZIP.
@@ -1495,7 +1524,7 @@ export function FileManager() {
 
         <div className="sidebar-section favorites-section">
           <p className="eyebrow">FAVOURITES</p>
-          {favorites.length ? <div className="favorite-list">{favorites.map((favorite) => <div key={favorite.path} className={`favorite-item ${currentPath === favorite.path ? "active" : ""} ${dropTarget === favorite.path ? "drop-target" : ""}`} data-drop-path={favorite.path} {...dropHandlers}><button title={`/${favorite.path}`} onClick={() => { navigate(favorite.path); setSidebarOpen(false); }}><Star size={15} fill="currentColor" /><span>{favorite.name}</span></button><button className="favorite-remove" aria-label={`Remove ${favorite.name} from favourites`} title="Remove from favourites" onClick={() => void toggleFavorite(favorite.path)}><X size={13} /></button></div>)}</div> : <p className="favorites-empty"><Star size={14} /> Star folders to pin them here.</p>}
+          {favorites.length ? <div className="favorite-list">{favorites.map((favorite) => <div key={favorite.path} className={`favorite-item ${currentPath === favorite.path ? "active" : ""} ${dropTarget === favorite.path ? "drop-target" : ""}`} data-drop-path={favorite.path} {...(canWrite ? dropHandlers : {})}><button title={`/${favorite.path}`} onClick={() => { navigate(favorite.path); setSidebarOpen(false); }}><Star size={15} fill="currentColor" /><span>{favorite.name}</span></button><button className="favorite-remove" aria-label={`Remove ${favorite.name} from favourites`} title="Remove from favourites" onClick={() => void toggleFavorite(favorite.path)}><X size={13} /></button></div>)}</div> : <p className="favorites-empty"><Star size={14} /> Star folders to pin them here.</p>}
         </div>
 
         <div className="sidebar-section">
@@ -1546,7 +1575,7 @@ export function FileManager() {
             {crumbs.map((crumb, index) => (
               <span key={crumb.path || "root"}>
                 {index > 0 && <ChevronRight size={14} />}
-                <button className={dropTarget === crumb.path ? "drop-target" : ""} data-drop-path={crumb.path} {...dropHandlers} onClick={() => navigate(crumb.path)}>{crumb.label}</button>
+                <button className={dropTarget === crumb.path ? "drop-target" : ""} data-drop-path={crumb.path} {...(canWrite ? dropHandlers : {})} onClick={() => navigate(crumb.path)}>{crumb.label}</button>
               </span>
             ))}
           </div>
@@ -1556,7 +1585,7 @@ export function FileManager() {
           </div>
         </header>
 
-        <div className={`workspaces ${splitPath !== null ? "split" : ""}`}>
+        <div className={`workspaces ${splitShown ? "split" : ""}`}>
         <section className="workspace">
           <div className="workspace-heading">
             <div>
@@ -1637,7 +1666,7 @@ export function FileManager() {
           )}
 
           {/* In the split view, items dragged from the other side can be dropped anywhere on this list. */}
-          <div className={`files-surface ${view === "grid" ? "grid-mode" : ""} ${splitPath !== null && dropTarget === currentPath ? "drop-target" : ""}`} onContextMenu={openBackgroundMenu} {...(splitPath !== null && canWrite && !nameSearching && !(searchMode === "contents" && activeSearch) ? { "data-drop-path": currentPath, ...dropHandlers } : {})}>
+          <div className={`files-surface ${view === "grid" ? "grid-mode" : ""} ${splitShown && dropTarget === currentPath ? "drop-target" : ""}`} onContextMenu={openBackgroundMenu} {...(splitShown && canWrite && mainFolderReady ? { "data-drop-path": currentPath, ...dropHandlers } : {})}>
             {searchMode === "contents" && activeSearch ? (
               <ContentResults
                 state={contentSearch}
@@ -1670,15 +1699,17 @@ export function FileManager() {
           </div>
           <div className="drop-hint"><Upload size={15} /> Drop files anywhere to upload to this folder</div>
         </section>
-        {splitPath !== null && auth.authenticated && (
+        {splitShown && (
           <OtherPane
-            key={auth.username ?? ""}
+            key={account ?? ""}
             path={splitPath}
+            reachable={withinHome(splitPath)}
             home={home}
             showHidden={showHidden}
             canWrite={canWrite}
             reloadSignal={entries}
-            mainPath={currentPath}
+            mainPath={mainFolderReady ? currentPath : null}
+            onUploadDrop={queueDrop}
             mainSelection={selectedEntries.map((entry) => entry.path)}
             dropTarget={dropTarget}
             dropHandlers={dropHandlers}
@@ -1753,14 +1784,17 @@ export function FileManager() {
  * between the two sides, with its buttons or by dragging either way (dropping on a folder, or
  * anywhere on the other side's list).
  */
-function OtherPane({ path, home, showHidden, canWrite, reloadSignal, mainPath, mainSelection, dropTarget, dropHandlers, onPath, onOpenFile, onDragPaths, onDragEnd, onTransfer, onClose }: {
+function OtherPane({ path, reachable, home, showHidden, canWrite, reloadSignal, mainPath, mainSelection, dropTarget, dropHandlers, onPath, onOpenFile, onDragPaths, onDragEnd, onTransfer, onUploadDrop, onClose }: {
   path: string;
+  /** The path is inside the account's own folder (anything else isn't even asked for). */
+  reachable: boolean;
   home: string;
   showHidden: boolean;
   canWrite: boolean;
   /** Changes whenever the main folder reloads (after a copy or move finishes, for one), so this reloads too. */
   reloadSignal: unknown;
-  mainPath: string;
+  /** The main side's folder, or null while it can't take items (a search, or a folder still loading). */
+  mainPath: string | null;
   mainSelection: string[];
   dropTarget: string | null;
   dropHandlers: DropHandlers;
@@ -1769,6 +1803,7 @@ function OtherPane({ path, home, showHidden, canWrite, reloadSignal, mainPath, m
   onDragPaths: (paths: string[], event: React.DragEvent<HTMLElement>) => void;
   onDragEnd: () => void;
   onTransfer: (mode: "copy" | "move", paths: string[], destination: string) => Promise<boolean>;
+  onUploadDrop: (transfer: DataTransfer, destination: string) => void;
   onClose: () => void;
 }) {
   const [listing, setListing] = useState<{ path: string; entries: FileEntry[] } | null>(null);
@@ -1779,17 +1814,24 @@ function OtherPane({ path, home, showHidden, canWrite, reloadSignal, mainPath, m
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
+    if (!reachable) {
+      onPath(home);
+      return;
+    }
     const controller = new AbortController();
     requestJson<{ entries: FileEntry[] }>(`/api/fs?path=${encodePath(path)}&hidden=${showHidden}`, { signal: controller.signal })
       .then((result) => setListing({ path, entries: result.entries }))
-      .catch((caught: Error) => {
+      .catch((caught: Error & { status?: number }) => {
         if (caught.name === "AbortError") return;
-        // A folder that's gone (or out of reach) gives way to the account's own.
-        setError(`${folderLabel(path)} couldn't be opened: ${caught.message}`);
-        if (path !== home) onPath(home);
+        // A folder that's gone (or out of reach) gives way to the account's own; anything else (the
+        // server restarting, say) is just reported, and the folder kept.
+        if ((caught.status === 403 || caught.status === 404) && path !== home) {
+          setError("That folder isn't available any more, so your own folder is shown.");
+          onPath(home);
+        } else setError(caught.message);
       });
     return () => controller.abort();
-  }, [path, home, showHidden, reloadSignal, onPath]);
+  }, [path, reachable, home, showHidden, reloadSignal, onPath]);
 
   const entries = useMemo(() => (listing?.path === path ? [...listing.entries] : [])
     .sort((a, b) => Number(b.type === "directory") - Number(a.type === "directory") || a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" })), [listing, path]);
@@ -1797,7 +1839,7 @@ function OtherPane({ path, home, showHidden, canWrite, reloadSignal, mainPath, m
   const chosen = entries.filter((entry) => selected.has(entry.path)).map((entry) => entry.path);
   const crumbs = [{ path: home, label: home ? "My files" : "All files" }];
   for (const part of path.slice(home ? home.length + 1 : 0).split("/").filter(Boolean)) crumbs.push({ path: crumbs.at(-1)!.path ? `${crumbs.at(-1)!.path}/${part}` : part, label: part });
-  const mainName = mainPath ? mainPath.split("/").at(-1)! : home ? "My files" : "All files";
+  const mainName = mainPath === null ? "the main side" : mainPath ? mainPath.split("/").at(-1)! : home ? "My files" : "All files";
   const hereName = path ? path.split("/").at(-1)! : "All files";
 
   // Going somewhere else clears the message about a folder that couldn't be opened.
@@ -1824,6 +1866,25 @@ function OtherPane({ path, home, showHidden, canWrite, reloadSignal, mainPath, m
     }
   };
   const dropProps = (destination: string) => (canWrite ? { "data-drop-path": destination, ...dropHandlers } : {});
+  // The list also takes files dropped from the computer, uploading them into this folder (rather than
+  // letting the drop reach the page, which uploads into the main side's folder).
+  const isUpload = (event: React.DragEvent<HTMLElement>) => !event.dataTransfer.types.includes(DRAG_TYPE) && event.dataTransfer.types.includes("Files");
+  const listDrop = canWrite ? {
+    "data-drop-path": path,
+    onDragOver: (event: React.DragEvent<HTMLElement>) => {
+      if (!isUpload(event)) return dropHandlers.onDragOver(event);
+      event.preventDefault();
+      event.stopPropagation();
+      event.dataTransfer.dropEffect = "copy";
+    },
+    onDragLeave: dropHandlers.onDragLeave,
+    onDrop: (event: React.DragEvent<HTMLElement>) => {
+      if (!isUpload(event)) return dropHandlers.onDrop(event);
+      event.preventDefault();
+      event.stopPropagation();
+      onUploadDrop(event.dataTransfer, path);
+    },
+  } : {};
 
   return (
     <aside className="other-pane" aria-label={`Split view: ${hereName}`}>
@@ -1846,13 +1907,13 @@ function OtherPane({ path, home, showHidden, canWrite, reloadSignal, mainPath, m
             <button type="button" className="button secondary" disabled={busy || !canDropInto(path, mainSelection, false)} title={`Move the ${itemCount(mainSelection.length)} selected on the left into ${hereName}`} onClick={() => void transfer("move", mainSelection, path)}><FolderInput size={14} /> Move here</button>
           </>}
           {chosen.length > 0 && <>
-            <button type="button" className="button secondary" disabled={busy || !canDropInto(mainPath, chosen, true)} title={`Copy the ${itemCount(chosen.length)} selected here into ${mainName}`} onClick={() => void transfer("copy", chosen, mainPath)}><ArrowLeft size={14} /> Copy {itemCount(chosen.length)} to {mainName}</button>
-            <button type="button" className="button secondary" disabled={busy || !canDropInto(mainPath, chosen, false)} title={`Move the ${itemCount(chosen.length)} selected here into ${mainName}`} onClick={() => void transfer("move", chosen, mainPath)}><FolderInput size={14} /> Move to {mainName}</button>
+            <button type="button" className="button secondary" disabled={busy || mainPath === null || !canDropInto(mainPath, chosen, true)} title={mainPath === null ? "The main side is showing search results or still loading" : `Copy the ${itemCount(chosen.length)} selected here into ${mainName}`} onClick={() => mainPath !== null && void transfer("copy", chosen, mainPath)}><ArrowLeft size={14} /> Copy {itemCount(chosen.length)} to {mainName}</button>
+            <button type="button" className="button secondary" disabled={busy || mainPath === null || !canDropInto(mainPath, chosen, false)} title={mainPath === null ? "The main side is showing search results or still loading" : `Move the ${itemCount(chosen.length)} selected here into ${mainName}`} onClick={() => mainPath !== null && void transfer("move", chosen, mainPath)}><FolderInput size={14} /> Move to {mainName}</button>
           </>}
           {!mainSelection.length && !chosen.length && <small>Select items on either side to copy or move them across, or drag them over.</small>}
         </div>
       )}
-      <div className={`other-pane-list ${dropTarget === path ? "drop-target" : ""}`} role="table" aria-label={`Files in ${hereName}`} {...dropProps(path)}>
+      <div className={`other-pane-list ${dropTarget === path ? "drop-target" : ""}`} role="table" aria-label={`Files in ${hereName}`} {...listDrop}>
         {error && <p className="form-error other-pane-error"><CircleAlert size={14} />{error}</p>}
         {loading ? <div className="other-pane-empty"><LoaderCircle className="spin" size={18} /></div>
           : !entries.length ? <div className="other-pane-empty">This folder is empty.</div>
@@ -1862,13 +1923,15 @@ function OtherPane({ path, home, showHidden, canWrite, reloadSignal, mainPath, m
               role="row"
               aria-selected={selected.has(entry.path)}
               className={`pane-row ${selected.has(entry.path) ? "selected" : ""} ${dropTarget === entry.path ? "drop-target" : ""}`}
-              draggable={canWrite}
-              onDragStart={(event) => {
-                const paths = selected.has(entry.path) ? chosen : [entry.path];
-                if (!selected.has(entry.path)) setSelection({ path, paths: new Set([entry.path]) });
-                onDragPaths(paths, event);
-              }}
-              onDragEnd={onDragEnd}
+              {...(canWrite ? {
+                draggable: true,
+                onDragStart: (event: React.DragEvent<HTMLElement>) => {
+                  const paths = selected.has(entry.path) ? chosen : [entry.path];
+                  if (!selected.has(entry.path)) setSelection({ path, paths: new Set([entry.path]) });
+                  onDragPaths(paths, event);
+                },
+                onDragEnd,
+              } : { draggable: false })}
               {...(entry.type === "directory" ? dropProps(entry.path) : {})}
               onClick={(event) => select(entry, event.metaKey || event.ctrlKey)}
               onDoubleClick={() => open(entry)}
@@ -2314,7 +2377,7 @@ function DialogHost({ dialog, selected, currentPath, username, role, home, onClo
 }) {
   // The server dialogs are shown by FileManager, which holds the list of servers.
   if (dialog.kind === "server" || dialog.kind === "serverSettings" || dialog.kind === "copyToServer") return null;
-  if (dialog.kind === "upload") return <UploadDialog items={dialog.items} folders={dialog.folders} currentPath={currentPath} chooseOwnership={role === "owner"} inPieces={uploadInPieces} onClose={onClose} notify={notify} onComplete={onRefresh} />;
+  if (dialog.kind === "upload") return <UploadDialog items={dialog.items} folders={dialog.folders} currentPath={dialog.destination ?? currentPath} chooseOwnership={role === "owner"} inPieces={uploadInPieces} onClose={onClose} notify={notify} onComplete={onRefresh} />;
   if (dialog.kind === "users") return <UsersDialog onClose={onClose} notify={notify} />;
   if (dialog.kind === "duplicates") return <DuplicatesDialog startPath={currentPath} onClose={onClose} notify={notify} onRefresh={onRefresh} onReveal={onReveal} />;
   if (dialog.kind === "storage") return <StorageDialog onClose={onClose} onReveal={onReveal} onPreview={onPreview} notify={notify} />;
