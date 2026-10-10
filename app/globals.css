@@ -546,6 +546,56 @@ kbd { padding: 3px 5px; border: 1px solid var(--line); border-bottom-width: 2px;
 .details-list dd { min-width: 0; margin: 0; overflow-wrap: anywhere; text-align: right; }
 .checksum-panel { display: grid; gap: 8px; margin: 14px 22px 0; }
 .media-panel { display: grid; gap: 8px; margin: 14px 22px 0; }
+.remote-server-list { display: grid; gap: 4px; margin-top: 6px; }
+.remote-server-item { display: flex; align-items: center; gap: 9px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); color: var(--ink); cursor: pointer; text-align: left; }
+.remote-server-item:hover { border-color: color-mix(in srgb, var(--brand) 35%, var(--line)); background: var(--panel-soft); }
+.remote-server-item > svg { flex: none; color: var(--brand); }
+.remote-server-item > span { display: flex; min-width: 0; flex-direction: column; }
+.remote-server-item strong { overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.remote-server-item small { overflow: hidden; color: var(--ink-faint); font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+.remote-server-add { display: flex; align-items: center; gap: 6px; padding: 6px 10px; border: 1px dashed var(--line-strong); border-radius: 9px; background: none; color: var(--ink-soft); cursor: pointer; font-size: 9px; font-weight: 700; }
+.remote-server-add:hover { color: var(--brand); border-color: var(--brand); }
+.server-step { display: grid; gap: 12px; margin: 18px 22px 0; }
+.server-step .modal-actions { margin-top: 4px; }
+.server-key { width: 100%; min-height: 76px; padding: 9px 11px; border: 1px solid var(--line-strong); border-radius: 9px; background: var(--panel-soft); color: var(--ink); font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; font-size: 9px; resize: vertical; overflow-wrap: anywhere; }
+.server-fingerprint { padding: 10px 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel-soft); font-size: 10px; overflow-wrap: anywhere; }
+.warning-box.danger { background: var(--danger-soft); color: var(--danger); }
+.server-methods { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 14px 0; }
+.server-methods button { display: flex; flex-direction: column; gap: 3px; padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel-soft); color: var(--ink-soft); cursor: pointer; text-align: left; }
+.server-methods button.active { border-color: var(--brand); background: var(--brand-soft); color: var(--brand-strong); box-shadow: inset 0 0 0 1px var(--brand); }
+.server-methods strong { font-size: 10px; }
+.server-methods span { font-size: 8px; opacity: .8; }
+.modal form > .form-field + .form-field, .modal form > .field-pair + .form-field { margin-top: 12px; }
+.server-remove { margin-right: auto; color: var(--danger); }
+.server-delete-note { margin-right: auto; color: var(--ink-soft); font-size: 10px; }
+.remote-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+.remote-trail { display: flex; min-width: 0; flex-wrap: wrap; align-items: center; gap: 2px; }
+.remote-trail > span { display: inline-flex; align-items: center; color: var(--ink-faint); }
+.remote-trail button { display: inline-flex; align-items: center; gap: 5px; padding: 4px 6px; border: 0; border-radius: 6px; background: none; color: var(--ink-soft); cursor: pointer; font-size: 11px; font-weight: 700; }
+.remote-trail button:hover { background: var(--panel-soft); color: var(--brand); }
+.remote-actions { display: flex; align-items: center; gap: 6px; }
+.remote-actions .button { min-height: 32px; font-size: 10px; }
+.remote-naming { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel-soft); font-size: 10px; font-weight: 700; }
+.remote-naming input { min-width: 0; flex: 1; height: 32px; padding: 0 10px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--panel); color: var(--ink); }
+.remote-naming .button { min-height: 32px; font-size: 10px; }
+.remote-table { max-height: min(520px, calc(100vh - 340px)); overflow-y: auto; border: 1px solid var(--line); border-radius: 10px; }
+.remote-row { display: grid; grid-template-columns: 38px minmax(0, 1fr) 90px 110px 70px; align-items: center; gap: 8px; min-height: 46px; padding: 0 10px; border-bottom: 1px solid var(--line); font-size: 10px; }
+.remote-row:last-child { border-bottom: 0; }
+.remote-row.selected { background: var(--brand-soft); }
+.remote-header { position: sticky; top: 0; z-index: 1; min-height: 36px; background: var(--panel-soft); color: var(--ink-faint); font-size: 8px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+.remote-name { display: flex; min-width: 0; align-items: center; gap: 9px; }
+.remote-name .file-icon { width: 28px; height: 28px; }
+.remote-name small { color: var(--ink-faint); font-size: 8px; }
+.remote-name .file-name:disabled { cursor: default; opacity: .7; }
+.remote-error-actions { display: flex; gap: 8px; margin-top: 8px; }
+.copy-to-server { display: grid; gap: 12px; margin: 18px 22px 0; }
+.copy-to-server select { height: 40px; padding: 0 10px; border: 1px solid var(--line-strong); border-radius: 9px; background: var(--panel-soft); color: var(--ink); }
+.copy-folder-list { display: grid; max-height: 260px; overflow-y: auto; border: 1px solid var(--line); border-radius: 10px; }
+.copy-folder-list > button { display: flex; align-items: center; gap: 8px; padding: 9px 12px; border: 0; border-bottom: 1px solid var(--line); background: none; color: var(--ink); cursor: pointer; font-size: 10px; text-align: left; }
+.copy-folder-list > button:hover { background: var(--panel-soft); }
+.copy-folder-list > button svg { color: #a36e19; }
+.copy-folder-list .checksum-note { padding: 10px 12px; }
+@media (max-width: 640px) { .remote-row { grid-template-columns: 34px minmax(0, 1fr) 70px; } .remote-row > :nth-child(4), .remote-row > :nth-child(5) { display: none; } .server-methods { grid-template-columns: 1fr; } }
 .search-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin: -2px 0 11px; padding: 9px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
 .search-filters label { display: inline-flex; align-items: center; gap: 7px; color: var(--ink-soft); font-size: 10px; font-weight: 700; }
 .search-filters select { height: 30px; padding: 0 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel-soft); color: var(--ink); font-size: 10px; }

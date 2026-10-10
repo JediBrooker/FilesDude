@@ -19,6 +19,8 @@ function buildCommit() {
 const nextConfig: NextConfig = {
   output: "standalone",
   poweredByHeader: false,
+  // ssh2 loads an optional native add-on, so it is required at run time rather than bundled.
+  serverExternalPackages: ["ssh2"],
   env: {
     NEXT_PUBLIC_FILESDUDE_VERSION: version,
     NEXT_PUBLIC_FILESDUDE_COMMIT: buildCommit(),
