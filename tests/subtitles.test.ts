@@ -142,10 +142,11 @@ test("extractions are shared, failures aren't retried, each account queues one, 
         return signal.aborted ? null : Buffer.from("WEBVTT\n\n00:00.000 --> 00:01.000\nok\n");
       },
     });
-    // Two requests for the same track share one run.
+    // Two requests for the same track share one run: Bob's starts it (waited for, however busy the
+    // machine is, so his is the one counted as busy), and Carol's joins it.
     const first = subtitleTrack("a.mkv", "stream:2", "bob");
+    while (runs < 1) await new Promise((resolve) => setTimeout(resolve, 10));
     const second = subtitleTrack("a.mkv", "stream:2", "carol");
-    await new Promise((resolve) => setTimeout(resolve, 50));
     // Bob can't queue another track while his first is still going.
     await assert.rejects(subtitleTrack("b.mkv", "stream:2", "bob"), /still being prepared/);
     release();

@@ -4,7 +4,7 @@ import { withAccess } from "@/lib/access";
 import { config } from "@/lib/config";
 import { assertMutationRequest, AppError, jsonError, readJsonBody } from "@/lib/http";
 import { cancelLinkUploads } from "@/lib/chunked-uploads";
-import { createShare, createUploadLink, listShares, revokeShare } from "@/lib/shares";
+import { createShare, createUploadLink, listShares, revokeShare, updateShare } from "@/lib/shares";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -37,6 +37,14 @@ export async function POST(request: Request) {
       const share = await createShare(body.path, Number(body.hours), body.maxDownloads === null || body.maxDownloads === undefined ? null : Number(body.maxDownloads), body.password);
       await audit("share.create", { username: session.username, id: share.id, path: share.path, expiresAt: share.expiresAt, maxDownloads: share.maxDownloads, protected: share.protected || undefined });
       return NextResponse.json({ ok: true, share }, { headers: { "Cache-Control": "no-store" } });
+    }
+    if (body.action === "update") {
+      if (typeof body.id !== "string" || body.id.length > 64) throw new AppError("Link id is invalid", 400, "INVALID_REQUEST");
+      const { link, changed } = await updateShare(body.id, { hours: body.hours, maxDownloads: body.maxDownloads, maxBytes: body.maxBytes, maxFiles: body.maxFiles, password: body.password });
+      // Uploads under way through a link that now needs a (new) password stop, as they would on revoke.
+      if (changed.includes("password added") || changed.includes("password changed")) await cancelLinkUploads(link.id);
+      await audit("share.update", { username: session.username, id: link.id, path: link.path, changed, expiresAt: link.expiresAt });
+      return NextResponse.json({ ok: true, share: link }, { headers: { "Cache-Control": "no-store" } });
     }
     if (body.action === "revoke") {
       if (typeof body.id !== "string" || body.id.length > 64) throw new AppError("Link id is invalid", 400, "INVALID_REQUEST");

@@ -252,6 +252,12 @@ copy and revoke buttons.
 - Shared files are always downloaded, never displayed in the browser; folders
   download as a ZIP of their current contents (without FilesDude's internal folders).
 - Links follow items that are renamed or moved, and are revoked when the item is deleted.
+- **Edit** on a link changes it in place, keeping its address: when it expires (from now),
+  its download limit (or an upload link's size and file limits), and its password (add,
+  change, or remove). Limits can't go below what's already been used (or promised to
+  uploads under way), and a new or removed password ends unlocks already given, so everyone
+  needs the new one; uploads under way through the link stop when a password is added or
+  changed.
 - Each link is signed with `FILEDUDE_SESSION_SECRET`; rotating that secret invalidates
   every link along with every session. Only link ids are stored, in `shares.json` in
   the state directory.
