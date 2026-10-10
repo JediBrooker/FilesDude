@@ -49,6 +49,11 @@ test("settings are checked and saved, and the ntfy token is never shown", async 
     await assert.rejects(saveNotificationSettings({ kind: "pager", url }), /Choose where/);
     await assert.rejects(saveNotificationSettings({ kind: "ntfy", url: "ftp://example.com" }), /http/);
     await assert.rejects(saveNotificationSettings({ kind: "ntfy", url: "not a url" }), /valid address/);
+    // A bare ntfy topic, as ntfy's apps take it, means that topic on ntfy.sh.
+    assert.equal((await saveNotificationSettings({ kind: "ntfy", url: "jedibrooker-9882bc971d27ca66ef16" })).url, "https://ntfy.sh/jedibrooker-9882bc971d27ca66ef16");
+    assert.equal((await saveNotificationSettings({ kind: "ntfy", url: "ntfy.example.com/alerts" })).url, "https://ntfy.example.com/alerts");
+    // A bare name isn't a Discord or Slack address.
+    await assert.rejects(saveNotificationSettings({ kind: "discord", url: "just-a-name" }), /valid address/);
     const saved = await saveNotificationSettings({ kind: "ntfy", url, token: "tk_secret", topics: { signIns: true } });
     assert.equal(saved.hasToken, true);
     assert.equal("token" in saved, false);

@@ -3513,7 +3513,7 @@ function PasskeysDialog({ onClose, notify }: { onClose: () => void; notify: (mes
 type NotificationSettings = { kind: "ntfy" | "discord" | "slack" | "webhook" | null; url: string; hasToken: boolean; topics: Record<"uploads" | "security" | "signIns" | "storage", boolean> };
 
 const NOTIFICATION_KINDS = [
-  { value: "ntfy", label: "ntfy", placeholder: "https://ntfy.sh/your-private-topic" },
+  { value: "ntfy", label: "ntfy", placeholder: "your-private-topic, or https://ntfy.example.com/topic" },
   { value: "discord", label: "Discord", placeholder: "https://discord.com/api/webhooks/…" },
   { value: "slack", label: "Slack", placeholder: "https://hooks.slack.com/services/…" },
   { value: "webhook", label: "Another service (JSON webhook)", placeholder: "https://example.com/webhook" },
@@ -3599,7 +3599,7 @@ function NotificationsDialog({ onClose, notify }: { onClose: () => void; notify:
         <form className="preferences-form notifications-form" onSubmit={submit}>
           <FormField label="Send notifications to"><select value={kind ?? "off"} onChange={(event) => setKind(event.target.value === "off" ? null : event.target.value as NotificationSettings["kind"])}><option value="off">Nowhere (off)</option>{NOTIFICATION_KINDS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select></FormField>
           {chosen && <>
-            <FormField label={chosen.value === "ntfy" ? "Topic address" : "Webhook address"} hint={chosen.value === "ntfy" ? "Use a long, hard-to-guess topic name on ntfy.sh, or your own ntfy server" : chosen.value === "webhook" ? "Each notification is sent as JSON: source, topic, title, message, urgent, at" : "Create an incoming webhook in the channel's settings and paste its address"}><input value={url} onChange={(event) => setUrl(event.target.value)} placeholder={chosen.placeholder} required maxLength={2048} autoComplete="off" spellCheck={false} /></FormField>
+            <FormField label={chosen.value === "ntfy" ? "Topic" : "Webhook address"} hint={chosen.value === "ntfy" ? "A topic name on ntfy.sh (keep it long and hard to guess), or the full address of a topic on your own ntfy server" : chosen.value === "webhook" ? "Each notification is sent as JSON: source, topic, title, message, urgent, at" : "Create an incoming webhook in the channel's settings and paste its address"}><input value={url} onChange={(event) => setUrl(event.target.value)} placeholder={chosen.placeholder} required maxLength={2048} autoComplete="off" spellCheck={false} /></FormField>
             {chosen.value === "ntfy" && <FormField label="Access token (optional)" hint={loaded?.hasToken && !removeToken ? "A token is saved; leave this empty to keep it" : "Only needed for a protected topic"}><input type="password" value={token} onChange={(event) => setToken(event.target.value)} placeholder={loaded?.hasToken && !removeToken ? "••••••••" : "tk_…"} maxLength={512} autoComplete="off" /></FormField>}
             {chosen.value === "ntfy" && loaded?.hasToken && <label className="show-passwords"><input type="checkbox" checked={removeToken} onChange={(event) => setRemoveToken(event.target.checked)} /> Remove the saved token</label>}
             <div className="notification-topics">

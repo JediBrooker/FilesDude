@@ -57,11 +57,17 @@ export async function getNotificationSettings() {
   return toPublic(await readSettings());
 }
 
-function checkUrl(value: unknown) {
+// ntfy users often give just their topic's name (as its apps do), or the address without https://.
+const NTFY_TOPIC = /^[A-Za-z0-9_-]{1,64}$/;
+
+function checkUrl(value: unknown, kind: NotificationKind) {
   if (typeof value !== "string" || value.length > 2048) throw new AppError("Enter the address to send notifications to", 400, "INVALID_URL");
+  let text = value.trim();
+  if (kind === "ntfy" && NTFY_TOPIC.test(text)) text = `https://ntfy.sh/${text}`;
+  else if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(text) && /^[\w.-]+\.[a-z]{2,}(:\d+)?\//i.test(text)) text = `https://${text}`;
   let url: URL;
   try {
-    url = new URL(value.trim());
+    url = new URL(text);
   } catch {
     throw new AppError("That isn't a valid address", 400, "INVALID_URL");
   }
@@ -75,7 +81,7 @@ export async function saveNotificationSettings(input: { kind?: unknown; url?: un
   const current = await readSettings();
   const kind = input.kind === null || input.kind === "off" ? null : input.kind;
   if (kind !== null && kind !== "ntfy" && kind !== "discord" && kind !== "slack" && kind !== "webhook") throw new AppError("Choose where to send notifications", 400, "INVALID_KIND");
-  const url = kind === null ? "" : checkUrl(input.url);
+  const url = kind === null ? "" : checkUrl(input.url, kind);
   if (input.token !== undefined && (typeof input.token !== "string" || input.token.length > 512)) throw new AppError("The access token is invalid", 400, "INVALID_TOKEN");
   // A saved token is only kept for the same server, so it's never sent somewhere new.
   const sameServer = Boolean(current.url) && kind === current.kind && new URL(url).origin === new URL(current.url).origin;
