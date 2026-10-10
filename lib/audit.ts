@@ -7,8 +7,11 @@ import { notifyFromAudit } from "./notifications";
 // The audit log: one JSON object per line in audit.jsonl in the state directory. At 8 MB the file is
 // set aside as a dated archive (audit-<time>.jsonl) and a new one started. Archives are kept for at
 // least 30 days, however much is written (so nobody can push recent history out by flooding the
-// log), and older ones once history passes 256 MB; only past 1 GB in total are recent ones removed,
-// to protect the disk. Every rotation, removal, and dropped entry is itself recorded.
+// log), and older ones once history passes 256 MB. Events anyone can repeat cheaply (downloads,
+// looking at Properties, favourites) are recorded once a minute per account and item; and if recent
+// history passes 1 GB all the same, only those are set aside (counted) until it's back under, so
+// sign-ins, changes, and account events are always kept. Every rotation, removal, and dropped entry
+// is itself recorded.
 export const AUDIT_FILE = "audit.jsonl";
 export const MAX_AUDIT_BYTES = 8 * 1024 * 1024;
 const KEEP_BYTES = 256 * 1024 * 1024;
@@ -68,15 +71,39 @@ async function prune(directory: string) {
   archives.sort((a, b) => b.mtime - a.mtime);
   const removed: string[] = [];
   let total = 0;
+  let recent = 0;
   for (const archive of archives) {
     total += archive.size;
     const old = Date.now() - archive.mtime > KEEP_DAYS * 24 * 60 * 60 * 1000;
-    if ((total > KEEP_BYTES && old) || total > HARD_LIMIT_BYTES) {
+    if (!old) recent += archive.size;
+    // Only archives older than the kept days ever go.
+    if (old && (total > KEEP_BYTES || total > HARD_LIMIT_BYTES)) {
       await fs.rm(path.join(directory, archive.name), { force: true });
       removed.push(archive.name);
     }
   }
+  overLimit = recent > HARD_LIMIT_BYTES;
   return removed;
+}
+
+// Cheap, repeatable events: recorded once a minute per account and item, and set aside entirely
+// while recent history is over its limit.
+const REPEATABLE = new Set(["fs.download", "fs.details", "favorites.add", "favorites.remove", "share.download"]);
+const REPEAT_MS = 60_000;
+const lastRepeat = new Map<string, number>();
+let overLimit = false;
+
+function isRepeat(event: string, details: Record<string, unknown>) {
+  if (!REPEATABLE.has(event)) return false;
+  if (overLimit) return true;
+  const key = JSON.stringify([event, details.username, details.id, details.address, details.path ?? details.paths]);
+  const now = Date.now();
+  const last = lastRepeat.get(key);
+  if (last !== undefined && now - last < REPEAT_MS) return true;
+  lastRepeat.delete(key);
+  lastRepeat.set(key, now);
+  if (lastRepeat.size > 10_000) lastRepeat.delete(lastRepeat.keys().next().value!);
+  return false;
 }
 
 let queue: Promise<void> = Promise.resolve();
@@ -124,6 +151,10 @@ function notifySafely(event: string, details: Record<string, unknown>) {
  * sign-ins or exhaust memory.
  */
 export async function audit(event: string, details: Record<string, unknown> = {}) {
+  if (isRepeat(event, details)) {
+    if (overLimit) dropped += 1;
+    return;
+  }
   if (pending >= MAX_PENDING) {
     dropped += 1;
     notifySafely(event, details);

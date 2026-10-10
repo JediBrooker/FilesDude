@@ -7,6 +7,7 @@ import { config } from "./config";
 import { acquireFilesystemLock, getMime, openVerifiedFile } from "./files";
 import { AppError } from "./http";
 import { diskUsage, inputLimits, sandboxFileRunner, sandboxRunner, VIDEO_FORMATS } from "./media-sandbox";
+import { limiter } from "./thumbnails";
 
 // Copies of videos that play in any browser, including Safari on iPhones, which can't play MKV at
 // all, and Chrome, which has no AC-3 or E-AC-3 sound. ffmpeg repackages the video as MP4 without
@@ -107,10 +108,29 @@ async function openVideo(relativePath: string): Promise<Video> {
 export type Codecs = { container: string; video?: string; audio?: string };
 const codecCache = new Map<string, Codecs>();
 
-async function codecsOf(video: Video, run: PlaybackRunners): Promise<Codecs | null> {
+// Looking inside a video runs ffprobe in the sandbox: a couple at a time, a video asked about by
+// several requests at once is looked at once, and too many waiting are turned away.
+const probeSlots = limiter(2, 50, "Too many videos are being looked at; try again shortly", "PLAYBACK_BUSY");
+const probing = new Map<string, Promise<Codecs | null>>();
+
+function codecsOf(video: Video, run: PlaybackRunners): Promise<Codecs | null> {
   const cached = codecCache.get(video.key);
-  if (cached) return cached;
-  const output = await run.probe(video.handle.fd);
+  if (cached) return Promise.resolve(cached);
+  const existing = probing.get(video.key);
+  if (existing) return existing;
+  const probe = (async () => {
+    await probeSlots.take();
+    try {
+      return parseCodecs(video, await run.probe(video.handle.fd));
+    } finally {
+      probeSlots.release();
+    }
+  })().finally(() => probing.delete(video.key));
+  probing.set(video.key, probe);
+  return probe;
+}
+
+function parseCodecs(video: Video, output: Buffer | null): Codecs | null {
   if (!output) return null;
   try {
     const data = JSON.parse(output.toString("utf8")) as { streams?: Array<{ codec_type?: unknown; codec_name?: unknown }>; format?: { format_name?: unknown } };

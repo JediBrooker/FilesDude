@@ -129,7 +129,7 @@ test("the sandbox shows Node.js and its packages read-only, and keeps hiding eve
   });
   assert.ok(args.includes(`BindReadOnlyPaths=/opt/node/bin/node:${MOUNT_DIR}/node "/opt/my app/node_modules":${MOUNT_DIR}/node_modules`));
   assert.ok(args.some((arg) => arg.startsWith("InaccessiblePaths=-/opt -/var ")));
-  for (const property of ["DynamicUser=yes", "PrivateNetwork=yes", "SystemCallFilter=~@network-io", "SystemCallFilter=getsockname getsockopt", "TemporaryFileSystem=/etc:ro /run:ro", "RuntimeMaxSec=15"]) assert.ok(args.includes(property), property);
+  for (const property of ["DynamicUser=yes", "PrivateNetwork=yes", "SystemCallFilter=~@network-io", "SystemCallFilter=getsockname getsockopt", "TemporaryFileSystem=/etc:ro /run:ro /dev/shm:size=16M", "MemorySwapMax=0", "SystemCallFilter=~io_uring_setup:EPERM io_uring_enter:EPERM io_uring_register:EPERM", "RuntimeMaxSec=15"]) assert.ok(args.includes(property), property);
   // Only the two harmless socket calls come back, after the rest are taken away.
   assert.ok(args.indexOf("SystemCallFilter=getsockname getsockopt") > args.indexOf("SystemCallFilter=~@network-io"));
   assert.deepEqual(args.slice(-4), ["/usr/bin/env", `${MOUNT_DIR}/node`, "-e", "code"]);

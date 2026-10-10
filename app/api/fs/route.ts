@@ -32,9 +32,26 @@ function actionPermission(action: unknown): Permission {
   return "write";
 }
 
+const running = new Map<string, number>();
+
+/** Runs `work` unless this account already has `max` of this kind going (then it's told to wait). */
+async function oneOfFew<T>(kind: string, account: string, max: number, work: () => Promise<T>) {
+  const key = `${kind}:${account}`;
+  const count = running.get(key) ?? 0;
+  if (count >= max) throw new AppError(kind === "search" ? "Your other searches are still running; try again in a moment" : "Your other folders are still loading; try again in a moment", 429, "BUSY");
+  running.set(key, count + 1);
+  try {
+    return await work();
+  } finally {
+    const left = (running.get(key) ?? 1) - 1;
+    if (left > 0) running.set(key, left);
+    else running.delete(key);
+  }
+}
+
 export async function GET(request: Request) {
   try {
-    return await withAccess(request, "read", async () => {
+    return await withAccess(request, "read", async (session) => {
       const url = new URL(request.url);
       const relativePath = url.searchParams.get("path") || "";
       const search = (url.searchParams.get("search") ?? "").trim().slice(0, 256);
@@ -46,10 +63,12 @@ export async function GET(request: Request) {
       const modifiedWithinDays = Number(url.searchParams.get("modifiedDays") || 0);
       const minBytes = Number(url.searchParams.get("minBytes") || 0);
       if (!Number.isFinite(modifiedWithinDays) || modifiedWithinDays < 0 || !Number.isFinite(minBytes) || minBytes < 0) throw new AppError("Invalid search filter", 400, "INVALID_FILTER");
-      // A search walks the tree without holding the filesystem lock (see name-search.ts).
-      const result = search || kind !== "any" || modifiedWithinDays || minBytes
-        ? await searchNames(relativePath, { query: search, hidden: showHidden, kind, modifiedWithinDays, minBytes }, request.signal)
-        : await withFilesystemLock(() => listDirectory(relativePath, showHidden));
+      // A search walks the tree, and a listing reads its folder, without holding the filesystem lock
+      // (see name-search.ts and listDirectory); each account has a few of each going at once.
+      const searching = Boolean(search || kind !== "any" || modifiedWithinDays || minBytes);
+      const result = await oneOfFew(searching ? "search" : "list", session.accountKey, searching ? 2 : 4, () => (searching
+        ? searchNames(relativePath, { query: search, hidden: showHidden, kind, modifiedWithinDays, minBytes }, request.signal)
+        : listDirectory(relativePath, showHidden)));
       return NextResponse.json(result, { headers: { "Cache-Control": "no-store" } });
     });
   } catch (error) {

@@ -31,7 +31,7 @@ const SAMPLE = {
     { codec_name: "ac3", codec_type: "audio", sample_rate: "48000", channels: 6, channel_layout: "5.1(side)" },
     { codec_name: "subrip", codec_type: "subtitle" },
   ],
-  format: { format_long_name: "QuickTime / MOV", duration: "3725.400000", bit_rate: "5200000", tags: { TITLE: "Holiday\u0007 ‮movie", Artist: "Me", encoder: "x" } },
+  format: { format_long_name: "QuickTime / MOV", duration: "3725.400000", bit_rate: "5200000", tags: { TITLE: "Holiday\u0007 \u202emovie", Artist: "Me", encoder: "x" } },
 };
 
 test("ffprobe's output becomes checked media details", () => {

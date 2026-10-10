@@ -105,7 +105,7 @@ test("the decoding process's details are only used when every field is as expect
     { ...good, pageHeight: 301 },
     { ...good, pages: -1 },
     { ...good, depth: "<b>" },
-    { ...good, space: "sRGB ‮" },
+    { ...good, space: "sRGB \u202e" },
     { ...good, hasAlpha: "yes" },
     { ...good, orientation: 9 },
     { ...good, exif: "not base64!" },

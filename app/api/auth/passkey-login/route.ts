@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { assertConfigured, checkLoginRateLimit, clearLoginFailures, clientAddress, createSession, refundLoginAttempt, sessionCookie } from "@/lib/auth";
+import { assertConfigured, assertLoginAllowed, checkLoginRateLimit, clientAddress, createSession, refundLoginAttempt, sessionCookie } from "@/lib/auth";
 import { audit } from "@/lib/audit";
 import { assertMutationRequest, AppError, jsonError, readJsonBody } from "@/lib/http";
 import { beginSignIn, finishSignIn, relyingParty } from "@/lib/passkeys";
@@ -23,9 +23,8 @@ export async function POST(request: Request) {
     const party = relyingParty(request);
 
     if (body.action === "options") {
-      // Asking for a challenge isn't a try, but isn't allowed while the address is locked out.
-      checkLoginRateLimit(key);
-      refundLoginAttempt(key);
+      // Asking for a challenge isn't a try (nor kept track of), but isn't allowed while the address is locked out.
+      assertLoginAllowed(key);
       return NextResponse.json(await beginSignIn(party), { headers: { "Cache-Control": "no-store" } });
     }
     if (body.action !== "verify") throw new AppError("Unknown sign-in operation", 400, "UNKNOWN_ACTION");
@@ -42,7 +41,7 @@ export async function POST(request: Request) {
       throw error;
     }
     const { account, passkey } = signedIn;
-    clearLoginFailures(key);
+    refundLoginAttempt(key);
     const response = NextResponse.json({ authenticated: true, username: account.username });
     response.headers.set("Set-Cookie", sessionCookie(createSession(account.username, account.version, account.key), request));
     response.headers.set("Cache-Control", "no-store");

@@ -67,6 +67,18 @@ function mutate<T>(operation: () => Promise<T>) {
   return result;
 }
 
+const MAX_FAVORITES = 200;
+
+/** Removes an account's favourites when the account is removed. */
+export async function forgetAccountFavorites(account: string) {
+  return mutate(async () => {
+    const all = await readAllFavorites();
+    if (!(account in all)) return;
+    delete all[account];
+    await writeAllFavorites(all);
+  });
+}
+
 /** Favourites outside the account's folder (after the owner moved it) are hidden, not deleted. */
 export async function listFavorites() {
   return (await readStoredFavorites()).filter((favorite) => withinScope(favorite.path));
@@ -80,6 +92,7 @@ export async function addFavorite(relativePath: string) {
     if (!(await fs.stat(absolute)).isDirectory()) throw new AppError("Only folders can be added to favourites", 400, "NOT_A_DIRECTORY");
     const favorites = await readStoredFavorites();
     if (!favorites.some((favorite) => favorite.path === normalized)) {
+      if (favorites.length >= MAX_FAVORITES) throw new AppError(`Up to ${MAX_FAVORITES} folders can be favourites`, 400, "TOO_MANY_FAVORITES");
       favorites.push({ path: normalized, name: path.basename(absolute), createdAt: new Date().toISOString() });
       await writeStoredFavorites(favorites);
     }

@@ -454,8 +454,10 @@ test("sign-in attempts are counted as they start, so parallel requests can't exc
     clearLoginFailures("direct-client");
     const results = await Promise.all(Array.from({ length: 12 }, () => signIn({ username: "bob", password: "wrong-password-here" })));
     const statuses = results.map((response) => response.status);
-    assert.equal(statuses.filter((code) => code === 401).length, 5);
-    assert.equal(statuses.filter((code) => code === 429).length, 7);
+    // At most five are checked (fewer when the cap on password checks at once turns some away),
+    // and the rest are refused.
+    assert.ok(statuses.filter((code) => code === 401).length <= 5);
+    assert.equal(statuses.filter((code) => code === 401 || code === 429).length, 12);
     clearLoginFailures("direct-client");
   });
 });
@@ -483,7 +485,10 @@ test("two-factor sign-in can be turned off, reset by the owner, and survives cre
 
     // The owner's own two-factor sign-in is kept when they change their password.
     const ownerTwoFactor = await enableTwoFactor(owner, OWNER_PASSWORD);
-    const changed = await call(preferences, "/api/auth/preferences", ownerTwoFactor.cookie, { currentPassword: OWNER_PASSWORD, newPassword: "another-owner-password" });
+    // Changing it needs a code as well as the password.
+    const withoutCode = await call(preferences, "/api/auth/preferences", ownerTwoFactor.cookie, { currentPassword: OWNER_PASSWORD, newPassword: "another-owner-password" });
+    assert.deepEqual([withoutCode.status, (await withoutCode.json()).code], [400, "CODE_REQUIRED"]);
+    const changed = await call(preferences, "/api/auth/preferences", ownerTwoFactor.cookie, { currentPassword: OWNER_PASSWORD, newPassword: "another-owner-password", code: ownerTwoFactor.recoveryCodes[1] });
     assert.equal(changed.status, 200);
     assert.ok((await readCredentials()).twoFactor);
     const disabled = await call(twoFactorAction, "/api/auth/two-factor", cookieFrom(changed), { action: "disable", currentPassword: "another-owner-password", code: ownerTwoFactor.recoveryCodes[0] });

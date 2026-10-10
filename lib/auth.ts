@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { config, configurationIssues, isValidPasswordHash } from "./config";
 import { getCredentials } from "./credentials";
 import { AppError } from "./http";
+import { addressGroup } from "./address-group";
 import { connectionPeer, normalizeAddress } from "./peer";
 import type { Role } from "./scope";
 import { findUserById } from "./users";
@@ -33,8 +34,12 @@ function base64url(value: string | Buffer) {
   return Buffer.from(value).toString("base64url");
 }
 
+// Sessions are signed with the secret and, once a credentials reset has happened, its generation
+// (FILEDUDE_SESSION_EPOCH): a reset ends every session without changing the secret, which share
+// links and saved server credentials also depend on.
 function signature(payload: string) {
-  return crypto.createHmac("sha256", config.sessionSecret).update(payload).digest("base64url");
+  const key = config.sessionEpoch ? `${config.sessionSecret}\u0000sessions\u0000${config.sessionEpoch}` : config.sessionSecret;
+  return crypto.createHmac("sha256", key).update(payload).digest("base64url");
 }
 
 export function assertConfigured() {
@@ -44,7 +49,22 @@ export function assertConfigured() {
   }
 }
 
+// Each password check runs scrypt on Node's small shared thread pool (which file work uses too), so
+// only a few run at once: a flood of sign-ins is turned away instead of slowing everything down.
+const MAX_PASSWORD_CHECKS = 4;
+let passwordChecks = 0;
+
 export async function verifyPassword(password: string, encoded = config.passwordHash) {
+  if (passwordChecks >= MAX_PASSWORD_CHECKS) throw new AppError("Too many sign-ins at once; try again in a moment", 429, "RATE_LIMITED");
+  passwordChecks += 1;
+  try {
+    return await checkPassword(password, encoded);
+  } finally {
+    passwordChecks -= 1;
+  }
+}
+
+async function checkPassword(password: string, encoded: string) {
   if (!isValidPasswordHash(encoded)) return false;
   const [algorithm, nRaw, rRaw, pRaw, salt, expectedRaw] = encoded.split("$");
   if (algorithm !== "scrypt" || !salt || !expectedRaw) return false;
@@ -167,41 +187,75 @@ export function clientAddress(request: Request) {
 }
 
 function sweepLoginAttempts(now: number) {
-  if (now - lastLoginAttemptSweep < 60_000 && loginAttempts.size < MAX_LOGIN_RATE_LIMIT_KEYS) return;
-  for (const [key, attempt] of loginAttempts) {
-    if (attempt.resetAt <= now) loginAttempts.delete(key);
+  if (now - lastLoginAttemptSweep < 60_000 && loginAttempts.size < MAX_LOGIN_RATE_LIMIT_KEYS && usernameAttempts.size < MAX_LOGIN_RATE_LIMIT_KEYS) return;
+  for (const table of [loginAttempts, usernameAttempts]) {
+    for (const [key, attempt] of table) {
+      if (attempt.resetAt <= now) table.delete(key);
+    }
   }
   lastLoginAttemptSweep = now;
 }
 
-/**
- * Counts a sign-in attempt as it starts, before anything is awaited, so requests sent in parallel
- * can't all get past the limit. A successful sign-in clears the count; a right password that still
- * needs a two-factor code gives its attempt back with refundLoginAttempt.
- */
-export function checkLoginRateLimit(key: string) {
+// Sign-in tries are counted per address (an IPv6 address by its /64, which one person can use all of)
+// and per username (so a password can't be guessed from many addresses). A full table drops its
+// oldest entries rather than turning everyone away. A successful sign-in only gives back its own
+// try: it never clears what failed before it from the same address, so signing in to one account
+// can't make room for guesses at another.
+const ADDRESS_LIMIT = 5;
+const USERNAME_LIMIT = 20;
+const usernameAttempts = new Map<string, { count: number; resetAt: number }>();
+const addressKey = (key: string) => `address:${addressGroup(key)}`;
+const usernameKey = (username: string) => username.trim().toLowerCase().slice(0, 64);
+
+function countAttempt(table: Map<string, { count: number; resetAt: number }>, key: string, limit: number) {
   const now = Date.now();
   sweepLoginAttempts(now);
-  const attempt = loginAttempts.get(key);
-  if (!attempt || attempt.resetAt <= now) {
-    if (loginAttempts.size >= MAX_LOGIN_RATE_LIMIT_KEYS) {
-      throw new AppError("Too many login attempts. Try again later.", 429, "RATE_LIMITED");
-    }
-    loginAttempts.set(key, { count: 1, resetAt: now + 15 * 60 * 1000 });
+  const attempt = table.get(key);
+  if (attempt && attempt.resetAt > now) {
+    if (attempt.count >= limit) throw new AppError("Too many login attempts. Try again later.", 429, "RATE_LIMITED");
+    attempt.count += 1;
     return;
   }
-  if (attempt.count >= 5) {
-    throw new AppError("Too many login attempts. Try again later.", 429, "RATE_LIMITED");
-  }
-  attempt.count += 1;
+  while (table.size >= MAX_LOGIN_RATE_LIMIT_KEYS) table.delete(table.keys().next().value!);
+  table.set(key, { count: 1, resetAt: now + 15 * 60 * 1000 });
 }
 
-export function refundLoginAttempt(key: string) {
-  const attempt = loginAttempts.get(key);
+function giveBack(table: Map<string, { count: number; resetAt: number }>, key: string) {
+  const attempt = table.get(key);
   if (attempt && attempt.count > 0) attempt.count -= 1;
 }
 
+/**
+ * Counts a sign-in attempt from an address as it starts, before anything is awaited, so requests sent
+ * in parallel can't all get past the limit. A successful sign-in (or a right password that still needs
+ * a two-factor code) gives its try back with refundLoginAttempt.
+ */
+export function checkLoginRateLimit(key: string) {
+  countAttempt(loginAttempts, addressKey(key), ADDRESS_LIMIT);
+}
+
+/** Refuses an address that's locked out, without counting a try (asking for a passkey challenge). */
+export function assertLoginAllowed(key: string) {
+  const attempt = loginAttempts.get(addressKey(key));
+  if (attempt && attempt.resetAt > Date.now() && attempt.count >= ADDRESS_LIMIT) throw new AppError("Too many login attempts. Try again later.", 429, "RATE_LIMITED");
+}
+
+export function refundLoginAttempt(key: string) {
+  giveBack(loginAttempts, addressKey(key));
+}
+
+/** Counts a password try at a username (known or not), as it starts. */
+export function checkUsernameRateLimit(username: string) {
+  countAttempt(usernameAttempts, usernameKey(username), USERNAME_LIMIT);
+}
+
+export function refundUsernameAttempt(username: string) {
+  giveBack(usernameAttempts, usernameKey(username));
+}
+
+/** Forgets an address's tries (tests, and nothing else: sign-ins only give back their own). */
 export function clearLoginFailures(key: string) {
+  loginAttempts.delete(addressKey(key));
   loginAttempts.delete(key);
 }
 

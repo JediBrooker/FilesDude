@@ -43,12 +43,14 @@ export function activityUser(entry: Entry) {
   return typeof entry.username === "string" ? entry.username : SYSTEM_ACTOR;
 }
 
-// Characters that are invisible or change the direction of the text around them.
-const HIDDEN_CHARACTERS = new RegExp("[\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u061c\\u180e\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u2069\\ufeff\\ufff9-\\ufffb]", "g");
+// Characters that are invisible or change the direction of the text around them: control and format characters (direction marks, zero-width spaces, tag characters, ...), plus the
+// blank-looking ones that aren't format characters: the combining grapheme joiner, Hangul fillers,
+// and variation selectors.
+const HIDDEN_CHARACTERS = /[\p{Cc}\p{Cf}\u034f\u115f\u1160\u180e\u3164\uffa0\ufe00-\ufe0f\u2028\u2029]/gu;
 
 /** Text from a user with invisible and direction-changing characters shown as their code. */
 export function visibleText(value: string) {
-  return value.replace(HIDDEN_CHARACTERS, (character) => `⟨U+${character.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0")}⟩`);
+  return value.replace(HIDDEN_CHARACTERS, (character) => `⟨U+${character.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}⟩`);
 }
 
 const str = (value: unknown) => (typeof value === "string" ? value : "");

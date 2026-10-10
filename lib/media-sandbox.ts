@@ -47,8 +47,14 @@ const SANDBOX = [
   // No socket calls at all (systemd can't drop the last address family), so no host sockets either;
   // Node.js may only ask what its standard input and output are (see inspectSockets).
   "LockPersonality=yes", "SystemCallFilter=@system-service", "SystemCallFilter=~@network-io", "SystemCallArchitectures=native",
-  "MemoryMax=512M", "TasksMax=64", "CPUQuota=200%",
-  "TemporaryFileSystem=/etc:ro /run:ro", "BindReadOnlyPaths=-/etc/ld.so.cache -/etc/alternatives",
+  // io_uring would let a compromised decoder do what the filter forbids (and is a common way to attack
+  // the kernel); refused with an error, as Node.js tries it when it starts. After @system-service,
+  // which would otherwise allow it again.
+  "SystemCallFilter=~io_uring_setup:EPERM io_uring_enter:EPERM io_uring_register:EPERM",
+  // No swap on top of the memory limit, and every run shares one slice's limits (see install.sh).
+  "MemoryMax=512M", "MemorySwapMax=0", "TasksMax=64", "CPUQuota=200%", "Slice=filesdude-media.slice",
+  // Its own small /dev/shm rather than the host's.
+  "TemporaryFileSystem=/etc:ro /run:ro /dev/shm:size=16M", "BindReadOnlyPaths=-/etc/ld.so.cache -/etc/alternatives",
 ];
 
 // Top-level folders the sandbox keeps: the system's programs and libraries (often symlinks into

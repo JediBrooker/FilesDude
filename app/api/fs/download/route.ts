@@ -6,7 +6,7 @@ import { withAccess } from "@/lib/access";
 import { audit } from "@/lib/audit";
 import { appendBundle, bundlePaths, checkBundle, createDownloadTicket, takeDownloadTicket } from "@/lib/bundle-download";
 import { acquireFilesystemLock, getMime, openVerifiedFile } from "@/lib/files";
-import { AppError, assertMutationRequest, jsonError, readJsonBody } from "@/lib/http";
+import { AppError, assertMutationRequest, assertSameOriginFetch, jsonError, readJsonBody } from "@/lib/http";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -136,6 +136,7 @@ async function bundleDownload(request: Request, token: string, session: { accoun
 
 export async function GET(request: Request) {
   try {
+    assertSameOriginFetch(request);
     return await withAccess(request, "read", async (session) => {
     const token = new URL(request.url).searchParams.get("ticket");
     if (token) return bundleDownload(request, token, session);
