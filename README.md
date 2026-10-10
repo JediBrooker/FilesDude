@@ -1,6 +1,6 @@
 # FilesDude
 
-FilesDude is a secure, self-hosted web file manager designed for a Proxmox host, VM, or LXC container. It exposes one explicitly configured filesystem root and keeps every browser operation inside that boundary.
+FilesDude File Explorer is a secure, self-hosted web file manager designed for a Proxmox host, VM, or LXC container. It exposes one explicitly configured filesystem root and keeps every browser operation inside that boundary.
 
 ## What is included
 
@@ -427,7 +427,7 @@ The container runs as UID/GID `1001:1001` by default. Give that account access t
 - Expose only the smallest useful root, such as `/mnt/pve/media`; never expose the Proxmox host root.
 - Prefer a dedicated unprivileged LXC or VM and bind-mount the managed storage into it.
 - Use HTTPS even on a LAN. For remote access, prefer WireGuard or Tailscale over directly exposing the login page to the internet.
-- Keep `FILEDUDE_TRUST_PROXY=true` only when the app is behind a trusted proxy that replaces forwarded headers. The systemd installer defaults it to `false` for direct LAN access.
+- Behind a reverse proxy or tunnel (such as a Cloudflare Tunnel's `cloudflared`), set `FILEDUDE_TRUSTED_PROXIES` in `/etc/filesdude/filesdude.env` to its address, for example `FILEDUDE_TRUSTED_PROXIES=192.168.0.3`, and restart. Only connections that really come from that address (FilesDude checks the connection itself, not a header) have their client address (Cloudflare's `CF-Connecting-IP`, or `X-Forwarded-For`) and HTTPS believed, so sign-in limits apply per real visitor, Activity shows real addresses, and session cookies are marked secure. Anyone else is taken as their own address, whatever headers they send. `FILEDUDE_TRUST_PROXY=true` (believing every connection is a proxy) remains only for setups where FilesDude can't be reached except through one.
 - Back up the underlying data independently. Protected trash helps with mistakes but is not a backup.
 - Keep Proxmox, the container image, and reverse proxy patched. Rotate the session secret to invalidate all sessions.
 

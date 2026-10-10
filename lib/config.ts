@@ -14,6 +14,12 @@ export const config = {
   sessionHours: Math.max(1, Number(process.env.FILEDUDE_SESSION_HOURS || 12)),
   maxUploadBytes: Math.max(1, Number(process.env.FILEDUDE_MAX_UPLOAD_MB || 512)) * 1024 * 1024,
   trustProxy: process.env.FILEDUDE_TRUST_PROXY === "true",
+  /**
+   * Addresses of reverse proxies or tunnels in front of FilesDude (such as a cloudflared container),
+   * comma-separated. Only requests whose connection comes from one of these have their forwarded
+   * client address and protocol believed.
+   */
+  trustedProxies: (process.env.FILEDUDE_TRUSTED_PROXIES ?? "").split(",").map((item) => item.trim()).filter(Boolean),
   trashEnabled: process.env.FILEDUDE_TRASH_ENABLED !== "false",
   sharingEnabled: process.env.FILEDUDE_SHARING_ENABLED !== "false",
 };
