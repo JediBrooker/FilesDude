@@ -283,6 +283,7 @@ const isNewerBuild = (server: ServerBuild | undefined) => differsFrom(server, { 
 const SORT_LABELS: Record<SortKey, string> = { name: "Name", size: "Size", owner: "Owner", mode: "Permissions", modified: "Modified" };
 const SORT_STORAGE_KEY = "filesdude-sort";
 const MANAGE_OPEN_KEY = "filesdude-manage-open";
+const INFO_OPEN_KEY = "filesdude-info-open";
 
 function storedSort() {
   try {
@@ -581,6 +582,15 @@ export function FileManager() {
   const splitPath = account === null ? null : split?.account === account ? split.path : storedSplit(account);
   const wideScreen = useSyncExternalStore(subscribeSplitMedia, () => window.matchMedia(SPLIT_MEDIA).matches, () => false);
   const splitShown = splitPath !== null && wideScreen;
+  // The details pane beside the list (on screens wide enough), remembered per browser.
+  const [infoOpen, setInfoOpen] = useState(() => {
+    try {
+      return typeof window !== "undefined" && window.localStorage.getItem(INFO_OPEN_KEY) === "on";
+    } catch {
+      return false;
+    }
+  });
+  const infoShown = infoOpen && wideScreen && !splitShown;
   // The folder whose listing is showing (it lags behind currentPath while a folder loads, or if it fails).
   const [loadedPath, setLoadedPath] = useState<string | null>(null);
   const [sort, setSort] = useState<SortState>(() => (typeof window !== "undefined" ? storedSort() : parseSort(null)));
@@ -1145,8 +1155,20 @@ export function FileManager() {
     }
   };
 
+  // The details pane and the split view share the room beside the list, so one closes the other.
+  const toggleInfo = (open = !infoOpen) => {
+    setInfoOpen(open);
+    try {
+      window.localStorage.setItem(INFO_OPEN_KEY, open ? "on" : "off");
+    } catch {
+      // Not remembered in this browser.
+    }
+    if (open && splitPath !== null) closeSplit();
+  };
+
   const openSplit = useCallback((target: string) => {
     if (account === null) return;
+    setInfoOpen(false);
     setSplit({ account, path: target });
     try {
       window.localStorage.setItem(`${SPLIT_STORAGE_PREFIX}${account}`, target);
@@ -1711,7 +1733,7 @@ export function FileManager() {
           </div>
         </header>
 
-        <div className={`workspaces ${splitShown ? "split" : ""}`}>
+        <div className={`workspaces ${splitShown || infoShown ? "split" : ""}`}>
         <section className="workspace">
           <div className="workspace-heading">
             <div>
@@ -1751,6 +1773,7 @@ export function FileManager() {
             </div>
             <button className={`toolbar-button ${showFolderSizes ? "active" : ""}`} aria-pressed={showFolderSizes} onClick={toggleFolderSizes} title="Show how much each folder holds"><HardDrive size={16} /> Sizes</button>
             <button className={`toolbar-button ${showHidden ? "active" : ""}`} onClick={() => setShowHidden(!showHidden)} title="Show hidden files">{showHidden ? <Eye size={17} /> : <EyeOff size={17} />}<span>Hidden</span></button>
+            <button className={`toolbar-button split-view-toggle ${infoShown ? "active" : ""}`} aria-pressed={infoShown} onClick={() => toggleInfo()} title="Show details of what's selected beside the list"><Info size={16} /><span>Info</span></button>
             <button className={`toolbar-button split-view-toggle ${splitPath !== null ? "active" : ""}`} aria-pressed={splitPath !== null} onClick={() => (splitPath === null ? openSplit(currentPath) : closeSplit())} title="Show a second folder side by side, to copy or move between them"><Columns2 size={16} /><span>Split</span></button>
             <div className="view-switch" role="group" aria-label="View style">
               <button className={view === "list" ? "active" : ""} aria-label="List view" onClick={() => setView("list")}><List size={17} /></button>
@@ -1825,6 +1848,22 @@ export function FileManager() {
           </div>
           <div className="drop-hint"><Upload size={15} /> Drop files anywhere to upload to this folder</div>
         </section>
+        {infoShown && (
+          <DetailsPane
+            selected={selectedEntries}
+            folder={currentPath}
+            entries={entries}
+            tags={tags}
+            isOwner={isOwner}
+            videoThumbnails={auth.features?.videoThumbnails ?? false}
+            onOpen={openEntry}
+            onDownload={(chosen) => void downloadEntries(chosen)}
+            onShare={(entry) => setDialog({ kind: "share", entry })}
+            onProperties={(entry) => setDialog({ kind: "details", entry })}
+            onClose={() => toggleInfo(false)}
+            notify={notify}
+          />
+        )}
         {splitShown && (
           <OtherPane
             key={account ?? ""}
@@ -5391,6 +5430,100 @@ function FolderSizePanel({ entry }: { entry: FileEntry }) {
         {!size.complete && size.reason && <p className="checksum-note"><Info size={14} /> {FOLDER_SIZE_SHORTFALL[size.reason]}</p>}
       </>}
     </section>
+  );
+}
+
+/**
+ * The details pane beside the list: the selected item's preview and facts (its media details too,
+ * once the selection has settled, so stepping through a folder doesn't ask for each), the total of
+ * several, or the folder's own. Heavier things (a folder's full size, checksums) stay in Properties.
+ */
+function DetailsPane({ selected, folder, entries, tags, isOwner, videoThumbnails, onOpen, onDownload, onShare, onProperties, onClose, notify }: {
+  selected: FileEntry[];
+  folder: string;
+  entries: FileEntry[];
+  tags: Map<string, TagColor[]>;
+  isOwner: boolean;
+  videoThumbnails: boolean;
+  onOpen: (entry: FileEntry) => void;
+  onDownload: (entries: FileEntry[]) => void;
+  onShare: (entry: FileEntry) => void;
+  onProperties: (entry: FileEntry) => void;
+  onClose: () => void;
+  notify: (message: string, tone?: "error") => void;
+}) {
+  const single = selected.length === 1 ? selected[0] : null;
+  const singlePath = single?.path ?? null;
+  const [settled, setSettled] = useState<string | null>(null);
+  useEffect(() => {
+    if (!singlePath) return;
+    const timer = window.setTimeout(() => setSettled(singlePath), 400);
+    return () => window.clearTimeout(timer);
+  }, [singlePath]);
+  const copyPath = async (target: string) => {
+    if (await copyText(`/${target}`)) notify("Path copied");
+    else notify("Couldn't copy the path", "error");
+  };
+  const summary = (items: FileEntry[]) => {
+    const files = items.filter((item) => item.type !== "directory");
+    const folders = items.length - files.length;
+    return { files: files.length, folders, bytes: files.reduce((sum, item) => sum + item.size, 0) };
+  };
+
+  let body: ReactNode;
+  if (single) {
+    const media = single.type === "file" && MEDIA_INFO_MIME.has(single.mime) && (!THUMBNAIL_MIME.has(single.mime) || single.size <= MAX_THUMBNAIL_SOURCE_BYTES);
+    const rows: Array<[string, ReactNode]> = [
+      ["Kind", single.type === "directory" ? "Folder" : single.type === "symlink" ? "Link" : `${extension(single.name)} · ${single.mime}`],
+      ...(single.type === "directory" ? [] : [["Size", `${formatBytes(single.size)} (${single.size.toLocaleString()} bytes)`] as [string, ReactNode]]),
+      ["Modified", new Date(single.modified).toLocaleString()],
+      ["Created", new Date(single.created).toLocaleString()],
+      ["Owner", `${single.owner}:${single.group}`],
+      ["Permissions", <code key="mode" className="mode-chip">{single.mode}</code>],
+      ["Where", folderLabel(parentOf(single.path))],
+    ];
+    body = <>
+      <div className="details-pane-preview"><GridPreview key={single.path} entry={single} onOpen={onOpen} videoThumbnails={videoThumbnails} /></div>
+      <div className="details-pane-name"><strong>{single.name}</strong><TagDots colors={tags.get(single.path)} /></div>
+      <div className="details-pane-actions">
+        <button type="button" className="button secondary" onClick={() => onOpen(single)}>{single.type === "directory" ? <FolderOpen size={14} /> : <Eye size={14} />} {single.type === "directory" ? "Open" : "Preview"}</button>
+        <button type="button" className="button secondary" onClick={() => onDownload([single])}><Download size={14} /> Download</button>
+        {isOwner && <button type="button" className="icon-button" aria-label="Share link" title="Share link" onClick={() => onShare(single)}><Link2 size={15} /></button>}
+        <button type="button" className="icon-button" aria-label="Copy path" title="Copy path" onClick={() => void copyPath(single.path)}><ClipboardCopy size={15} /></button>
+        <button type="button" className="icon-button" aria-label="Properties" title="Properties (folder size, checksums)" onClick={() => onProperties(single)}><Info size={15} /></button>
+      </div>
+      <dl className="details-list">{rows.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}</dl>
+      {media && settled === single.path && <MediaPanel key={single.path} entry={single} />}
+    </>;
+  } else if (selected.length) {
+    const { files, folders, bytes } = summary(selected);
+    body = <>
+      <div className="details-pane-preview"><span className="file-icon"><ListChecks size={34} /></span></div>
+      <div className="details-pane-name"><strong>{itemCount(selected.length)} selected</strong></div>
+      <div className="details-pane-actions"><button type="button" className="button secondary" onClick={() => onDownload(selected)}><Download size={14} /> Download as ZIP</button></div>
+      <dl className="details-list">
+        <div><dt>Files</dt><dd>{files.toLocaleString()}{files ? ` · ${formatBytes(bytes)}` : ""}</dd></div>
+        <div><dt>Folders</dt><dd>{folders.toLocaleString()}{folders ? " (what's inside isn't counted)" : ""}</dd></div>
+      </dl>
+    </>;
+  } else {
+    const { files, folders, bytes } = summary(entries);
+    body = <>
+      <div className="details-pane-preview"><span className="file-icon directory"><FolderOpen size={34} /></span></div>
+      <div className="details-pane-name"><strong>{folder ? folder.split("/").at(-1) : "All files"}</strong></div>
+      <dl className="details-list">
+        <div><dt>Files</dt><dd>{files.toLocaleString()}{files ? ` · ${formatBytes(bytes)}` : ""}</dd></div>
+        <div><dt>Folders</dt><dd>{folders.toLocaleString()}</dd></div>
+        <div><dt>Where</dt><dd>{folder ? folderLabel(parentOf(folder)) : "—"}</dd></div>
+      </dl>
+      <p className="details-pane-hint">Select an item to see its details.</p>
+    </>;
+  }
+  return (
+    <aside className="details-pane" aria-label="Details">
+      <header className="other-pane-header"><strong className="details-pane-title">Details</strong><button type="button" className="icon-button" aria-label="Close details" title="Close details" onClick={onClose}><X size={16} /></button></header>
+      <div className="details-pane-body">{body}</div>
+    </aside>
   );
 }
 
