@@ -13,10 +13,14 @@ import { config } from "./config";
 // way, and the tool may only read that file, in one of the container formats listed below: a crafted
 // file can't make it open playlists, other files, or URLs.
 
-/** Runs the tool with these arguments on an open file, returning its output, or null on failure. */
-export type SandboxRun = (args: string[], fd: number, maxBytes: number) => Promise<Buffer | null>;
+/**
+ * Runs the tool with these arguments on an open file, returning its output, or null on failure. It
+ * is stopped after `seconds` (15 by default; reading a whole large video for its subtitles needs more).
+ */
+export type SandboxRun = (args: string[], fd: number, maxBytes: number, seconds?: number) => Promise<Buffer | null>;
 
-const KILL_AFTER_MS = 25_000;
+const DEFAULT_SECONDS = 15;
+const MAX_SECONDS = 600;
 const SYSTEMD_RUN = "/usr/bin/systemd-run";
 
 /** Container formats each use may read: video thumbnails only need the video ones. */
@@ -33,7 +37,7 @@ const SANDBOX = [
   "NoNewPrivileges=yes", "CapabilityBoundingSet=", "RestrictAddressFamilies=AF_UNIX", "RestrictNamespaces=yes", "RestrictRealtime=yes", "RestrictSUIDSGID=yes",
   // No socket calls at all (systemd can't drop the last address family), so no host sockets either.
   "LockPersonality=yes", "SystemCallFilter=@system-service", "SystemCallFilter=~@network-io", "SystemCallArchitectures=native",
-  "MemoryMax=512M", "TasksMax=64", "RuntimeMaxSec=15", "CPUQuota=200%",
+  "MemoryMax=512M", "TasksMax=64", "CPUQuota=200%",
   "TemporaryFileSystem=/etc:ro /run:ro", "BindReadOnlyPaths=-/etc/ld.so.cache -/etc/alternatives",
 ];
 
@@ -58,7 +62,7 @@ export async function sandboxRunner(tool: string): Promise<SandboxRun | null> {
   if (typeof process.getuid !== "function" || process.getuid() !== 0) return null;
   if (!(await executable(tool)) || !(await executable(SYSTEMD_RUN))) return null;
   const hidden = hiddenPaths();
-  return async (args, fd, maxBytes) => {
+  return async (args, fd, maxBytes, seconds = DEFAULT_SECONDS) => {
     // Each run reads from its own fresh opening of the file, at its start: the tool moves the file
     // position as it reads, and an earlier run must not leave it somewhere else.
     const source = await fs.open(`/proc/self/fd/${fd}`, constants.O_RDONLY | constants.O_NOCTTY).catch(() => null);
@@ -67,18 +71,19 @@ export async function sandboxRunner(tool: string): Promise<SandboxRun | null> {
       const original = fstatSync(fd);
       const reopened = await source.stat();
       if (!reopened.isFile() || original.dev !== reopened.dev || original.ino !== reopened.ino) return null;
-      return await run(tool, hidden, args, source.fd, maxBytes);
+      return await run(tool, hidden, args, source.fd, maxBytes, Math.min(Math.max(1, Math.round(seconds)), MAX_SECONDS));
     } finally {
       await source.close().catch(() => undefined);
     }
   };
 }
 
-function run(tool: string, hidden: string[], toolArgs: string[], fd: number, maxBytes: number) {
+function run(tool: string, hidden: string[], toolArgs: string[], fd: number, maxBytes: number, seconds: number) {
   return new Promise<Buffer | null>((resolve) => {
     const args = [
       "--pipe", "--wait", "--quiet", "--collect", "--service-type=exec",
       ...SANDBOX.flatMap((property) => ["-p", property]),
+      "-p", `RuntimeMaxSec=${seconds}`,
       // Wherever the data root and state folder are, they are out of reach too.
       "-p", `InaccessiblePaths=${[...hidden, config.root, config.stateDir].map((location) => quote(`-${path.resolve(location)}`)).join(" ")}`,
       tool, ...toolArgs,
@@ -87,7 +92,8 @@ function run(tool: string, hidden: string[], toolArgs: string[], fd: number, max
     const chunks: Buffer[] = [];
     let size = 0;
     let tooBig = false;
-    const timer = setTimeout(() => child.kill("SIGKILL"), KILL_AFTER_MS);
+    // A backstop in case systemd's own limit doesn't stop it.
+    const timer = setTimeout(() => child.kill("SIGKILL"), (seconds + 10) * 1000);
     child.stdout!.on("data", (chunk: Buffer) => {
       size += chunk.length;
       if (size > maxBytes) {

@@ -3609,6 +3609,17 @@ export function PreviewDialog({ entry, siblings = [], onStep, onClose, urls = lo
   const [error, setError] = useState("");
   const touchStart = useRef<{ x: number; y: number } | null>(null);
   const url = urls(entry).stream;
+  // A local video's subtitles (files beside it and tracks inside it), offered in the player's CC menu.
+  const [subtitles, setSubtitles] = useState<Array<{ id: string; label: string; language?: string }>>([]);
+  const local = urls === localPreviewUrls;
+  useEffect(() => {
+    if (!local || !entry.mime.startsWith("video/")) return;
+    const controller = new AbortController();
+    requestJson<{ tracks: Array<{ id: string; label: string; language?: string }> }>(`/api/fs/subtitles?path=${encodePath(entry.path)}`, { signal: controller.signal })
+      .then((result) => setSubtitles(result.tracks))
+      .catch(() => undefined);
+    return () => controller.abort();
+  }, [entry.path, entry.mime, local]);
   const index = siblings.findIndex((item) => item.path === entry.path);
   const previous = index > 0 ? siblings[index - 1] : null;
   const next = index >= 0 && index < siblings.length - 1 ? siblings[index + 1] : null;
@@ -3656,7 +3667,7 @@ export function PreviewDialog({ entry, siblings = [], onStep, onClose, urls = lo
   if (error) preview = <div className="preview-message"><CircleAlert size={24} /><p>{error}</p></div>;
   else if (isText) preview = text === null ? <div className="preview-message"><LoaderCircle className="spin" size={24} /><p>Loading preview…</p></div> : <pre className="text-preview">{text}</pre>;
   else if (entry.mime.startsWith("image/")) preview = <div className="image-preview"><img src={url} alt={entry.name} /></div>; // eslint-disable-line @next/next/no-img-element
-  else if (entry.mime.startsWith("video/")) preview = <video src={url} controls autoPlay />;
+  else if (entry.mime.startsWith("video/")) preview = <video src={url} controls autoPlay>{subtitles.map((track) => <track key={track.id} kind="subtitles" label={track.label} srcLang={track.language} src={`/api/fs/subtitles?path=${encodePath(entry.path)}&track=${encodeURIComponent(track.id)}`} />)}</video>;
   else if (entry.mime.startsWith("audio/")) preview = <div className="audio-preview"><FileAudio size={54} /><strong>{entry.name}</strong><audio src={url} controls autoPlay /></div>;
   else if (entry.mime === "application/pdf") preview = <iframe src={url} title={`Preview of ${entry.name}`} />;
   else preview = <div className="preview-message"><File size={42} /><h3>Preview unavailable</h3><p>This file type can still be downloaded.</p></div>;
