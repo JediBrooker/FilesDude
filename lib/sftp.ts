@@ -1,5 +1,6 @@
 import path from "node:path";
-import type { Readable, Writable } from "node:stream";
+import { Readable, Transform, type Writable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import ssh2, { type Client, type ConnectConfig, type FileEntryWithStats, type SFTPWrapper, type Stats } from "ssh2";
 import { connectionSettings, fingerprint, type ConnectionSettings } from "./connections";
 import { getMime } from "./files";
@@ -14,10 +15,20 @@ export type RemoteEntry = { name: string; path: string; type: "file" | "director
 
 const READY_TIMEOUT_MS = 15_000;
 const IDLE_CLOSE_MS = 60_000;
+// Connecting must finish in OPEN_DEADLINE_MS, and a single request that gets no answer in
+// CALL_TIMEOUT_MS means the server has stopped responding. Tests shorten them.
+let OPEN_DEADLINE_MS = 30_000;
+let CALL_TIMEOUT_MS = 60_000;
+export function setSftpTimeouts(timeouts: { open?: number; call?: number }) {
+  OPEN_DEADLINE_MS = timeouts.open ?? 30_000;
+  CALL_TIMEOUT_MS = timeouts.call ?? 60_000;
+}
 const MAX_LISTING = 10_000;
 
 type Session = { client: Client; sftp: SFTPWrapper; root: string; users: number; idle?: NodeJS.Timeout; closed: boolean };
 const sessions = new Map<string, Promise<Session>>();
+
+const stalled = () => new AppError("The server stopped responding", 504, "REMOTE_STALLED");
 
 function sshError(error: unknown, settings: ConnectionSettings): AppError {
   if (error instanceof AppError) return error;
@@ -84,30 +95,90 @@ export function remotePath(root: string, relative: string) {
   return path.posix.join(root || "/", ...parts);
 }
 
-const call = <T>(run: (done: (error: Error | null | undefined, value?: T) => void) => void) =>
-  new Promise<T>((resolve, reject) => run((error, value) => (error ? reject(error) : resolve(value as T))));
+// One request to the server; a server that never answers fails it rather than hanging forever.
+const call = <T>(run: (done: (error: Error | null | undefined, value?: T) => void) => void, timeoutMs?: number) =>
+  new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(stalled()), timeoutMs ?? CALL_TIMEOUT_MS);
+    run((error, value) => {
+      clearTimeout(timer);
+      if (error) reject(error);
+      else resolve(value as T);
+    });
+  });
+
+/**
+ * A folder's entries, read a batch at a time so a server that keeps sending entries can't use up
+ * memory: past `max` it stops (and says so), and it stops when `signal` does.
+ */
+export async function readDirectory(sftp: SFTPWrapper, absolute: string, max: number, signal?: AbortSignal) {
+  const handle = await call<Buffer>((done) => sftp.opendir(absolute, done));
+  const entries: FileEntryWithStats[] = [];
+  let truncated = false;
+  try {
+    for (;;) {
+      if (signal?.aborted) throw new AppError("Cancelled", 409, "JOB_CANCELLED");
+      const batch = await call<FileEntryWithStats[] | false>((done) => sftp.readdir(handle, (error, list) => {
+        // The end of the listing comes as an "end of file" status.
+        if (error && (error as { code?: number }).code === 1) done(undefined, false);
+        else done(error, list);
+      }));
+      if (!batch) break;
+      for (const entry of batch) {
+        if (entry.filename === "." || entry.filename === ".." || entry.filename.includes("/")) continue;
+        if (entries.length >= max) {
+          truncated = true;
+          break;
+        }
+        entries.push(entry);
+      }
+      if (truncated) break;
+    }
+  } finally {
+    await call<void>((done) => sftp.close(handle, done), 10_000).catch(() => undefined);
+  }
+  return { entries, truncated };
+}
+
+function endSession(id: string, session: Session) {
+  session.closed = true;
+  clearTimeout(session.idle);
+  void sessions.get(id)?.then((current) => { if (current === session) sessions.delete(id); }, () => undefined);
+  session.client.end();
+}
 
 async function openSession(id: string): Promise<Session> {
   const settings = await connectionSettings(id);
-  const { client, sftp } = await connect(settings);
-  const root = settings.root || (await call<string>((done) => sftp.realpath(".", done)).catch(() => "/"));
-  const session: Session = { client, sftp, root, users: 0, closed: false };
-  // A dropped connection is forgotten, so the next request opens a new one.
-  const forget = () => {
-    session.closed = true;
-    void sessions.get(id)?.then((current) => { if (current === session) sessions.delete(id); }, () => undefined);
-  };
-  client.on("close", forget);
-  client.on("error", forget);
-  return session;
+  let opened: { client: Client; sftp: SFTPWrapper } | undefined;
+  // Connecting and finding the starting folder must finish in time.
+  const deadline = new Promise<never>((_, reject) => setTimeout(() => {
+    opened?.client.end();
+    reject(stalled());
+  }, OPEN_DEADLINE_MS).unref());
+  return Promise.race([deadline, (async () => {
+    opened = await connect(settings);
+    const { client, sftp } = opened;
+    const root = settings.root || (await call<string>((done) => sftp.realpath(".", done)));
+    const session: Session = { client, sftp, root, users: 0, closed: false };
+    // A dropped connection is forgotten, so the next request opens a new one.
+    const forget = () => {
+      session.closed = true;
+      clearTimeout(session.idle);
+      void sessions.get(id)?.then((current) => { if (current === session) sessions.delete(id); }, () => undefined);
+    };
+    client.on("close", forget);
+    client.on("error", forget);
+    return session;
+  })()]);
 }
 
-/** Closes the server's session (after its settings change or it's removed). */
+/** Closes the server's session (after its settings change, it's removed, or it stops responding). */
 export async function closeSession(id: string) {
   const pending = sessions.get(id);
   sessions.delete(id);
-  const session = await pending?.catch(() => null);
-  if (session && !session.closed) session.client.end();
+  if (!pending) return;
+  // A session still opening is given a moment, then left to its own deadline.
+  const session = await Promise.race([pending.catch(() => null), new Promise<null>((resolve) => setTimeout(() => resolve(null), 5_000).unref())]);
+  if (session && !session.closed) endSession(id, session);
 }
 
 /** Runs `run` with an SFTP session to the server, reusing one opened in the last minute. */
@@ -116,11 +187,12 @@ export async function withSftp<T>(id: string, run: (sftp: SFTPWrapper, root: str
   if (!pending) {
     pending = openSession(id);
     sessions.set(id, pending);
-    pending.catch(() => { if (sessions.get(id) === pending) sessions.delete(id); });
+    const opening = pending;
+    opening.catch(() => { if (sessions.get(id) === opening) sessions.delete(id); });
   }
   const session = await pending;
   if (session.closed) {
-    sessions.delete(id);
+    if (sessions.get(id) === pending) sessions.delete(id);
     return withSftp(id, run);
   }
   session.users += 1;
@@ -128,11 +200,23 @@ export async function withSftp<T>(id: string, run: (sftp: SFTPWrapper, root: str
   try {
     return await run(session.sftp, session.root);
   } catch (error) {
+    // A server that stopped responding is disconnected, so nothing keeps waiting on it.
+    if (error instanceof AppError && error.code === "REMOTE_STALLED") endSession(id, session);
     throw remoteError(error);
   } finally {
     session.users -= 1;
-    if (!session.users) session.idle = setTimeout(() => void closeSession(id), IDLE_CLOSE_MS).unref();
+    // The idle timer closes only this session, and only if nothing has used it since.
+    if (!session.users && !session.closed) {
+      clearTimeout(session.idle);
+      session.idle = setTimeout(() => { if (!session.users) endSession(id, session); }, IDLE_CLOSE_MS).unref();
+    }
   }
+}
+
+/** Disconnects the server's current session, failing whatever is waiting on it (used to cancel). */
+export async function abortSession(id: string) {
+  const session = await sessions.get(id)?.catch(() => null);
+  if (session && !session.closed) endSession(id, session);
 }
 
 /** Connects once to check the settings work, reporting the server's fingerprint either way. */
@@ -149,13 +233,19 @@ export async function testConnection(id: string) {
   }
 }
 
-// SFTP status errors in words.
+// SFTP status errors (numeric codes) in words; local filesystem errors (named codes) say so without
+// paths.
 export function remoteError(error: unknown) {
   if (error instanceof AppError) return error;
-  const code = (error as { code?: number })?.code;
-  const message = (error as Error)?.message ?? String(error);
+  const code = (error as { code?: number | string })?.code;
+  if (typeof code === "string") {
+    if (code === "ENOSPC") return new AppError("There isn't enough free space here", 507, "NOT_ENOUGH_SPACE");
+    if (code === "EEXIST") return new AppError("An item couldn't be created here because one with that name already exists (names that differ only in case clash on some filesystems)", 409, "NAME_CONFLICT");
+    return new AppError(`Something here couldn't be written (${code})`, 500, "LOCAL_ERROR");
+  }
   if (code === 2) return new AppError("That file or folder no longer exists on the server", 404, "REMOTE_NOT_FOUND");
   if (code === 3) return new AppError("The server refused permission for that", 403, "REMOTE_PERMISSION");
+  const message = ((error as Error)?.message ?? String(error)).slice(0, 200);
   return new AppError(`The server reported an error: ${message}`, 502, "REMOTE_ERROR");
 }
 
@@ -185,10 +275,9 @@ const join = (folder: string, name: string) => (folder ? `${folder}/${name}` : n
 /** A folder's contents on the server. */
 export async function listRemote(id: string, relative: string) {
   return withSftp(id, async (sftp, root) => {
-    const entries = await call<FileEntryWithStats[]>((done) => sftp.readdir(remotePath(root, relative), done));
+    const { entries, truncated } = await readDirectory(sftp, remotePath(root, relative), MAX_LISTING);
     const folder = relative.split("/").filter((part) => part && part !== ".").join("/");
-    const list = entries.filter((entry) => entry.filename !== "." && entry.filename !== ".." && !entry.filename.includes("/")).slice(0, MAX_LISTING);
-    return { root, path: folder, truncated: entries.length > MAX_LISTING, entries: list.map((entry) => entryOf(entry.filename, join(folder, entry.filename), entry.attrs)) };
+    return { root, path: folder, truncated, entries: entries.map((entry) => entryOf(entry.filename, join(folder, entry.filename), entry.attrs)) };
   });
 }
 
@@ -252,10 +341,9 @@ export async function removeRemoteTree(sftp: SFTPWrapper, absolute: string, sign
     if (removed >= MAX_DELETE_ENTRIES || depth > 64) throw new AppError("That folder is too large to delete from here", 400, "TOO_LARGE");
     const stats = await statRemote(sftp, location);
     if (stats.isDirectory()) {
-      for (const entry of await call<FileEntryWithStats[]>((done) => sftp.readdir(location, done))) {
-        if (entry.filename === "." || entry.filename === ".." || entry.filename.includes("/")) continue;
-        await remove(path.posix.join(location, entry.filename), depth + 1);
-      }
+      const { entries, truncated } = await readDirectory(sftp, location, MAX_DELETE_ENTRIES - removed, signal);
+      if (truncated) throw new AppError("That folder is too large to delete from here", 400, "TOO_LARGE");
+      for (const entry of entries) await remove(path.posix.join(location, entry.filename), depth + 1);
       await call<void>((done) => sftp.rmdir(location, done));
     } else {
       // Files and links alike: a link is removed, never what it points to.
@@ -282,9 +370,14 @@ export async function deleteRemote(id: string, relatives: string[], signal?: Abo
 
 export { call as sftpCall };
 
-/** A stream of a file on the server (optionally a byte range), with its size. */
+const STREAM_IDLE_MS = 120_000;
+
+/**
+ * A stream of a file on the server (optionally a byte range), with its size. The session is held
+ * until the stream ends; one nobody reads for two minutes is closed. Never more than the size the
+ * server reported is sent.
+ */
 export async function readRemote(id: string, relative: string, range?: { start: number; end: number }) {
-  // The session is held until the stream ends.
   let release!: () => void;
   const held = new Promise<void>((resolve) => { release = resolve; });
   return new Promise<{ stream: Readable; size: number; name: string }>((resolve, reject) => {
@@ -292,10 +385,26 @@ export async function readRemote(id: string, relative: string, range?: { start: 
       const absolute = remotePath(root, relative);
       const stats = await call<Stats>((done) => sftp.stat(absolute, done));
       if (!stats.isFile()) throw new AppError("Only files can be opened", 400, "NOT_A_FILE");
-      const stream = sftp.createReadStream(absolute, range ? { start: range.start, end: range.end } : {});
-      stream.once("close", release);
-      stream.once("error", release);
-      resolve({ stream, size: Number(stats.size), name: path.posix.basename(absolute) });
+      const size = Number(stats.size);
+      const end = range ? range.end : size - 1;
+      if (end < (range?.start ?? 0)) {
+        resolve({ stream: Readable.from([]), size, name: path.posix.basename(absolute) });
+        release();
+        await held;
+        return;
+      }
+      const source = sftp.createReadStream(absolute, { start: range?.start ?? 0, end });
+      // Data passes through only as fast as it's read, so a stall here means nobody is reading.
+      let lastRead = Date.now();
+      const stream = new Transform({ transform(chunk, _encoding, done) { lastRead = Date.now(); done(null, chunk); } });
+      const watchdog = setInterval(() => { if (Date.now() - lastRead > STREAM_IDLE_MS) stream.destroy(); }, 15_000);
+      const finish = () => {
+        clearInterval(watchdog);
+        release();
+      };
+      stream.once("close", finish);
+      pipeline(source, stream).catch(() => undefined);
+      resolve({ stream, size, name: path.posix.basename(absolute) });
       await held;
     }).catch(reject);
   });

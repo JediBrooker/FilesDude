@@ -36,6 +36,7 @@ FilesDude is a secure, self-hosted web file manager designed for a Proxmox host,
 - Optional two-factor sign-in for every account with an authenticator app (6-digit codes), with one-time recovery codes
 - Duplicate finder (owner): scan a folder for files with identical contents, see which copies waste the most space, and move extra copies to the trash or replace them with hard links, always keeping one of each
 - ZFS snapshots: when the root is a ZFS dataset, browse earlier versions of files ("Previous versions" or **Snapshots**), download them, and restore them beside the current version; the owner can take snapshots or schedule them hourly or daily
+- Other servers (owner): connect to any machine you can SSH into over SFTP, then browse it, preview, download, upload, organise, and copy files and folders to and from FilesDude
 - User accounts: the owner (the installer's login) can add editors (view and change files) and viewers (view and download only), each confined to one folder, from **Users** in the sidebar
 - Multi-selection toolbar actions, responsive UI, dark mode, keyboard shortcuts, and no external analytics or storage services
 
@@ -272,6 +273,27 @@ flooding the log, and beyond that while history stays under 256 MB; only past 1 
 are recent ones removed, to protect the disk. Every entry is kept small, rotations and
 removals are recorded in the log, and downloads through a share link are recorded once per
 link and address every ten minutes rather than for each range request.
+
+## Other servers (SFTP)
+
+The owner can add other servers under **Servers** in the sidebar: a name, host, port,
+username, and how to sign in. The recommended way is a key FilesDude generates: only its
+public half leaves this server, to be added to `~/.ssh/authorized_keys` on the other one
+(the dialog shows the line and a command). A password or a pasted private key also work.
+Credentials are encrypted at rest in the state directory, bound to their server, and never
+sent to the browser; changing a password-based server's host or account needs the password
+again.
+
+The first connection shows the server's host key fingerprint to confirm (check it with
+`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on that server); after that, a changed key
+is refused. A server can be browsed within its starting folder, previewed, downloaded from,
+uploaded to, and organised (new folder, rename, delete: the server has no trash). Items copy
+both ways as background jobs with progress and cancel: select items there and choose **Copy
+to** the folder open in FilesDude, or select items in FilesDude and choose **Copy to server**.
+The other server is treated as untrusted: unsafe names, links, and special files are skipped;
+entries, bytes, and free space are checked as a copy goes; a folder is copied into a private
+placeholder and appears only once complete; and a server that stops responding is
+disconnected.
 
 ## Duplicate files
 

@@ -63,8 +63,18 @@ test("servers are stored with their credentials encrypted and never shown", asyn
     await trustHostKey(connection.id, `SHA256:${"A".repeat(43)}`);
     const renamed = await updateConnection(connection.id, { name: "NAS 2", host: "nas.local", port, username: "alice", auth: "password" });
     assert.equal(renamed.hostKey, `SHA256:${"A".repeat(43)}`);
-    const moved = await updateConnection(connection.id, { name: "NAS 2", host: "other.local", port, username: "alice", auth: "password" });
+    // A saved password isn't carried to a different server or account: it must be entered again.
+    await assert.rejects(updateConnection(connection.id, { name: "NAS 2", host: "other.local", port, username: "alice", auth: "password" }), /Enter the password again/);
+    await assert.rejects(updateConnection(connection.id, { name: "NAS 2", host: "nas.local", port, username: "mallory", auth: "password" }), /Enter the password again/);
+    const moved = await updateConnection(connection.id, { name: "NAS 2", host: "other.local", port, username: "alice", auth: "password", password: "new-pass" });
     assert.equal(moved.hostKey, undefined);
+    // Sealed credentials are bound to their entry: moved to another one, they can't be read.
+    const store = JSON.parse(await fs.readFile(path.join(state, "connections.json"), "utf8"));
+    const other = await createConnection({ name: "Other", host: "other.local", port, username: "alice", auth: "password", password: "x" });
+    const withOther = JSON.parse(await fs.readFile(path.join(state, "connections.json"), "utf8"));
+    withOther.find((item: { id: string }) => item.id === other.id).secret = store.find((item: { id: string }) => item.id === connection.id).secret;
+    await fs.writeFile(path.join(state, "connections.json"), JSON.stringify(withOther));
+    await assert.rejects(testConnection(other.id), /can't be read/);
     // A generated key keeps only its public half visible.
     const keyed = await createConnection({ name: "Keyed", host: "nas.local", username: "alice", auth: "key" });
     assert.match(keyed.publicKey!, /^ssh-ed25519 /);
@@ -83,9 +93,9 @@ test("a server's identity must be confirmed, and a changed one is refused", asyn
     const changed = await testConnection(id).catch((error) => error);
     assert.equal(changed.code, "HOST_KEY_CHANGED");
     assert.match(changed.fingerprint, /^SHA256:/);
-    // A wrong password is a clear sign-in failure.
-    const wrong = await connect({ password: "wrong" }).catch((error) => error);
-    assert.equal(wrong.code ?? (await testConnection((await listConnections()).at(-1)!.id).catch((error) => error)).code, "REMOTE_AUTH_FAILED");
+    // A wrong password is a clear sign-in failure (the host key is checked, and confirmed, first).
+    const wrongId = await connect({ name: "Wrong password", password: "wrong" });
+    assert.equal((await testConnection(wrongId).catch((error) => error)).code, "REMOTE_AUTH_FAILED");
   });
 });
 
@@ -99,11 +109,11 @@ test("FilesDude can sign in with a key it generated", async () => {
   const settingsFile = await fs.readFile(path.join(base, "connections.json"), "utf8");
   Object.assign(config, original);
   await withServer(async ({ state, port }) => {
-    // The same stored connection, pointed at this server.
-    const stored = JSON.parse(settingsFile);
-    stored[0].port = port;
+    // The same stored connection, pointed at this server (its key goes with it).
     await fs.mkdir(state, { recursive: true });
-    await fs.writeFile(path.join(state, "connections.json"), JSON.stringify(stored), { mode: 0o600 });
+    await fs.writeFile(path.join(state, "connections.json"), settingsFile, { mode: 0o600 });
+    const moved = await updateConnection(connection.id, { name: "Keyed", host: "127.0.0.1", port, username: "alice", auth: "key" });
+    assert.equal(moved.publicKey, connection.publicKey);
     const unknown = await testConnection(connection.id).catch((error) => error);
     await trustHostKey(connection.id, unknown.fingerprint);
     assert.equal((await testConnection(connection.id)).ok, true);

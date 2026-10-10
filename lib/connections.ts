@@ -47,17 +47,26 @@ function secretKey() {
   return Buffer.from(crypto.hkdfSync("sha256", config.sessionSecret, "filesdude-connections", "credentials v1", 32));
 }
 
-function seal(secret: Secret) {
+// Credentials are bound to the server they're for, so they can't be moved to another entry, and
+// changing the server or account needs them entered again.
+type Bound = { id: string; host: string; port: number; username: string };
+const boundTo = ({ id, host, port, username }: Bound) => Buffer.from(`${id}|${host}|${port}|${username}`, "utf8");
+const sameServer = (a: Omit<Bound, "id">, b: Omit<Bound, "id">) => a.host === b.host && a.port === b.port && a.username === b.username;
+
+function seal(secret: Secret, bound: Bound) {
   const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv("aes-256-gcm", secretKey(), iv);
+  const cipher = crypto.createCipheriv("aes-256-gcm", secretKey(), iv, { authTagLength: 16 });
+  cipher.setAAD(boundTo(bound));
   const data = Buffer.concat([cipher.update(JSON.stringify(secret), "utf8"), cipher.final()]);
   return [iv, cipher.getAuthTag(), data].map((part) => part.toString("base64")).join(".");
 }
 
-function open(sealed: string): Secret {
+function open(sealed: string, bound: Bound): Secret {
   try {
     const [iv, tag, data] = sealed.split(".").map((part) => Buffer.from(part, "base64"));
-    const decipher = crypto.createDecipheriv("aes-256-gcm", secretKey(), iv);
+    if (iv.length !== 12 || tag.length !== 16) throw new Error("malformed");
+    const decipher = crypto.createDecipheriv("aes-256-gcm", secretKey(), iv, { authTagLength: 16 });
+    decipher.setAAD(boundTo(bound));
     decipher.setAuthTag(tag);
     return JSON.parse(Buffer.concat([decipher.update(data), decipher.final()]).toString("utf8"));
   } catch {
@@ -105,7 +114,7 @@ export async function getConnection(id: string) {
 /** What connecting needs, with the credentials decrypted. Server-side only. */
 export async function connectionSettings(id: string): Promise<ConnectionSettings> {
   const found = await getConnection(id);
-  return { id: found.id, host: found.host, port: found.port, username: found.username, auth: found.auth, root: found.root, hostKey: found.hostKey, ...open(found.secret) };
+  return { id: found.id, host: found.host, port: found.port, username: found.username, auth: found.auth, root: found.root, hostKey: found.hostKey, ...open(found.secret, found) };
 }
 
 /** OpenSSH-style fingerprint of a raw host key: "SHA256:" and unpadded base64. */
@@ -163,25 +172,36 @@ function checkPrivateKey(privateKey: string, passphrase?: string) {
   if (parsed instanceof Error || (Array.isArray(parsed) ? !parsed.length : !parsed)) throw new AppError("That private key couldn't be read (check its passphrase)", 400, "INVALID_KEY");
 }
 
-/** Builds the credentials from the input; without new ones, an existing connection keeps its own. */
-function credentials(input: ConnectionInput, settings: ReturnType<typeof validate>, existing?: StoredConnection) {
+/**
+ * Builds the credentials from the input; without new ones, an existing connection keeps its own. A
+ * saved password is never carried over to a different server or account (it would be sent there);
+ * a key is, since signing in with it reveals nothing.
+ */
+function credentials(input: ConnectionInput, settings: ReturnType<typeof validate>, id: string, existing?: StoredConnection) {
+  const bound = { id, ...settings };
   if (settings.auth === "password") {
     if (typeof input.password === "string" && input.password) {
       if (input.password.length > 1024) throw new AppError("The password is too long", 400, "INVALID_CONNECTION");
-      return { secret: seal({ password: input.password }), publicKey: undefined };
+      return { secret: seal({ password: input.password }, bound), publicKey: undefined };
     }
-    if (existing?.auth === "password") return { secret: existing.secret, publicKey: undefined };
+    if (existing?.auth === "password") {
+      if (!sameServer(existing, settings)) throw new AppError("Enter the password again: the server or account changed", 400, "INVALID_CONNECTION");
+      return { secret: existing.secret, publicKey: undefined };
+    }
     throw new AppError("Enter the password", 400, "INVALID_CONNECTION");
   }
   if (typeof input.privateKey === "string" && input.privateKey.trim()) {
     const passphrase = typeof input.passphrase === "string" && input.passphrase ? input.passphrase : undefined;
     if (input.privateKey.length > 16_384) throw new AppError("That private key is too long", 400, "INVALID_KEY");
     checkPrivateKey(input.privateKey, passphrase);
-    return { secret: seal({ privateKey: input.privateKey, passphrase }), publicKey: undefined };
+    return { secret: seal({ privateKey: input.privateKey, passphrase }, bound), publicKey: undefined };
   }
-  if (existing?.auth === "key" && !input.generateKey) return { secret: existing.secret, publicKey: existing.publicKey };
+  if (existing?.auth === "key" && !input.generateKey) {
+    // The same key, sealed again for the (possibly changed) server.
+    return { secret: sameServer(existing, settings) ? existing.secret : seal(open(existing.secret, existing), bound), publicKey: existing.publicKey };
+  }
   const pair = generateKeyPair(settings.name);
-  return { secret: seal({ privateKey: pair.privateKey }), publicKey: pair.publicKey };
+  return { secret: seal({ privateKey: pair.privateKey }, bound), publicKey: pair.publicKey };
 }
 
 export async function createConnection(input: ConnectionInput) {
@@ -189,7 +209,8 @@ export async function createConnection(input: ConnectionInput) {
   return mutate((connections) => {
     if (connections.length >= MAX_CONNECTIONS) throw new AppError(`Set up at most ${MAX_CONNECTIONS} servers`, 409, "TOO_MANY_CONNECTIONS");
     const now = new Date().toISOString();
-    const stored: StoredConnection = { id: crypto.randomUUID(), ...settings, ...credentials(input, settings), createdAt: now, updatedAt: now };
+    const id = crypto.randomUUID();
+    const stored: StoredConnection = { id, ...settings, ...credentials(input, settings, id), createdAt: now, updatedAt: now };
     return { next: [...connections, stored], result: toPublic(stored) };
   });
 }
@@ -201,8 +222,8 @@ export async function updateConnection(id: string, input: ConnectionInput) {
     if (index < 0) throw new AppError("That server is no longer set up", 404, "CONNECTION_NOT_FOUND");
     const existing = connections[index];
     // A different server (host or port) has to have its identity confirmed again.
-    const sameServer = existing.host === settings.host && existing.port === settings.port;
-    const updated: StoredConnection = { ...existing, ...settings, ...credentials(input, settings, existing), hostKey: sameServer ? existing.hostKey : undefined, updatedAt: new Date().toISOString() };
+    const sameHost = existing.host === settings.host && existing.port === settings.port;
+    const updated: StoredConnection = { ...existing, ...settings, ...credentials(input, settings, id, existing), hostKey: sameHost ? existing.hostKey : undefined, updatedAt: new Date().toISOString() };
     const next = [...connections];
     next[index] = updated;
     return { next, result: toPublic(updated) };
