@@ -667,6 +667,14 @@ kbd { padding: 3px 5px; border: 1px solid var(--line); border-bottom-width: 2px;
 .preview-overlay.fullscreen { padding: 0; background: #000; backdrop-filter: none; }
 .preview-overlay.fullscreen .preview-modal { width: 100%; height: 100vh; border: 0; border-radius: 0; }
 .preview-overlay.fullscreen .preview-body, .preview-overlay.fullscreen .preview-stage { background: #000; }
+.video-preview { position: relative; display: flex; width: 100%; height: 100%; flex-direction: column; align-items: center; justify-content: center; }
+.video-preview video { min-height: 0; max-width: 100%; flex: 1; }
+.playback-notice { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 10px; padding: 10px 12px; border-radius: 10px; background: var(--panel); color: var(--ink); font-size: 11px; box-shadow: var(--shadow); }
+.playback-notice > svg { flex: 0 0 auto; color: var(--brand); }
+.playback-notice > span:not(.playback-progress):not(.form-error) { min-width: 0; flex: 1; }
+.playback-notice .button { min-height: 32px; padding: 0 12px; font-size: 10px; }
+.playback-progress { position: relative; display: block; width: 100%; height: 4px; overflow: hidden; border-radius: 4px; background: var(--line); }
+.playback-progress > span { position: absolute; inset: 0 auto 0 0; background: var(--brand); transition: width .4s; }
 .slideshow-controls { display: flex; align-items: center; gap: 6px; }
 .slideshow-controls select { height: 34px; padding: 0 8px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--panel); color: var(--ink); font-size: 10px; }
 .preview-modal { display: flex; width: min(1120px, 100%); height: min(760px, calc(100vh - 48px)); flex-direction: column; overflow: hidden; border: 1px solid var(--line); border-radius: 16px; background: var(--panel); box-shadow: var(--shadow); }
