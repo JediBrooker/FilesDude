@@ -542,6 +542,7 @@ export function FileManager() {
   const [watching, setWatching] = useState<Map<string, WatchEntry>>(() => new Map());
   // Video or audio that keeps playing while you browse.
   const [nowPlaying, setNowPlaying] = useState<NowPlaying | null>(null);
+  const playerSessions = useRef(0);
   const [toast, setToast] = useState<{ message: string; tone?: "error"; undo?: UndoAction } | null>(null);
   // A newer build the server runs than this page, and one the user chose not to reload for yet.
   const [serverBuild, setServerBuild] = useState<ServerBuild | null>(null);
@@ -1390,6 +1391,10 @@ export function FileManager() {
   });
 
   const logout = async () => {
+    // Whatever was playing or open belongs to this account: it goes (saving where it got to first).
+    setNowPlaying(null);
+    setDialog(null);
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
     await requestJson("/api/auth/logout", { method: "POST", body: JSON.stringify({}) });
     setFavorites([]);
     setAuth(initialAuth);
@@ -1664,14 +1669,14 @@ export function FileManager() {
           uploadInPieces={auth.features?.uploadInPieces ?? true}
           onReveal={(entry) => { setDialog(null); navigate(entry.path.split("/").slice(0, -1).join("/")); }}
           onPreview={showPreview}
-          onPlayer={(playing) => { setDialog(null); setNowPlaying(playing); }}
+          onPlayer={(playing) => { setDialog(null); setNowPlaying({ ...playing, session: ++playerSessions.current, account: auth.username ?? "" }); }}
         />
       )}
       {menu && createPortal(menu.kind === "entry"
         ? <FileActionMenu entry={menu.entry} targets={menuTargets(menu.entry)} position={{ top: menu.top, left: menu.left }} menuRef={menuRef} favoritePaths={favoritePaths} canWrite={canWrite} isOwner={isOwner} snapshots={snapshotsAvailable} canPaste={canWrite && Boolean(clipboard) && menu.entry.type === "directory"} onAction={(action, entry) => { setMenu(null); handleEntryAction(action, entry); }} />
         : <BackgroundMenu canWrite={canWrite} position={{ top: menu.top, left: menu.left }} menuRef={menuRef} folder={currentPath ? currentPath.split("/").at(-1) || "" : "All files"} clipboardCount={clipboard?.paths.length ?? 0} canSelectAll={sortedEntries.length > 0} onChoose={chooseBackground} />,
       document.body)}
-      {nowPlaying && <NowPlayingPlayer playing={nowPlaying} onChange={setNowPlaying} onClose={() => setNowPlaying(null)} onExpand={(entry, siblings, startAt) => { setNowPlaying(null); setDialog({ kind: "preview", entry, siblings, startAt }); }} />}
+      {nowPlaying && auth.authenticated && nowPlaying.account === (auth.username ?? "") && <NowPlayingPlayer key={nowPlaying.session} playing={nowPlaying} onChange={setNowPlaying} onClose={() => setNowPlaying(null)} onExpand={(entry, siblings, startAt) => { setNowPlaying(null); setDialog({ kind: "preview", entry, siblings, startAt }); }} />}
       {jobs.length > 0 && <div className="job-panels">{jobs.map((job) => <JobPanel key={job.id} job={job} onCancel={() => void cancelJob(job)} />)}</div>}
       {toast && <div className={`toast ${toast.tone === "error" ? "toast-error" : ""}`} role="status">{toast.tone === "error" ? <CircleAlert size={18} /> : <Check size={18} />}<span>{toast.message}</span>{toast.undo && <button className="toast-action" onClick={() => void runUndo(toast.undo!)}><Undo2 size={14} /> Undo</button>}</div>}
     </div>
@@ -4150,21 +4155,24 @@ function useWatchTracking(pathValue: string, mediaRef: React.RefObject<HTMLMedia
     if (position === state.saved) return;
     state.saved = position;
     state.savedAt = Date.now();
-    saveWatchPosition(pathValue, position, Math.round(state.duration));
-  }, [pathValue]);
+    // The file this state is about (a player that has just gone on to another may not have reset yet).
+    saveWatchPosition(state.path, position, Math.round(state.duration));
+  }, []);
   useEffect(() => {
     if (watch.current.path !== pathValue) watch.current = { path: pathValue, known: startAt !== undefined, target: startAt ?? 0, announce: startAt === undefined, applied: false, savedAt: 0, saved: -1, position: 0, duration: 0 };
     const controller = new AbortController();
-    if (!watch.current.known) {
+    const state = watch.current;
+    if (!state.known) {
       requestJson<{ entry: WatchEntry | null }>(`/api/watching?path=${encodePath(pathValue)}`, { signal: controller.signal })
         .then((result) => {
+          if (controller.signal.aborted) return;
           const item = result.entry;
-          watch.current.target = item && !item.watched && item.position >= RESUME_MIN_SECONDS ? item.position : 0;
+          state.target = item && !item.watched && item.position >= RESUME_MIN_SECONDS ? item.position : 0;
         })
         .catch(() => undefined)
         .finally(() => {
           if (controller.signal.aborted) return;
-          watch.current.known = true;
+          state.known = true;
           resume();
         });
     }
@@ -4292,7 +4300,7 @@ function VideoPreview({ entry, url, mediaRef, startAt, upNext, onUpNext, childre
         key={src} ref={(element) => { mediaRef.current = element; }} src={src} controls autoPlay playsInline
         {...tracking.mediaProps}
         onError={() => { if (!useCopy) setFailed(true); }}
-        onLoadedMetadata={(event) => { if (useCopy && resumeAt.current) event.currentTarget.currentTime = resumeAt.current; else tracking.mediaProps.onLoadedMetadata(); }}
+        onLoadedMetadata={(event) => { tracking.mediaProps.onLoadedMetadata(); if (useCopy && resumeAt.current) event.currentTarget.currentTime = resumeAt.current; }}
         onPlay={(event) => { setEnded(false); tracking.mediaProps.onPlay(event); }}
         onEnded={() => { tracking.save(true); setEnded(true); }}
       >{children}</video>
@@ -4328,6 +4336,10 @@ export type NowPlaying = {
   copy?: boolean;
   /** Asked for as picture in picture: a video goes into the browser's own floating window if it can. */
   picture?: boolean;
+  /** Each hand-off starts a fresh player (going on to the next file keeps it). */
+  session?: number;
+  /** The account it was started by: it never shows for another. */
+  account?: string;
 };
 
 /**
@@ -4363,7 +4375,7 @@ function NowPlayingPlayer({ playing, onChange, onClose, onExpand }: { playing: N
   const previous = index > 0 ? queue[index - 1] : null;
   const next = index >= 0 ? queue[index + 1] ?? null : null;
   const cover = mode === "audio" ? coverFor(siblings) : null;
-  const go = useCallback((item: FileEntry) => onChange({ entry: item, siblings, mode }), [onChange, siblings, mode]);
+  const go = useCallback((item: FileEntry) => onChange({ ...playing, entry: item, startAt: undefined, copy: undefined, picture: undefined }), [onChange, playing]);
   const playNext = useCallback(() => { if (next) go(next); }, [go, next]);
   const src = copy ? `/api/fs/playback?path=${encodePath(entry.path)}` : localPreviewUrls(entry).stream;
   const pictureInPicture = mode === "video" && typeof document !== "undefined" && document.pictureInPictureEnabled;
@@ -4425,8 +4437,8 @@ function NowPlayingPlayer({ playing, onChange, onClose, onExpand }: { playing: N
   const mediaEvents = {
     ...tracking.mediaProps,
     onLoadedMetadata: (event: React.SyntheticEvent<HTMLMediaElement>) => {
+      tracking.mediaProps.onLoadedMetadata();
       if (copy && resumeAt.current) event.currentTarget.currentTime = resumeAt.current;
-      else tracking.mediaProps.onLoadedMetadata();
       // Straight into the browser's floating window, while the click that asked for it still counts.
       if (playing.picture && pictureInPicture && !pictureTried.current && navigator.userActivation?.isActive !== false) {
         pictureTried.current = true;
