@@ -182,7 +182,8 @@ export interface ArchiveResult {
 
 export interface JobState {
   id: string;
-  kind: "compress" | "extract" | "copy" | "move" | "restore";
+  /** "send" is a copy to another server: its paths are on that server, so it has no undo here. */
+  kind: "compress" | "extract" | "copy" | "move" | "restore" | "send";
   label: string;
   status: "running" | "done" | "failed" | "cancelled";
   startedAt: string;

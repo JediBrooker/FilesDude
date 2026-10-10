@@ -337,7 +337,7 @@ type CopyContext = {
 const itemIdentityOf = (stat: BigIntStats): ItemIdentity => ({ dev: String(stat.dev), ino: String(stat.ino) });
 const itemKey = (identity: ItemIdentity) => `${identity.dev}:${identity.ino}`;
 
-const identityOf = (stat: Stats) => `${stat.dev}:${stat.ino}`;
+export const identityOf = (stat: Stats) => `${stat.dev}:${stat.ino}`;
 // What a move may remove once copied: folders by identity, anything else by identity, size, and
 // modification and change times, so a file changed after (or while) it was copied is kept.
 const fingerprintOf = (stat: BigIntStats) => (stat.isDirectory()
@@ -479,7 +479,7 @@ async function removeCopied(directory: AnchoredDirectory, name: string, sources:
  * then emptied, so an item swapped in at that name is never emptied, and the final rmdir by name
  * fails harmlessly if the name now holds something else.
  */
-async function removeCreated(directory: AnchoredDirectory, name: string, created: string | undefined) {
+export async function removeCreated(directory: AnchoredDirectory, name: string, created: string | undefined) {
   if (!created) return;
   const stat = await fs.lstat(inside(directory, name)).catch(missingAsNull);
   if (!stat || identityOf(stat) !== created) return;
@@ -504,7 +504,7 @@ const nameConflict = () => new AppError("An item with that name already exists i
  * filesystems without hard links, are renamed after checking the name is free, so only something
  * created in that moment could be replaced.
  */
-async function placeEntry(from: AnchoredDirectory, name: string, to: AnchoredDirectory, targetName: string) {
+export async function placeEntry(from: AnchoredDirectory, name: string, to: AnchoredDirectory, targetName: string) {
   const source = inside(from, name);
   const target = inside(to, targetName);
   const stat = await fs.lstat(source);

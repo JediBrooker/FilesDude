@@ -76,6 +76,7 @@ import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState
 import { createPortal } from "react-dom";
 import { ACTIVITY_CATEGORIES, activityCategory, activityUser, describeActivity, SHARE_LINK_ACTOR, SYSTEM_ACTOR, visibleText, type ActivityCategory } from "@/lib/activity-text";
 import { isNewerBuild as differsFrom, type BuildIdentity } from "@/lib/build";
+import { CopyToServerDialog, RemoteBrowserDialog, ServerSettingsDialog, type ServerConnection } from "./remote-servers";
 import { moveCursor, selectionRange } from "@/lib/selection";
 import { INITIAL_DIRECTION, nextSort, parseSort, sortEntries, type SortKey, type SortState } from "@/lib/sort";
 import type { ContentSearchHit, ContentSearchResult, ShareLink } from "@/lib/types";
@@ -113,6 +114,10 @@ type DialogState =
   | { kind: "shares" }
   | { kind: "users" }
   | { kind: "activity" }
+  // The owner's other servers: browsing one, adding or editing one, and copying items to one.
+  | { kind: "server"; id: string }
+  | { kind: "serverSettings"; id?: string }
+  | { kind: "copyToServer" }
   | { kind: "new" }
   | { kind: "rename"; entry: FileEntry }
   | { kind: "delete" }
@@ -267,7 +272,7 @@ const initialAuth: AuthState = {
   configurationIssues: [],
 };
 
-function formatBytes(value: number) {
+export function formatBytes(value: number) {
   if (!Number.isFinite(value) || value === 0) return value === 0 ? "0 B" : "—";
   const units = ["B", "KB", "MB", "GB", "TB", "PB"];
   const index = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1);
@@ -283,7 +288,7 @@ function csvCell(value: string | number) {
   return `"${String(value).replaceAll('"', '""')}"`;
 }
 
-function formatDate(value: string) {
+export function formatDate(value: string) {
   const date = new Date(value);
   const today = new Date();
   const sameDay = date.toDateString() === today.toDateString();
@@ -293,7 +298,7 @@ function formatDate(value: string) {
   ).format(date);
 }
 
-function encodePath(value: string) {
+export function encodePath(value: string) {
   return encodeURIComponent(value);
 }
 
@@ -309,7 +314,7 @@ function ownershipKey(pair: Pick<OwnershipPair, "uid" | "gid">) {
   return `${pair.uid}:${pair.gid}`;
 }
 
-function extension(name: string) {
+export function extension(name: string) {
   const index = name.lastIndexOf(".");
   return index > 0 ? name.slice(index + 1).toUpperCase() : "FILE";
 }
@@ -319,7 +324,7 @@ function isEditable(entry: FileEntry) {
   return entry.type === "file" && textType && entry.size <= 2 * 1024 * 1024;
 }
 
-function fileIcon(entry: Pick<FileEntry, "type" | "mime">, size = 20) {
+export function fileIcon(entry: Pick<FileEntry, "type" | "mime">, size = 20) {
   if (entry.type === "directory") return <Folder size={size} strokeWidth={1.8} />;
   if (entry.mime.startsWith("image/")) return <FileImage size={size} strokeWidth={1.8} />;
   if (entry.mime.startsWith("video/")) return <FileVideo size={size} strokeWidth={1.8} />;
@@ -332,7 +337,7 @@ function fileIcon(entry: Pick<FileEntry, "type" | "mime">, size = 20) {
 
 // navigator.clipboard only exists on HTTPS or localhost, so plain-HTTP LAN access falls back to
 // the older copy command.
-async function copyText(text: string) {
+export async function copyText(text: string) {
   try {
     if (navigator.clipboard && window.isSecureContext) {
       await navigator.clipboard.writeText(text);
@@ -357,7 +362,7 @@ function shareAddress(link: ShareLink) {
   return `${window.location.origin}${link.url}`;
 }
 
-function formatDateTime(value: string) {
+export function formatDateTime(value: string) {
   return new Date(value).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
 }
 
@@ -377,7 +382,7 @@ function startDownload(pathValue: string) {
   downloadFrom(`/api/fs/download?path=${encodePath(pathValue)}`);
 }
 
-function downloadFrom(url: string) {
+export function downloadFrom(url: string) {
   const link = document.createElement("a");
   link.href = url;
   link.download = "";
@@ -386,15 +391,15 @@ function downloadFrom(url: string) {
   link.remove();
 }
 
-function parentOf(pathValue: string) {
+export function parentOf(pathValue: string) {
   return pathValue.split("/").slice(0, -1).join("/");
 }
 
-function itemCount(count: number) {
+export function itemCount(count: number) {
   return `${count} ${count === 1 ? "item" : "items"}`;
 }
 
-function folderLabel(pathValue: string) {
+export function folderLabel(pathValue: string) {
   return pathValue ? `/${pathValue}` : "Root";
 }
 
@@ -430,7 +435,7 @@ function gridColumns() {
   return grid ? Math.max(1, getComputedStyle(grid).gridTemplateColumns.split(" ").filter(Boolean).length) : 1;
 }
 
-function formatRemaining(seconds: number) {
+export function formatRemaining(seconds: number) {
   if (!Number.isFinite(seconds) || seconds <= 0) return "";
   if (seconds < 60) return `about ${Math.max(1, Math.round(seconds))}s left`;
   if (seconds < 3600) return `about ${Math.round(seconds / 60)} min left`;
@@ -438,7 +443,7 @@ function formatRemaining(seconds: number) {
 }
 
 // fetch() cannot report upload progress, so single-file uploads go through XMLHttpRequest.
-function uploadFile<T>(url: string, file: File, onProgress: (loaded: number) => void, signal: AbortSignal) {
+export function uploadFile<T>(url: string, file: File, onProgress: (loaded: number) => void, signal: AbortSignal) {
   return new Promise<T>((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     const abort = () => xhr.abort();
@@ -467,7 +472,7 @@ function uploadFile<T>(url: string, file: File, onProgress: (loaded: number) => 
   });
 }
 
-async function requestJson<T>(url: string, options: RequestInit = {}): Promise<T> {
+export async function requestJson<T>(url: string, options: RequestInit = {}): Promise<T> {
   const headers = new Headers(options.headers);
   if (options.method && options.method !== "GET") headers.set("x-filedude-request", "1");
   if (options.body && !(options.body instanceof FormData)) headers.set("Content-Type", "application/json");
@@ -728,6 +733,18 @@ export function FileManager() {
     return () => window.clearTimeout(timer);
   }, [auth.authenticated, loadFavorites]);
 
+  // The owner's other servers, for the sidebar.
+  const [connections, setConnections] = useState<ServerConnection[]>([]);
+  const loadConnections = useCallback(async () => {
+    if (!auth.authenticated || auth.role !== "owner") return;
+    const result = await requestJson<{ connections: ServerConnection[] }>("/api/connections").catch(() => null);
+    if (result) setConnections(result.connections);
+  }, [auth.authenticated, auth.role]);
+  useEffect(() => {
+    const timer = window.setTimeout(() => void loadConnections(), 0);
+    return () => window.clearTimeout(timer);
+  }, [loadConnections]);
+
   useEffect(() => {
     window.history.replaceState({ path: currentPath, index: 0 }, "", buildUrl(currentPath));
     // eslint-disable-next-line react-hooks/exhaustive-deps -- only the path present at mount should seed the initial history entry
@@ -874,7 +891,14 @@ export function FileManager() {
   const finishJob = async (job: JobState) => {
     if (finishedJobsRef.current.has(job.id)) return;
     finishedJobsRef.current.add(job.id);
-    if (job.kind === "restore") {
+    if (job.kind === "send") {
+      // A copy to another server: its paths are on that server, so there's no undo here.
+      const items = job.transferred ?? [];
+      const server = job.label.replace(/^Copying .* to /, "");
+      if (job.status === "done") notify(`${itemCount(items.length)} copied to ${server}`);
+      else if (job.status === "failed") notify(job.error || `The copy to ${server} failed`, "error");
+      else notify(`Copy to ${server} cancelled${items.length ? ` after ${itemCount(items.length)}` : ""}`);
+    } else if (job.kind === "restore") {
       const restored = job.transferred?.[0];
       if (job.status === "done" && restored) {
         notify(`Restored as /${restored.path}`, undefined, undoFor({ action: "copy" }, job.transferred) ?? undefined);
@@ -1392,12 +1416,16 @@ export function FileManager() {
         </div>
 
         <div className="sidebar-section">
-          <p className="eyebrow">SERVER</p>
+          <p className="eyebrow">{isOwner ? "SERVERS" : "SERVER"}</p>
           <div className="server-card">
             <div className="server-card-icon"><Server size={19} /></div>
             <div><strong>Local filesystem</strong><span>Connected securely</span></div>
             <span className="live-dot" title="Connected" />
           </div>
+          {isOwner && <div className="remote-server-list">
+            {connections.map((connection) => <button key={connection.id} type="button" className="remote-server-item" title={`${connection.username}@${connection.host}`} onClick={() => { setDialog({ kind: "server", id: connection.id }); setSidebarOpen(false); }}><Server size={15} /><span><strong>{connection.name}</strong><small>{connection.host}</small></span></button>)}
+            <button type="button" className="remote-server-add" onClick={() => { setDialog({ kind: "serverSettings" }); setSidebarOpen(false); }}><Plus size={14} /> Add a server</button>
+          </div>}
         </div>
 
         <button type="button" className={`storage-card ${isOwner ? "" : "static"}`} title={isOwner ? "Find the largest files" : undefined} aria-label={isOwner ? "Storage usage. Open the largest-files scanner" : "Storage usage"} disabled={!isOwner} onClick={() => setDialog({ kind: "storage" })}>
@@ -1514,6 +1542,7 @@ export function FileManager() {
                 {isOwner && <button onClick={() => setDialog({ kind: "permissions" })}><KeyRound size={16} /> Permissions</button>}
                 {isOwner && <button onClick={() => setDialog({ kind: "ownership" })}><UserRoundCog size={16} /> Ownership</button>}
                 {canWrite && <button onClick={() => setDialog({ kind: "compress" })}><FileArchive size={16} /> Compress</button>}
+                {isOwner && connections.length > 0 && <button onClick={() => setDialog({ kind: "copyToServer" })}><Server size={16} /> Copy to server</button>}
                 {canWrite && selected.size > 1 && <button onClick={() => setDialog({ kind: "bulk" })}><Sparkles size={16} /> Bulk rename</button>}
                 {selected.size === 1 && <button onClick={() => setDialog({ kind: "details", entry: selectedEntries[0] })}><Info size={16} /> Properties</button>}
                 {canWrite && <button className="danger-action" onClick={() => setDialog({ kind: "delete" })}><Trash2 size={16} /> Delete</button>}
@@ -1558,6 +1587,22 @@ export function FileManager() {
       </main>
 
       {sidebarOpen && <button className="sidebar-backdrop" aria-label="Close navigation" onClick={() => setSidebarOpen(false)} />}
+      {dialog?.kind === "server" && connections.some((item) => item.id === dialog.id) && (
+        <RemoteBrowserDialog key={dialog.id} connection={connections.find((item) => item.id === dialog.id)!} localFolder={currentPath} onClose={() => setDialog(null)} onEdit={() => setDialog({ kind: "serverSettings", id: dialog.id })} onJob={trackJob} notify={notify} />
+      )}
+      {dialog?.kind === "serverSettings" && (
+        <ServerSettingsDialog
+          connection={dialog.id ? connections.find((item) => item.id === dialog.id) : undefined}
+          onClose={() => setDialog(null)}
+          onSaved={(saved, open) => {
+            setConnections((current) => [...current.filter((item) => item.id !== saved.id), saved].sort((a, b) => a.name.localeCompare(b.name)));
+            if (open) setDialog({ kind: "server", id: saved.id });
+          }}
+          onDeleted={(id) => { setConnections((current) => current.filter((item) => item.id !== id)); setDialog(null); }}
+          notify={notify}
+        />
+      )}
+      {dialog?.kind === "copyToServer" && connections.length > 0 && <CopyToServerDialog entries={selectedEntries} connections={connections} onClose={() => setDialog(null)} onJob={trackJob} notify={notify} />}
       {dialog && (
         <DialogHost
           dialog={dialog}
@@ -1876,7 +1921,7 @@ function GridPreview({ entry, onOpen, videoThumbnails }: { entry: FileEntry; onO
   );
 }
 
-function CheckBox({ checked, onChange, label }: { checked: boolean; onChange: (event: { shiftKey: boolean }) => void; label: string }) {
+export function CheckBox({ checked, onChange, label }: { checked: boolean; onChange: (event: { shiftKey: boolean }) => void; label: string }) {
   // React fires a checkbox's change from its click event, which carries the shift key.
   return <label className="checkbox"><input type="checkbox" checked={checked} onChange={(event) => onChange({ shiftKey: (event.nativeEvent as MouseEvent).shiftKey === true })} aria-label={label} /><span>{checked && <Check size={12} strokeWidth={3} />}</span></label>;
 }
@@ -1956,7 +2001,7 @@ function FileSkeleton() {
 }
 
 function JobPanel({ job, onCancel }: { job: JobState; onCancel: () => void }) {
-  const icons: Record<JobState["kind"], ReactNode> = { compress: <FileArchive size={17} />, extract: <PackageOpen size={17} />, copy: <Copy size={17} />, move: <FolderInput size={17} />, restore: <History size={17} /> };
+  const icons: Record<JobState["kind"], ReactNode> = { compress: <FileArchive size={17} />, extract: <PackageOpen size={17} />, copy: <Copy size={17} />, move: <FolderInput size={17} />, restore: <History size={17} />, send: <Server size={17} /> };
   const percent = job.progress.total ? Math.min(100, (job.progress.done / job.progress.total) * 100) : undefined;
   return (
     <div className="job-panel" role="status" aria-live="polite">
@@ -1987,6 +2032,8 @@ function DialogHost({ dialog, selected, currentPath, username, role, home, onClo
   onReveal: (entry: FileEntry) => void;
   onPreview: (entry: FileEntry, siblings?: FileEntry[]) => void;
 }) {
+  // The server dialogs are shown by FileManager, which holds the list of servers.
+  if (dialog.kind === "server" || dialog.kind === "serverSettings" || dialog.kind === "copyToServer") return null;
   if (dialog.kind === "upload") return <UploadDialog items={dialog.items} folders={dialog.folders} currentPath={currentPath} chooseOwnership={role === "owner"} onClose={onClose} notify={notify} onComplete={onRefresh} />;
   if (dialog.kind === "users") return <UsersDialog onClose={onClose} notify={notify} />;
   if (dialog.kind === "duplicates") return <DuplicatesDialog startPath={currentPath} onClose={onClose} notify={notify} onRefresh={onRefresh} onReveal={onReveal} />;
@@ -2017,11 +2064,11 @@ function DialogHost({ dialog, selected, currentPath, username, role, home, onClo
   return <DetailsDialog entry={dialog.entry} onClose={onClose} />;
 }
 
-function Modal({ title, subtitle, icon, onClose, children, wide = false }: { title: string; subtitle?: string; icon?: ReactNode; onClose: () => void; children: ReactNode; wide?: boolean }) {
+export function Modal({ title, subtitle, icon, onClose, children, wide = false }: { title: string; subtitle?: string; icon?: ReactNode; onClose: () => void; children: ReactNode; wide?: boolean }) {
   return <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className={`modal ${wide ? "modal-wide" : ""}`} role="dialog" aria-modal="true" aria-label={title}><header><div className="modal-title">{icon && <span>{icon}</span>}<div><h2>{title}</h2>{subtitle && <p>{subtitle}</p>}</div></div><button className="icon-button" aria-label="Close dialog" onClick={onClose}><X size={18} /></button></header>{children}</section></div>;
 }
 
-function ModalActions({ onClose, submitLabel, danger = false, busy = false, disabled = false }: { onClose: () => void; submitLabel: string; danger?: boolean; busy?: boolean; disabled?: boolean }) {
+export function ModalActions({ onClose, submitLabel, danger = false, busy = false, disabled = false }: { onClose: () => void; submitLabel: string; danger?: boolean; busy?: boolean; disabled?: boolean }) {
   return <div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className={`button ${danger ? "danger" : "primary"}`} disabled={busy || disabled}>{busy && <LoaderCircle className="spin" size={16} />}{submitLabel}</button></div>;
 }
 
@@ -3549,11 +3596,15 @@ function UsersDialog({ onClose, notify }: { onClose: () => void; notify: (messag
 // Neighbouring images up to this size are fetched ahead, so stepping through photos is instant.
 const PRELOAD_IMAGE_BYTES = 32 * 1024 * 1024;
 
-function PreviewDialog({ entry, siblings = [], onStep, onClose }: { entry: FileEntry; siblings?: FileEntry[]; onStep: (entry: FileEntry) => void; onClose: () => void }) {
+// Where a preview reads a file from and downloads it: FilesDude's own files by default.
+export type PreviewUrls = (entry: FileEntry) => { stream: string; download: string };
+const localPreviewUrls: PreviewUrls = (entry) => ({ stream: `/api/fs/stream?path=${encodePath(entry.path)}`, download: `/api/fs/download?path=${encodePath(entry.path)}` });
+
+export function PreviewDialog({ entry, siblings = [], onStep, onClose, urls = localPreviewUrls }: { entry: FileEntry; siblings?: FileEntry[]; onStep: (entry: FileEntry) => void; onClose: () => void; urls?: PreviewUrls }) {
   const [text, setText] = useState<string | null>(null);
   const [error, setError] = useState("");
   const touchStart = useRef<{ x: number; y: number } | null>(null);
-  const url = `/api/fs/stream?path=${encodePath(entry.path)}`;
+  const url = urls(entry).stream;
   const index = siblings.findIndex((item) => item.path === entry.path);
   const previous = index > 0 ? siblings[index - 1] : null;
   const next = index >= 0 && index < siblings.length - 1 ? siblings[index + 1] : null;
@@ -3575,9 +3626,9 @@ function PreviewDialog({ entry, siblings = [], onStep, onClose }: { entry: FileE
 
   useEffect(() => {
     for (const item of [next, previous]) {
-      if (item && item.mime.startsWith("image/") && item.mime !== "image/svg+xml" && item.size <= PRELOAD_IMAGE_BYTES) new Image().src = `/api/fs/stream?path=${encodePath(item.path)}`;
+      if (item && item.mime.startsWith("image/") && item.mime !== "image/svg+xml" && item.size <= PRELOAD_IMAGE_BYTES) new Image().src = urls(item).stream;
     }
-  }, [next, previous]);
+  }, [next, previous, urls]);
 
   // A horizontal swipe steps on touch screens, over pictures and messages (not over videos, PDFs,
   // or text, which have their own gestures).
@@ -3605,7 +3656,7 @@ function PreviewDialog({ entry, siblings = [], onStep, onClose }: { entry: FileE
   else if (entry.mime.startsWith("audio/")) preview = <div className="audio-preview"><FileAudio size={54} /><strong>{entry.name}</strong><audio src={url} controls autoPlay /></div>;
   else if (entry.mime === "application/pdf") preview = <iframe src={url} title={`Preview of ${entry.name}`} />;
   else preview = <div className="preview-message"><File size={42} /><h3>Preview unavailable</h3><p>This file type can still be downloaded.</p></div>;
-  return <div className="preview-overlay"><section className="preview-modal" role="dialog" aria-modal="true" aria-label={`Preview ${entry.name}`}><header><div><span className={`file-icon ${entry.type}`}>{fileIcon(entry)}</span><div><strong>{entry.name}</strong><span>{extension(entry.name)} · {formatBytes(entry.size)}{index >= 0 && siblings.length > 1 ? ` · ${index + 1} of ${siblings.length}` : ""}</span></div></div><div><a className="button secondary" href={`/api/fs/download?path=${encodePath(entry.path)}`}><ArrowDownToLine size={16} /> Download</a><button className="icon-button" aria-label="Close preview" onClick={onClose}><X size={19} /></button></div></header><div className="preview-stage" onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}><div className="preview-body">{preview}</div>{previous && <button type="button" className="preview-nav previous" aria-label={`Previous: ${previous.name}`} title={`${previous.name} (←)`} onClick={() => onStep(previous)}><ChevronLeft size={22} /></button>}{next && <button type="button" className="preview-nav next" aria-label={`Next: ${next.name}`} title={`${next.name} (→)`} onClick={() => onStep(next)}><ChevronRight size={22} /></button>}</div></section></div>;
+  return <div className="preview-overlay"><section className="preview-modal" role="dialog" aria-modal="true" aria-label={`Preview ${entry.name}`}><header><div><span className={`file-icon ${entry.type}`}>{fileIcon(entry)}</span><div><strong>{entry.name}</strong><span>{extension(entry.name)} · {formatBytes(entry.size)}{index >= 0 && siblings.length > 1 ? ` · ${index + 1} of ${siblings.length}` : ""}</span></div></div><div><a className="button secondary" href={urls(entry).download}><ArrowDownToLine size={16} /> Download</a><button className="icon-button" aria-label="Close preview" onClick={onClose}><X size={19} /></button></div></header><div className="preview-stage" onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}><div className="preview-body">{preview}</div>{previous && <button type="button" className="preview-nav previous" aria-label={`Previous: ${previous.name}`} title={`${previous.name} (←)`} onClick={() => onStep(previous)}><ChevronLeft size={22} /></button>}{next && <button type="button" className="preview-nav next" aria-label={`Next: ${next.name}`} title={`${next.name} (→)`} onClick={() => onStep(next)}><ChevronRight size={22} /></button>}</div></section></div>;
 }
 
 type Checksums = { sha256: string; md5: string };
@@ -3768,6 +3819,6 @@ function DetailsDialog({ entry, onClose }: { entry: FileEntry; onClose: () => vo
   return <Modal title="Item details" subtitle={entry.name} icon={<Info size={19} />} onClose={onClose}><div className="details-hero"><span className={`file-icon ${entry.type}`}>{fileIcon(entry, 32)}</span><div><strong>{entry.name}</strong><span>{entry.type === "directory" ? "Folder" : extension(entry.name)}</span></div></div><dl className="details-list">{rows.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{label === "Permissions" ? <code className="mode-chip">{value}</code> : value}</dd></div>)}</dl>{media && <MediaPanel entry={entry} />}{entry.type === "directory" && <FolderSizePanel entry={entry} />}{entry.type === "file" && <ChecksumPanel entry={entry} />}<div className="modal-actions"><button className="button primary" onClick={onClose}>Done</button></div></Modal>;
 }
 
-function FormField({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
+export function FormField({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
   return <label className="form-field"><span>{label}</span>{children}{hint && <small>{hint}</small>}</label>;
 }
