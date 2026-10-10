@@ -1,6 +1,6 @@
 import { type ChildProcess, type StdioOptions, execFile, spawn } from "node:child_process";
 import crypto from "node:crypto";
-import { constants, fstatSync, readdirSync } from "node:fs";
+import { constants, fstatSync, readdirSync, readFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { config } from "./config";
@@ -73,6 +73,29 @@ export interface SandboxOptions {
    * sockets): it still can't make, connect, or use a socket.
    */
   inspectSockets?: boolean;
+  /**
+   * The tool writes to a file (its standard output) of at most this many bytes: it can't grow it
+   * past that, or reserve disk space without writing (which a size check wouldn't see).
+   */
+  fileOutput?: number;
+}
+
+/** Disk space a file takes up, which a file with space reserved past its end can exceed its size by. */
+export const diskUsage = (stat: { size: number; blocks: number }) => Math.max(stat.size, stat.blocks * 512);
+
+// The systemd service FilesDude runs as, if it does: runs are bound to it, so they stop when it
+// stops or restarts (a new FilesDude wouldn't know about them).
+let ownService: string | null | undefined;
+function serviceOfThisProcess() {
+  if (ownService === undefined) {
+    try {
+      const match = /^0::\/(?:.*\/)?([A-Za-z0-9_.@-]+\.service)$/m.exec(readFileSync("/proc/self/cgroup", "utf8"));
+      ownService = match?.[1] ?? null;
+    } catch {
+      ownService = null;
+    }
+  }
+  return ownService;
 }
 
 /**
@@ -139,7 +162,7 @@ export async function sandboxFileRunner(tool: string): Promise<SandboxFileRun | 
       if (!reopened.isFile() || original.dev !== reopened.dev || original.ino !== reopened.ino) return false;
       const unit = `filesdude-media-${crypto.randomUUID()}`;
       return await new Promise<boolean>((resolve) => {
-        const child = spawn(SYSTEMD_RUN, unitArguments(unit, [tool, ...args], limit, hidden), { stdio: [source.fd, output, "ignore"] });
+        const child = spawn(SYSTEMD_RUN, unitArguments(unit, [tool, ...args], limit, hidden, { fileOutput: maxBytes }), { stdio: [source.fd, output, "ignore"] });
         let stopped = false;
         const stop = () => {
           if (stopped) return;
@@ -150,7 +173,7 @@ export async function sandboxFileRunner(tool: string): Promise<SandboxFileRun | 
         // The output is watched as it grows, so a crafted file can't fill the disk.
         const watch = setInterval(() => {
           try {
-            if (fstatSync(output).size > maxBytes) stop();
+            if (diskUsage(fstatSync(output)) > maxBytes) stop();
           } catch {
             stop();
           }
@@ -161,13 +184,16 @@ export async function sandboxFileRunner(tool: string): Promise<SandboxFileRun | 
           clearInterval(watch);
           clearTimeout(timer);
           signal?.removeEventListener("abort", stop);
-          let size = Infinity;
+          let size = 0;
+          let used = Infinity;
           try {
-            size = fstatSync(output).size;
+            const stat = fstatSync(output);
+            size = stat.size;
+            used = diskUsage(stat);
           } catch {
             // A closed output means nothing usable was written.
           }
-          resolve(ok && !stopped && size > 0 && size <= maxBytes);
+          resolve(ok && !stopped && size > 0 && used <= maxBytes);
         };
         child.on("error", () => finish(false));
         child.on("close", (code) => finish(code === 0));
@@ -179,11 +205,14 @@ export async function sandboxFileRunner(tool: string): Promise<SandboxFileRun | 
 }
 
 /** systemd-run's arguments for one run of this command, as the unit with this name. */
-export function unitArguments(unit: string, command: string[], seconds: number, hidden: string[], { mounts = [], inspectSockets = false }: SandboxOptions = {}) {
+export function unitArguments(unit: string, command: string[], seconds: number, hidden: string[], { mounts = [], inspectSockets = false, fileOutput }: SandboxOptions = {}, service = serviceOfThisProcess()) {
   return [
     "--pipe", "--wait", "--quiet", "--collect", "--service-type=exec", `--unit=${unit}`,
     ...SANDBOX.flatMap((property) => ["-p", property]),
     ...(inspectSockets ? ["-p", "SystemCallFilter=getsockname getsockopt"] : []),
+    // The kernel refuses writes past the limit; reserving space and resizing aren't allowed at all.
+    ...(fileOutput !== undefined ? ["-p", `LimitFSIZE=${Math.max(1, Math.floor(fileOutput))}`, "-p", "SystemCallFilter=~fallocate ftruncate"] : []),
+    ...(service ? ["-p", `BindsTo=${service}`] : []),
     "-p", `RuntimeMaxSec=${seconds}`,
     // Long runs read whole videos; they yield the disk to everything else.
     ...(seconds > DEFAULT_SECONDS ? ["-p", "IOWeight=10", "-p", "CPUWeight=20"] : []),

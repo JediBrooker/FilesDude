@@ -6,14 +6,16 @@ import { reservedPathCheck } from "./archives";
 import { config } from "./config";
 import { acquireFilesystemLock, getMime, openVerifiedFile } from "./files";
 import { AppError } from "./http";
-import { inputLimits, sandboxFileRunner, sandboxRunner, VIDEO_FORMATS } from "./media-sandbox";
+import { diskUsage, inputLimits, sandboxFileRunner, sandboxRunner, VIDEO_FORMATS } from "./media-sandbox";
 
 // Copies of videos that play in any browser, including Safari on iPhones, which can't play MKV at
 // all, and Chrome, which has no AC-3 or E-AC-3 sound. ffmpeg repackages the video as MP4 without
 // re-encoding the picture (so it's quick and loses nothing) and turns the sound into stereo AAC
 // where needed. It runs in the media sandbox, reading the opened video and writing straight into a
 // file FilesDude opened for it. Copies are kept in the state folder, up to a total size
-// (FILEDUDE_PLAYBACK_CACHE_GB, 50 GB by default), the least recently watched going first.
+// (FILEDUDE_PLAYBACK_CACHE_GB, 50 GB by default), the least recently watched going first. Room is
+// made before a copy starts, for the most it may grow to, and a copy is only made while the disk
+// keeps some space free (the state folder is often on the system disk).
 
 /** Picture formats MP4 can carry as they are; others would need re-encoding, which isn't offered. */
 const COPY_VIDEO = new Set(["h264", "hevc"]);
@@ -21,6 +23,9 @@ const COPY_VIDEO = new Set(["h264", "hevc"]);
 const KEEP_AUDIO = new Set(["aac", "mp3"]);
 const FAILURE_RETRY_MS = 10 * 60_000;
 const MAX_WAITING = 4;
+/** Space always left free on the disk: 10 GB, or 5% of it if that's more. */
+const RESERVE_BYTES = 10 * 1024 ** 3;
+const RESERVE_SHARE = 0.05;
 
 export type PlaybackRunners = {
   probe: (fd: number) => Promise<Buffer | null>;
@@ -33,6 +38,7 @@ export function setPlaybackRunners(replacement: PlaybackRunners | null | undefin
   runners = replacement;
   codecCache.clear();
   failures.clear();
+  cleaned = false;
 }
 
 async function playbackRunners() {
@@ -56,6 +62,25 @@ const maxCacheBytes = () => {
   const gigabytes = Number(process.env.FILEDUDE_PLAYBACK_CACHE_GB);
   return (Number.isFinite(gigabytes) && gigabytes > 0 ? gigabytes : 50) * 1024 ** 3;
 };
+
+/** The most a copy of a video this size may grow to (MP4 adds little; converted sound can add some). */
+const copyLimit = (size: number) => size * 1.5 + 64 * 1024 * 1024;
+
+/** Bytes that can still be written to the cache's disk, leaving its reserve free. */
+export type FreeSpace = (directory: string) => Promise<number>;
+const diskFree: FreeSpace = async (directory) => {
+  const disk = await fs.statfs(directory);
+  const reserve = Math.max(RESERVE_BYTES, disk.blocks * disk.bsize * RESERVE_SHARE);
+  return disk.bavail * disk.bsize - reserve;
+};
+let freeSpace = diskFree;
+
+/** For tests: replaces how free disk space is measured. */
+export function setPlaybackFreeSpace(replacement: FreeSpace | undefined) {
+  freeSpace = replacement ?? diskFree;
+}
+
+const tooLarge = () => new AppError("This video is too large to prepare: there isn't enough space for a copy", 507, "PLAYBACK_NO_SPACE");
 
 type Video = Awaited<ReturnType<typeof openVerifiedFile>> & { key: string; size: number };
 
@@ -104,11 +129,12 @@ async function codecsOf(video: Video, run: PlaybackRunners): Promise<Codecs | nu
   }
 }
 
-type Job = { key: string; size: number; written: () => Promise<number>; promise: Promise<void>; account: string };
+type Job = { key: string; size: number; written: () => Promise<number>; account: string };
 const jobs = new Map<string, Job>();
 const failures = new Map<string, number>();
 let running: Promise<void> = Promise.resolve();
 let waiting = 0;
+let cleaned = false;
 
 export type PlaybackStatus = { state: "ready" | "preparing" | "none" | "unsupported" | "failed" | "unavailable"; progress?: number; codecs?: Codecs };
 
@@ -148,24 +174,41 @@ export async function preparePlayback(relativePath: string, account: string) {
   try {
     const status = await statusOf(video);
     if (status.state !== "none") return status;
+    const limit = copyLimit(video.size);
+    if (limit > maxCacheBytes()) throw tooLarge();
+    await fs.mkdir(cacheDir(), { recursive: true, mode: 0o700 });
+    if (!cleaned) {
+      // Copies a previous FilesDude was part-way through were stopped along with it.
+      cleaned = true;
+      await removeParts(Date.now());
+    }
+    // Checked again just before the copy starts; this is so nobody waits for one that can't be made.
+    if (limit > (await freeSpace(cacheDir())) + (await cacheBytes())) throw tooLarge();
+    // From here until the job is listed, nothing waits, so two requests can't both get through.
+    if (jobs.has(video.key)) return { state: "preparing", progress: 0, codecs: status.codecs } satisfies PlaybackStatus;
     if ([...jobs.values()].some((job) => job.account === account)) throw new AppError("Another video is being prepared for you; try again when it's ready", 429, "PLAYBACK_BUSY");
     if (waiting >= MAX_WAITING) throw new AppError("Other videos are being prepared; try again in a few minutes", 503, "PLAYBACK_BUSY");
+    let output: fs.FileHandle | undefined;
+    const job: Job = { key: video.key, size: video.size, account, written: async () => (output ? output.stat().then((stat) => stat.size, () => 0) : 0) };
+    jobs.set(video.key, job);
+    waiting += 1;
+    const temporary = path.join(cacheDir(), `${video.key}.${crypto.randomUUID()}.part`);
+    try {
+      output = await fs.open(temporary, constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    } catch (error) {
+      jobs.delete(video.key);
+      waiting -= 1;
+      throw error;
+    }
+    const opened = output;
     const run = (await playbackRunners())!;
     const codecs = status.codecs!;
-    await fs.mkdir(cacheDir(), { recursive: true, mode: 0o700 });
-    const temporary = path.join(cacheDir(), `${video.key}.${crypto.randomUUID()}.part`);
-    const output = await fs.open(temporary, constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
-    waiting += 1;
-    const job: Job = {
-      key: video.key,
-      size: video.size,
-      account,
-      written: () => output.stat().then((stat) => stat.size, () => 0),
-      promise: Promise.resolve(),
-    };
     const work = async () => {
       waiting -= 1;
       try {
+        // Room for the most the copy may grow to: older copies make way, and the disk keeps its reserve.
+        await evict(limit);
+        if (limit > (await freeSpace(cacheDir()))) throw new Error("there isn't enough free disk space");
         const args = [
           "-hide_banner", "-loglevel", "error", "-nostdin", ...inputLimits(VIDEO_FORMATS), "-i", "fd:",
           "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "copy", ...(codecs.video === "hevc" ? ["-tag:v", "hvc1"] : []),
@@ -173,25 +216,22 @@ export async function preparePlayback(relativePath: string, account: string) {
           "-sn", "-dn", "-map_chapters", "-1", "-map_metadata", "-1", "-f", "mp4", "-fd", "1", "fd:",
         ];
         // Repackaging reads the whole video; allowed a slow 8 MB/s plus two minutes.
-        const ok = await run.remux(args, video.handle.fd, output.fd, video.size * 1.5 + 64 * 1024 * 1024, 120 + video.size / (8 * 1024 * 1024));
-        await output.close();
+        const ok = await run.remux(args, video.handle.fd, opened.fd, limit, 120 + video.size / (8 * 1024 * 1024));
+        await opened.close();
         if (!ok) throw new Error("ffmpeg couldn't repackage the video");
         await fs.rename(temporary, readyFile(video.key));
-        await evict(video.key);
       } catch (error) {
         failures.set(video.key, Date.now());
         if (failures.size > 2_000) failures.delete(failures.keys().next().value!);
         console.error("A video couldn't be prepared for playback:", (error as Error).message);
-        await output.close().catch(() => undefined);
+        await opened.close().catch(() => undefined);
         await fs.unlink(temporary).catch(() => undefined);
       } finally {
-        jobs.delete(video.key);
+        if (jobs.get(video.key) === job) jobs.delete(video.key);
         await video.handle.close().catch(() => undefined);
       }
     };
-    job.promise = running.then(work, work);
-    running = job.promise;
-    jobs.set(video.key, job);
+    running = running.then(work, work);
     handedOver = true;
     return { state: "preparing", progress: 0, codecs } satisfies PlaybackStatus;
   } finally {
@@ -199,22 +239,38 @@ export async function preparePlayback(relativePath: string, account: string) {
   }
 }
 
-/** Keeps the copies within their total size, removing the least recently watched first. */
-async function evict(keep: string) {
+/** The finished copies, with the disk space each takes up. */
+async function copies() {
   const names = await fs.readdir(cacheDir()).catch(() => [] as string[]);
-  const now = Date.now();
-  const copies: Array<{ name: string; size: number; used: number }> = [];
+  const found: Array<{ name: string; size: number; used: number }> = [];
   for (const name of names) {
+    if (!name.endsWith(".mp4")) continue;
     const stat = await fs.lstat(path.join(cacheDir(), name)).catch(() => null);
-    if (!stat?.isFile()) continue;
-    // Pieces left by a restart part-way through are removed after a day.
-    if (name.endsWith(".part") && now - stat.mtimeMs > 24 * 3_600_000) await fs.unlink(path.join(cacheDir(), name)).catch(() => undefined);
-    else if (name.endsWith(".mp4")) copies.push({ name, size: stat.size, used: stat.mtimeMs });
+    if (stat?.isFile()) found.push({ name, size: diskUsage(stat), used: stat.mtimeMs });
   }
-  let total = copies.reduce((sum, copy) => sum + copy.size, 0);
-  for (const copy of copies.sort((a, b) => a.used - b.used)) {
-    if (total <= maxCacheBytes()) break;
-    if (copy.name === `${keep}.mp4`) continue;
+  return found;
+}
+
+const cacheBytes = async () => (await copies()).reduce((sum, copy) => sum + copy.size, 0);
+
+/** Removes unfinished copies last changed before this time. */
+async function removeParts(before: number) {
+  for (const name of await fs.readdir(cacheDir()).catch(() => [] as string[])) {
+    if (!name.endsWith(".part")) continue;
+    const stat = await fs.lstat(path.join(cacheDir(), name)).catch(() => null);
+    if (stat?.isFile() && stat.mtimeMs < before) await fs.unlink(path.join(cacheDir(), name)).catch(() => undefined);
+  }
+}
+
+/**
+ * Makes room for a copy of up to `needed` bytes within the total size, removing the least recently
+ * watched copies first (they also give back their disk space).
+ */
+async function evict(needed: number) {
+  const found = await copies();
+  let total = found.reduce((sum, copy) => sum + copy.size, 0);
+  for (const copy of found.sort((a, b) => a.used - b.used)) {
+    if (total + needed <= maxCacheBytes()) break;
     await fs.unlink(path.join(cacheDir(), copy.name)).catch(() => undefined);
     total -= copy.size;
   }

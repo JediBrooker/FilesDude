@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { existsSync, readSync, writeSync } from "node:fs";
+import { constants, existsSync, readSync, writeSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -9,7 +9,8 @@ import test from "node:test";
 import { createSession } from "../lib/auth";
 import { config } from "../lib/config";
 import { getCredentials } from "../lib/credentials";
-import { openPlayback, playbackStatus, preparePlayback, setPlaybackRunners, waitForPlaybackJobs, type PlaybackRunners } from "../lib/playback";
+import { sandboxFileRunner, unitArguments } from "../lib/media-sandbox";
+import { openPlayback, playbackStatus, preparePlayback, setPlaybackFreeSpace, setPlaybackRunners, waitForPlaybackJobs, type PlaybackRunners } from "../lib/playback";
 import { runInScope } from "../lib/scope";
 import { GET as playback } from "../app/api/fs/playback/route";
 
@@ -18,6 +19,9 @@ function scrypt(password: string, salt: Buffer) {
     crypto.scrypt(password, salt, 32, { N: 16384, r: 8, p: 1, maxmem: 64 * 1024 * 1024 }, (error, key) => (error ? reject(error) : resolve(key)));
   });
 }
+
+/** The most a copy of the tests' 8-byte videos may grow to. */
+const COPY_LIMIT = 8 * 1.5 + 64 * 1024 * 1024;
 
 async function withRoot<T>(run: (context: { root: string; state: string; calls: string[][]; owner: string }) => Promise<T>, codecs: Record<string, { video?: string; audio?: string }>, remuxWorks = true) {
   const base = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "filesdude-playback-")));
@@ -51,6 +55,7 @@ async function withRoot<T>(run: (context: { root: string; state: string; calls: 
   } finally {
     await waitForPlaybackJobs();
     setPlaybackRunners(undefined);
+    setPlaybackFreeSpace(undefined);
     Object.assign(config, original);
     delete process.env.FILEDUDE_PLAYBACK_CACHE_GB;
     await fs.rm(base, { recursive: true, force: true });
@@ -116,19 +121,82 @@ test("pictures that can't be copied, failures, and busy accounts are told apart"
 
 test("copies stay within their total size, the least recently watched going first", async () => {
   await withRoot(async ({ root, state }) => {
-    process.env.FILEDUDE_PLAYBACK_CACHE_GB = String(30 / 1024 ** 3);
+    // Room for one copy at its largest, so the older one makes way for the next.
+    process.env.FILEDUDE_PLAYBACK_CACHE_GB = String((COPY_LIMIT + 1) / 1024 ** 3);
     for (const name of ["one", "two"]) {
       await fs.writeFile(path.join(root, `${name}.mkv`), "h264-aac");
       await preparePlayback(`${name}.mkv`, "owner");
       await waitForPlaybackJobs();
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
-    // Each copy is 19 bytes, so only the newest fits in 30.
     const left = (await fs.readdir(path.join(state, "playback"))).filter((name) => name.endsWith(".mp4"));
     assert.equal(left.length, 1);
     assert.equal((await playbackStatus("two.mkv")).state, "ready");
     assert.equal((await playbackStatus("one.mkv")).state, "none");
   }, { "h264-aac": { video: "h264", audio: "aac" } });
+});
+
+test("a copy is only made with room for it at its largest, on the cache and on the disk", async () => {
+  await withRoot(async ({ root, state, calls }) => {
+    await fs.writeFile(path.join(root, "big.mkv"), "h264-aac");
+    // Larger than the whole cache may be.
+    process.env.FILEDUDE_PLAYBACK_CACHE_GB = String((COPY_LIMIT - 1) / 1024 ** 3);
+    await assert.rejects(preparePlayback("big.mkv", "owner"), /too large/);
+    delete process.env.FILEDUDE_PLAYBACK_CACHE_GB;
+    // Not enough free disk space (beyond what's kept free).
+    setPlaybackFreeSpace(async () => COPY_LIMIT - 1);
+    await assert.rejects(preparePlayback("big.mkv", "owner"), /too large/);
+    // Space that goes while it waits its turn: checked again just before it starts.
+    let free = COPY_LIMIT * 2;
+    setPlaybackFreeSpace(async () => free);
+    assert.equal((await preparePlayback("big.mkv", "owner")).state, "preparing");
+    free = 0;
+    await waitForPlaybackJobs();
+    assert.equal(calls.length, 0);
+    assert.equal((await playbackStatus("big.mkv")).state, "failed");
+    assert.deepEqual(await fs.readdir(path.join(state, "playback")), []);
+  }, { "h264-aac": { video: "h264", audio: "aac" } });
+});
+
+test("requests at the same moment can't get past one per account, the queue, or one copy per video", async () => {
+  await withRoot(async ({ root, calls }) => {
+    for (let index = 0; index < 20; index += 1) await fs.writeFile(path.join(root, `v${index}.mkv`), "h264-aac");
+    const results = await Promise.allSettled(Array.from({ length: 20 }, (_, index) => preparePlayback(`v${index}.mkv`, "bob")));
+    assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
+    await waitForPlaybackJobs();
+    assert.equal(calls.length, 1);
+    // Many accounts asking for the same video share one copy.
+    await fs.writeFile(path.join(root, "same.mkv"), "h264-aac");
+    const shared = await Promise.all(Array.from({ length: 10 }, (_, index) => preparePlayback("same.mkv", `account${index}`)));
+    assert.ok(shared.every((status) => status.state === "preparing"));
+    await waitForPlaybackJobs();
+    assert.equal(calls.length, 2);
+    // Different videos from many accounts: four waiting (and one running, if it started in time),
+    // the rest turned away.
+    const many = await Promise.allSettled(Array.from({ length: 10 }, (_, index) => preparePlayback(`v${index + 10}.mkv`, `other${index}`)));
+    const accepted = many.filter((result) => result.status === "fulfilled").length;
+    assert.ok(accepted === 4 || accepted === 5, `${accepted} accepted`);
+    await waitForPlaybackJobs();
+  }, { "h264-aac": { video: "h264", audio: "aac" } });
+});
+
+test("pieces left by an earlier FilesDude are removed", async () => {
+  await withRoot(async ({ root, state }) => {
+    await fs.mkdir(path.join(state, "playback"), { recursive: true });
+    await fs.writeFile(path.join(state, "playback", "old.part"), "left over");
+    await fs.utimes(path.join(state, "playback", "old.part"), new Date(Date.now() - 60_000), new Date(Date.now() - 60_000));
+    await fs.writeFile(path.join(root, "clip.mkv"), "h264-aac");
+    await preparePlayback("clip.mkv", "owner");
+    await waitForPlaybackJobs();
+    assert.deepEqual((await fs.readdir(path.join(state, "playback"))).filter((name) => !name.endsWith(".mp4")), []);
+  }, { "h264-aac": { video: "h264", audio: "aac" } });
+});
+
+test("runs that write a file can't grow it past its limit or reserve space, and stop with FilesDude", () => {
+  const args = unitArguments("filesdude-media-x", ["/usr/bin/ffmpeg"], 600, [], { fileOutput: 1000.5 }, "filesdude.service");
+  for (const property of ["LimitFSIZE=1000", "SystemCallFilter=~fallocate ftruncate", "BindsTo=filesdude.service"]) assert.ok(args.includes(property), property);
+  const plain = unitArguments("filesdude-media-y", ["/usr/bin/ffprobe"], 15, [], {}, null);
+  assert.ok(!plain.some((arg) => arg.startsWith("LimitFSIZE") || arg.startsWith("BindsTo") || arg.includes("fallocate")));
 });
 
 const realSandbox = process.platform === "linux" && process.getuid?.() === 0 && existsSync("/usr/bin/ffmpeg") && existsSync("/usr/bin/ffprobe") && existsSync("/usr/bin/systemd-run");
@@ -155,6 +223,33 @@ test("a real video is repackaged by ffmpeg in its sandbox into an MP4 that plays
   } finally {
     await waitForPlaybackJobs();
     setPlaybackRunners(undefined);
+    Object.assign(config, original);
+    await fs.rm(base, { recursive: true, force: true });
+  }
+});
+
+test("in the real sandbox, a file can't be given disk space beyond its size, or grown past its limit", { skip: (!realSandbox || !existsSync("/usr/bin/python3")) && "needs Linux, root, systemd, and Python" }, async () => {
+  const base = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "filesdude-playback-limits-")));
+  const original = { root: config.root, stateDir: config.stateDir };
+  Object.assign(config, { root: path.join(base, "root"), stateDir: path.join(base, "state") });
+  try {
+    const run = (await sandboxFileRunner("/usr/bin/python3"))!;
+    await fs.writeFile(path.join(base, "input"), "input");
+    const input = await fs.open(path.join(base, "input"), "r");
+    // Stands in for an exploited ffmpeg.
+    for (const [name, code] of [["reserve", "import os; os.posix_fallocate(1, 0, 1 << 30); os.write(1, b'x')"], ["sparse", "import os; os.lseek(1, 1 << 30, 0); os.write(1, b'x')"], ["truncate", "import os; os.ftruncate(1, 1 << 30); os.write(1, b'x')"]]) {
+      const output = await fs.open(path.join(base, name), constants.O_RDWR | constants.O_CREAT | constants.O_EXCL, 0o600);
+      assert.equal(await run(["-I", "-S", "-c", code], input.fd, output.fd, 1024 * 1024, 30), false, name);
+      const stat = await output.stat();
+      assert.ok(stat.size <= 1024 * 1024 && stat.blocks * 512 <= 1024 * 1024, `${name}: ${stat.size} bytes, ${stat.blocks} blocks`);
+      await output.close();
+    }
+    // Writing normally still works (Python started without its site setup, which wants a socket).
+    const output = await fs.open(path.join(base, "normal"), constants.O_RDWR | constants.O_CREAT | constants.O_EXCL, 0o600);
+    assert.equal(await run(["-I", "-S", "-c", "import os; os.write(1, b'fine')"], input.fd, output.fd, 1024 * 1024, 30), true);
+    await output.close();
+    await input.close();
+  } finally {
     Object.assign(config, original);
     await fs.rm(base, { recursive: true, force: true });
   }
