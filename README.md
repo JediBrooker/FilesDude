@@ -371,8 +371,9 @@ repackaged; other picture formats can't, and HEVC still needs a browser that sho
 
 ## Continue watching
 
-FilesDude remembers how far each account got in each video, so a video carries on where it
-was left off, on any device (with **Start over** to go back to the beginning). Videos
+FilesDude remembers how far each account got in each video and audiobook, so it carries on
+where it was left off, on any device (with **Start over** to go back to the beginning). Audio
+is remembered when it's longer than ten minutes (audiobooks, not songs). Videos
 watched to within two minutes of the end (or 95%) are marked watched with a tick in the
 list; part-watched ones show how far through they are. **Continue watching** in the sidebar
 lists the videos you're part-way through, newest first, with how long is left.
@@ -381,6 +382,24 @@ lists the videos you're part-way through, newest first, with how long is left.
   Less than 30 seconds in isn't remembered.
 - Each account's last 300 videos are kept in `watching.json` in the state directory, and
   only for videos the account can reach; an account's history goes when it's removed.
+
+## Now playing, picture in picture, and up next
+
+- **Up next:** when an episode ends, the next video in its folder (in name order, so episode 2
+  comes before episode 10, whatever the list is sorted by) starts after a ten-second
+  countdown, with **Play now** and **Cancel**. Audiobook parts and album tracks go straight
+  on to the next.
+- **Picture in picture:** a video's preview can hand it to a small player in the corner, so it
+  keeps playing, from the same moment, while you browse. Where the browser supports it, it
+  goes straight into the browser's own floating window (over other tabs and apps too); the
+  corner player then shrinks to its controls. Picture in picture carries on into the next
+  episode.
+- **Keep playing:** closing an audio preview while it plays moves it to the same player, as an
+  audio bar with the album's or audiobook's cover (a `cover.jpg`, `folder.jpg`, or the only
+  picture beside it).
+- The player has previous and next for the folder, play and pause, a way back to the full
+  view at the same moment, and Stop. Starting anything else pauses it, and it saves where you
+  got to like the full preview does.
 
 ## Activity
 

@@ -158,6 +158,20 @@ test("a damaged file is kept aside, odd entries are ignored, and removed account
   });
 });
 
+test("audiobooks are remembered like videos, songs aren't", async () => {
+  await withRoot(async ({ root }) => {
+    await fs.mkdir(path.join(root, "books", "Novel"), { recursive: true });
+    for (const file of ["books/Novel/Novel.m4b", "books/Novel/Part 02.mp3", "song.mp3"]) await fs.writeFile(path.join(root, file), "audio");
+    assert.equal((await saveWatchPosition("owner", "books/Novel/Novel.m4b", 1800, 36000))?.position, 1800);
+    assert.equal((await saveWatchPosition("owner", "books/Novel/Part 02.mp3", 300, 2400))?.position, 300);
+    // A four-minute song isn't worth carrying on from.
+    assert.equal(await saveWatchPosition("owner", "song.mp3", 60, 240), null);
+    const list = await continueWatching("owner");
+    assert.deepEqual(list.map((item) => [item.path, item.mime]), [["books/Novel/Part 02.mp3", "audio/mpeg"], ["books/Novel/Novel.m4b", "audio/mp4"]]);
+    assert.equal((await saveWatchPosition("owner", "books/Novel/Novel.m4b", 35990, 36000))?.watched, true);
+  });
+});
+
 test("the API is per account, needs a signed-in request, and a removed account's history goes", async () => {
   await withRoot(async () => {
     const credentials = await getCredentials();
