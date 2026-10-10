@@ -34,7 +34,7 @@ const mimeTypes: Record<string, string> = {
   ".pdf": "application/pdf", ".mp4": "video/mp4", ".m4v": "video/mp4", ".webm": "video/webm",
   ".mkv": "video/x-matroska", ".mov": "video/quicktime", ".avi": "video/x-msvideo",
   ".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg", ".opus": "audio/ogg",
-  ".flac": "audio/flac", ".m4a": "audio/mp4", ".aac": "audio/aac",
+  ".flac": "audio/flac", ".m4a": "audio/mp4", ".m4b": "audio/mp4", ".aac": "audio/aac",
   ".zip": "application/zip", ".gz": "application/gzip", ".tar": "application/x-tar",
 };
 

@@ -58,6 +58,7 @@ import {
   PackageOpen,
   Pause,
   Pencil,
+  PictureInPicture2,
   Play,
   Plus,
   RefreshCw,
@@ -66,6 +67,8 @@ import {
   Scissors,
   Search,
   Send,
+  SkipBack,
+  SkipForward,
   Server,
   Settings2,
   ShieldCheck,
@@ -137,7 +140,7 @@ type DialogState =
   | { kind: "transfer"; mode: "copy" | "move" }
   | { kind: "bulk" }
   // `siblings` are the files previous/next step through (the folder's files, in its order).
-  | { kind: "preview"; entry: FileEntry; siblings?: FileEntry[]; slideshow?: Slideshow }
+  | { kind: "preview"; entry: FileEntry; siblings?: FileEntry[]; slideshow?: Slideshow; startAt?: number }
   | { kind: "edit"; entry: FileEntry }
   | { kind: "preferences" }
   | { kind: "twoFactor" }
@@ -537,6 +540,9 @@ export function FileManager() {
   const [loading, setLoading] = useState(false);
   const [dialog, setDialog] = useState<DialogState>(null);
   const [watching, setWatching] = useState<Map<string, WatchEntry>>(() => new Map());
+  // Video or audio that keeps playing while you browse.
+  const [nowPlaying, setNowPlaying] = useState<NowPlaying | null>(null);
+  const playerSessions = useRef(0);
   const [toast, setToast] = useState<{ message: string; tone?: "error"; undo?: UndoAction } | null>(null);
   // A newer build the server runs than this page, and one the user chose not to reload for yet.
   const [serverBuild, setServerBuild] = useState<ServerBuild | null>(null);
@@ -1385,6 +1391,10 @@ export function FileManager() {
   });
 
   const logout = async () => {
+    // Whatever was playing or open belongs to this account: it goes (saving where it got to first).
+    setNowPlaying(null);
+    setDialog(null);
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
     await requestJson("/api/auth/logout", { method: "POST", body: JSON.stringify({}) });
     setFavorites([]);
     setAuth(initialAuth);
@@ -1659,12 +1669,14 @@ export function FileManager() {
           uploadInPieces={auth.features?.uploadInPieces ?? true}
           onReveal={(entry) => { setDialog(null); navigate(entry.path.split("/").slice(0, -1).join("/")); }}
           onPreview={showPreview}
+          onPlayer={(playing) => { setDialog(null); setNowPlaying({ ...playing, session: ++playerSessions.current, account: auth.username ?? "" }); }}
         />
       )}
       {menu && createPortal(menu.kind === "entry"
         ? <FileActionMenu entry={menu.entry} targets={menuTargets(menu.entry)} position={{ top: menu.top, left: menu.left }} menuRef={menuRef} favoritePaths={favoritePaths} canWrite={canWrite} isOwner={isOwner} snapshots={snapshotsAvailable} canPaste={canWrite && Boolean(clipboard) && menu.entry.type === "directory"} onAction={(action, entry) => { setMenu(null); handleEntryAction(action, entry); }} />
         : <BackgroundMenu canWrite={canWrite} position={{ top: menu.top, left: menu.left }} menuRef={menuRef} folder={currentPath ? currentPath.split("/").at(-1) || "" : "All files"} clipboardCount={clipboard?.paths.length ?? 0} canSelectAll={sortedEntries.length > 0} onChoose={chooseBackground} />,
       document.body)}
+      {nowPlaying && auth.authenticated && nowPlaying.account === (auth.username ?? "") && <NowPlayingPlayer key={nowPlaying.session} playing={nowPlaying} onChange={setNowPlaying} onClose={() => setNowPlaying(null)} onExpand={(entry, siblings, startAt) => { setNowPlaying(null); setDialog({ kind: "preview", entry, siblings, startAt }); }} />}
       {jobs.length > 0 && <div className="job-panels">{jobs.map((job) => <JobPanel key={job.id} job={job} onCancel={() => void cancelJob(job)} />)}</div>}
       {toast && <div className={`toast ${toast.tone === "error" ? "toast-error" : ""}`} role="status">{toast.tone === "error" ? <CircleAlert size={18} /> : <Check size={18} />}<span>{toast.message}</span>{toast.undo && <button className="toast-action" onClick={() => void runUndo(toast.undo!)}><Undo2 size={14} /> Undo</button>}</div>}
     </div>
@@ -2073,7 +2085,7 @@ function JobPanel({ job, onCancel }: { job: JobState; onCancel: () => void }) {
   );
 }
 
-function DialogHost({ dialog, selected, currentPath, username, role, home, onClose, onRun, notify, onRefresh, onStartJob, onTransfer, onJob, canWrite, onSharesChanged, onCredentialsUpdated, onTwoFactor, onPasskeys, onNotifications, onReveal, onPreview, uploadInPieces }: {
+function DialogHost({ dialog, selected, currentPath, username, role, home, onClose, onRun, notify, onRefresh, onStartJob, onTransfer, onJob, canWrite, onSharesChanged, onCredentialsUpdated, onTwoFactor, onPasskeys, onNotifications, onReveal, onPreview, onPlayer, uploadInPieces }: {
   dialog: NonNullable<DialogState>;
   selected: FileEntry[];
   currentPath: string;
@@ -2096,6 +2108,7 @@ function DialogHost({ dialog, selected, currentPath, username, role, home, onClo
   uploadInPieces: boolean;
   onReveal: (entry: FileEntry) => void;
   onPreview: (entry: FileEntry, siblings?: FileEntry[], slideshow?: Slideshow) => void;
+  onPlayer: (playing: NowPlaying) => void;
 }) {
   // The server dialogs are shown by FileManager, which holds the list of servers.
   if (dialog.kind === "server" || dialog.kind === "serverSettings" || dialog.kind === "copyToServer") return null;
@@ -2118,7 +2131,7 @@ function DialogHost({ dialog, selected, currentPath, username, role, home, onClo
   if (dialog.kind === "preview") {
     const { siblings, slideshow } = dialog;
     // The preview is remounted for each file, so the slideshow's settings travel with the dialog.
-    return <PreviewDialog key={dialog.entry.path} entry={dialog.entry} siblings={siblings} onStep={(entry) => onPreview(entry, siblings, slideshow)} onClose={onClose} slideshow={slideshow} onSlideshow={(next) => onPreview(dialog.entry, siblings, next)} />;
+    return <PreviewDialog key={dialog.entry.path} entry={dialog.entry} siblings={siblings} onStep={(entry) => onPreview(entry, siblings, slideshow)} onClose={onClose} slideshow={slideshow} onSlideshow={(next) => onPreview(dialog.entry, siblings, next)} onPlayer={onPlayer} startAt={dialog.startAt} />;
   }
   if (dialog.kind === "edit") return <EditDialog entry={dialog.entry} onClose={onClose} onRun={onRun} />;
   if (dialog.kind === "twoFactor") return <TwoFactorDialog onClose={onClose} notify={notify} />;
@@ -4046,10 +4059,10 @@ function ContinueWatchingDialog({ onClose, onPreview, onReveal, notify }: { onCl
   };
   const asEntry = (item: ContinueEntry): FileEntry => ({ name: item.name, path: item.path, type: "file", size: item.size, modified: item.modified, created: item.modified, mode: "", uid: 0, gid: 0, owner: "", group: "", mime: item.mime, hidden: item.name.startsWith(".") });
   return (
-    <Modal title="Continue watching" subtitle="Videos you stopped part-way through, on any device" icon={<MonitorPlay size={19} />} onClose={onClose}>
+    <Modal title="Continue watching" subtitle="Videos and audiobooks you stopped part-way through, on any device" icon={<MonitorPlay size={19} />} onClose={onClose}>
       {error ? <div className="watching-empty"><CircleAlert size={24} /><strong>Couldn&apos;t load the list</strong><span>{error}</span></div>
         : !entries ? <div className="watching-empty"><LoaderCircle className="spin" size={22} /></div>
-        : !entries.length ? <div className="watching-empty"><MonitorPlay size={26} /><strong>Nothing to carry on with</strong><span>Videos you stop part-way through show up here.</span></div>
+        : !entries.length ? <div className="watching-empty"><MonitorPlay size={26} /><strong>Nothing to carry on with</strong><span>Videos and audiobooks you stop part-way through show up here.</span></div>
         : <ul className="watching-list">{entries.map((item) => (
           <li key={item.path}>
             <button type="button" className="watching-play" onClick={() => onPreview(asEntry(item))}>
@@ -4085,23 +4098,155 @@ function pictureSupported(codecs?: PlaybackCodecs) {
   return document.createElement("video").canPlayType('video/mp4; codecs="hvc1.1.6.L93.B0"') !== "";
 }
 
+/** Which kind of player a file plays in, if any. */
+function mediaKind(item: FileEntry): "video" | "audio" | null {
+  if (item.type !== "file") return null;
+  return item.mime.startsWith("video/") ? "video" : item.mime.startsWith("audio/") ? "audio" : null;
+}
+
+/**
+ * The folder's files of this kind in name order (episode 2 before episode 10), whatever the list's
+ * sort: what comes next after an episode or audiobook part.
+ */
+const mediaQueue = (siblings: FileEntry[], kind: "video" | "audio") => siblings.filter((item) => mediaKind(item) === kind).sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }));
+
+const thumbnailUrl = (item: FileEntry) => `/api/fs/thumbnail?path=${encodePath(item.path)}&v=${encodeURIComponent(`${item.modified}-${item.size}`)}`;
+
+/** An album's or audiobook's cover: a picture named like one beside it, or the only picture there. */
+function coverFor(siblings: FileEntry[]) {
+  const pictures = siblings.filter((item) => item.type === "file" && item.mime.startsWith("image/") && item.mime !== "image/svg+xml");
+  return pictures.find((item) => /^(cover|folder|front|album ?art)\b/i.test(item.name)) ?? (pictures.length === 1 ? pictures[0] : null);
+}
+
+// One thing plays at a time: starting one (a preview, or Now playing) pauses whatever was playing.
+let playingElement: HTMLMediaElement | null = null;
+function claimPlayback(element: HTMLMediaElement) {
+  if (playingElement && playingElement !== element && playingElement.isConnected && !playingElement.paused) playingElement.pause();
+  playingElement = element;
+}
+
+/**
+ * Carries on from where this account got to in a video or audiobook (or from `startAt`, when it's
+ * handed over from another player) once that's known and the file has loaded, and saves where it
+ * gets to: every few seconds while it plays, on pausing, at the end, and on leaving.
+ */
+function useWatchTracking(pathValue: string, mediaRef: React.RefObject<HTMLMediaElement | null>, startAt?: number) {
+  const [resumed, setResumed] = useState<{ path: string; at: number } | null>(null);
+  const resumedFrom = resumed?.path === pathValue ? resumed.at : null;
+  // A player can go on to another file (Now playing does, keeping its video element), so this is
+  // started afresh for each.
+  const watch = useRef({ path: pathValue, known: startAt !== undefined, target: startAt ?? 0, announce: startAt === undefined, applied: false, savedAt: 0, saved: -1, position: 0, duration: 0 });
+  const resume = useCallback(() => {
+    const state = watch.current;
+    const media = mediaRef.current;
+    if (!state.known || state.applied || !media || media.readyState < 1) return;
+    state.applied = true;
+    // A remembered position right at the end starts again instead; a handed-over one is kept as it is.
+    if (state.target && (!state.announce || !Number.isFinite(media.duration) || state.target < media.duration - 5)) {
+      media.currentTime = state.target;
+      if (state.announce) setResumed({ path: state.path, at: state.target });
+    }
+  }, [mediaRef]);
+  const save = useCallback((ended = false) => {
+    const state = watch.current;
+    // Nothing is saved until it's known where to carry on from, so that isn't overwritten.
+    if (!state.applied || !state.duration) return;
+    const position = Math.round(ended ? state.duration : state.position);
+    if (position === state.saved) return;
+    state.saved = position;
+    state.savedAt = Date.now();
+    // The file this state is about (a player that has just gone on to another may not have reset yet).
+    saveWatchPosition(state.path, position, Math.round(state.duration));
+  }, []);
+  useEffect(() => {
+    if (watch.current.path !== pathValue) watch.current = { path: pathValue, known: startAt !== undefined, target: startAt ?? 0, announce: startAt === undefined, applied: false, savedAt: 0, saved: -1, position: 0, duration: 0 };
+    const controller = new AbortController();
+    const state = watch.current;
+    if (!state.known) {
+      requestJson<{ entry: WatchEntry | null }>(`/api/watching?path=${encodePath(pathValue)}`, { signal: controller.signal })
+        .then((result) => {
+          if (controller.signal.aborted) return;
+          const item = result.entry;
+          state.target = item && !item.watched && item.position >= RESUME_MIN_SECONDS ? item.position : 0;
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          if (controller.signal.aborted) return;
+          state.known = true;
+          resume();
+        });
+    }
+    const leave = () => save();
+    window.addEventListener("pagehide", leave);
+    return () => {
+      controller.abort();
+      window.removeEventListener("pagehide", leave);
+      save();
+    };
+  }, [pathValue, startAt, resume, save]);
+  useEffect(() => {
+    if (!resumed) return;
+    const timer = window.setTimeout(() => setResumed(null), 12_000);
+    return () => window.clearTimeout(timer);
+  }, [resumed]);
+  const startOver = () => {
+    if (mediaRef.current) mediaRef.current.currentTime = 0;
+    setResumed(null);
+    watch.current.saved = -1;
+    void requestJson("/api/watching", { method: "POST", body: JSON.stringify({ action: "forget", path: pathValue }) }).catch(() => undefined);
+  };
+  const track = (media: HTMLMediaElement) => {
+    if (!watch.current.applied || media.seeking) return;
+    watch.current.position = media.currentTime;
+    if (Number.isFinite(media.duration)) watch.current.duration = media.duration;
+  };
+  const mediaProps = {
+    onLoadedMetadata: () => resume(),
+    onPlay: (event: React.SyntheticEvent<HTMLMediaElement>) => claimPlayback(event.currentTarget),
+    onTimeUpdate: (event: React.SyntheticEvent<HTMLMediaElement>) => {
+      track(event.currentTarget);
+      if (!event.currentTarget.paused && Date.now() - watch.current.savedAt > SAVE_EVERY_MS) save();
+    },
+    onPause: (event: React.SyntheticEvent<HTMLMediaElement>) => {
+      track(event.currentTarget);
+      save();
+    },
+  };
+  return { resumedFrom, startOver, save, mediaProps };
+}
+
+function ResumeNotice({ from, onStartOver }: { from: number; onStartOver: () => void }) {
+  return <div className="playback-notice"><History size={16} /><span>Carried on from {formatDuration(from)}, where you left off.</span><button type="button" className="button secondary" onClick={onStartOver}><RotateCcw size={14} /> Start over</button></div>;
+}
+
+/** Counts down to the next episode (or part), which starts unless it's called off. */
+function UpNext({ next, seconds, onPlay, onCancel }: { next: FileEntry; seconds: number; onPlay: () => void; onCancel: () => void }) {
+  const [left, setLeft] = useState(seconds);
+  useEffect(() => {
+    if (left <= 0) {
+      onPlay();
+      return;
+    }
+    const timer = window.setTimeout(() => setLeft(left - 1), 1000);
+    return () => window.clearTimeout(timer);
+  }, [left, onPlay]);
+  return <div className="playback-notice up-next" role="status"><SkipForward size={16} /><span>Up next in {left} s: <strong>{next.name}</strong></span><button type="button" className="button primary" onClick={onPlay}><Play size={14} /> Play now</button><button type="button" className="button secondary" onClick={onCancel}>Cancel</button></div>;
+}
+
 /**
  * A video, played as it is where the browser can; otherwise (it fails to play, or its sound wouldn't
  * play here) FilesDude offers a copy that plays everywhere, and switches to it once it's ready,
- * carrying on from the same moment.
+ * carrying on from the same moment. At the end, the next video in the folder follows.
  */
-function VideoPreview({ entry, url, children }: { entry: FileEntry; url: string; children: ReactNode }) {
+function VideoPreview({ entry, url, mediaRef, startAt, upNext, onUpNext, children }: { entry: FileEntry; url: string; mediaRef: React.RefObject<HTMLMediaElement | null>; startAt?: number; upNext?: FileEntry | null; onUpNext?: () => void; children: ReactNode }) {
   const [status, setStatus] = useState<PlaybackStatus | null>(null);
   const [failed, setFailed] = useState(false);
   const [useCopy, setUseCopy] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const videoRef = useRef<HTMLVideoElement>(null);
+  const [ended, setEnded] = useState(false);
   const resumeAt = useRef(0);
-  // Where this account got to last time (carried on from once it's known and the video has
-  // loaded), and where it is now, saved every few seconds, on pausing, and on leaving.
-  const [resumedFrom, setResumedFrom] = useState<number | null>(null);
-  const watch = useRef({ known: false, target: 0, applied: false, savedAt: 0, saved: -1, position: 0, duration: 0 });
+  const tracking = useWatchTracking(entry.path, mediaRef, startAt);
   const statusUrl = `/api/fs/playback?path=${encodePath(entry.path)}&status=1`;
   const sound = unplayableSound(status?.codecs);
   const needsCopy = failed || Boolean(sound);
@@ -4111,72 +4256,15 @@ function VideoPreview({ entry, url, children }: { entry: FileEntry; url: string;
     requestJson<PlaybackStatus>(statusUrl, { signal: controller.signal }).then(setStatus).catch(() => undefined);
     return () => controller.abort();
   }, [statusUrl]);
-  const resume = useCallback(() => {
-    const state = watch.current;
-    const video = videoRef.current;
-    if (!state.known || state.applied || !video || video.readyState < 1) return;
-    state.applied = true;
-    if (state.target && (!Number.isFinite(video.duration) || state.target < video.duration - 5)) {
-      video.currentTime = state.target;
-      setResumedFrom(state.target);
-    }
-  }, []);
-  const save = useCallback((ended = false) => {
-    const state = watch.current;
-    // Nothing is saved until it's known where to carry on from, so that isn't overwritten.
-    if (!state.applied || !state.duration) return;
-    const position = Math.round(ended ? state.duration : state.position);
-    if (position === state.saved) return;
-    state.saved = position;
-    state.savedAt = Date.now();
-    saveWatchPosition(entry.path, position, Math.round(state.duration));
-  }, [entry.path]);
-  useEffect(() => {
-    const controller = new AbortController();
-    requestJson<{ entry: WatchEntry | null }>(`/api/watching?path=${encodePath(entry.path)}`, { signal: controller.signal })
-      .then((result) => {
-        const item = result.entry;
-        watch.current.target = item && !item.watched && item.position >= RESUME_MIN_SECONDS ? item.position : 0;
-      })
-      .catch(() => undefined)
-      .finally(() => {
-        if (controller.signal.aborted) return;
-        watch.current.known = true;
-        resume();
-      });
-    const leave = () => save();
-    window.addEventListener("pagehide", leave);
-    return () => {
-      controller.abort();
-      window.removeEventListener("pagehide", leave);
-      save();
-    };
-  }, [entry.path, resume, save]);
-  useEffect(() => {
-    if (resumedFrom === null) return;
-    const timer = window.setTimeout(() => setResumedFrom(null), 12_000);
-    return () => window.clearTimeout(timer);
-  }, [resumedFrom]);
-  const startOver = () => {
-    if (videoRef.current) videoRef.current.currentTime = 0;
-    setResumedFrom(null);
-    watch.current.saved = -1;
-    void requestJson("/api/watching", { method: "POST", body: JSON.stringify({ action: "forget", path: entry.path }) }).catch(() => undefined);
-  };
-  const track = (video: HTMLVideoElement) => {
-    if (!watch.current.applied || video.seeking) return;
-    watch.current.position = video.currentTime;
-    if (Number.isFinite(video.duration)) watch.current.duration = video.duration;
-  };
 
   // A copy that's ready is used straight away when it's needed.
   useEffect(() => {
     if (status?.state === "ready" && needsCopy && !useCopy) {
-      resumeAt.current = videoRef.current?.currentTime ?? 0;
+      resumeAt.current = mediaRef.current?.currentTime ?? 0;
       const timer = window.setTimeout(() => setUseCopy(true), 0);
       return () => window.clearTimeout(timer);
     }
-  }, [status?.state, needsCopy, useCopy]);
+  }, [status?.state, needsCopy, useCopy, mediaRef]);
   // While a copy is being made, the browser asks how it's going.
   useEffect(() => {
     if (status?.state !== "preparing") return;
@@ -4209,16 +4297,185 @@ function VideoPreview({ entry, url, children }: { entry: FileEntry; url: string;
   return (
     <div className="video-preview">
       <video
-        key={src} ref={videoRef} src={src} controls autoPlay
+        key={src} ref={(element) => { mediaRef.current = element; }} src={src} controls autoPlay playsInline
+        {...tracking.mediaProps}
         onError={() => { if (!useCopy) setFailed(true); }}
-        onLoadedMetadata={(event) => { if (useCopy && resumeAt.current) event.currentTarget.currentTime = resumeAt.current; else resume(); }}
-        onTimeUpdate={(event) => { track(event.currentTarget); if (!event.currentTarget.paused && Date.now() - watch.current.savedAt > SAVE_EVERY_MS) save(); }}
-        onPause={(event) => { track(event.currentTarget); save(); }}
-        onEnded={() => save(true)}
+        onLoadedMetadata={(event) => { tracking.mediaProps.onLoadedMetadata(); if (useCopy && resumeAt.current) event.currentTarget.currentTime = resumeAt.current; }}
+        onPlay={(event) => { setEnded(false); tracking.mediaProps.onPlay(event); }}
+        onEnded={() => { tracking.save(true); setEnded(true); }}
       >{children}</video>
-      {resumedFrom !== null && <div className="playback-notice"><History size={16} /><span>Carried on from {formatDuration(resumedFrom)}, where you left off.</span><button type="button" className="button secondary" onClick={startOver}><RotateCcw size={14} /> Start over</button></div>}
+      {tracking.resumedFrom !== null && <ResumeNotice from={tracking.resumedFrom} onStartOver={tracking.startOver} />}
+      {ended && upNext && onUpNext && <UpNext next={upNext} seconds={10} onPlay={onUpNext} onCancel={() => setEnded(false)} />}
       {(notice || error) && <div className="playback-notice">{notice}{error && <span className="form-error"><CircleAlert size={14} />{error}</span>}</div>}
     </div>
+  );
+}
+
+/** Audio, with its cover if it has one; an audiobook carries on where it was left, and goes on to the next part. */
+function AudioPreview({ entry, url, mediaRef, startAt, cover, upNext, onUpNext }: { entry: FileEntry; url: string; mediaRef: React.RefObject<HTMLMediaElement | null>; startAt?: number; cover: FileEntry | null; upNext?: FileEntry | null; onUpNext?: () => void }) {
+  const tracking = useWatchTracking(entry.path, mediaRef, startAt);
+  return (
+    <div className="audio-preview">
+      {cover ? <img className="audio-cover" src={thumbnailUrl(cover)} alt="" /> : <FileAudio size={54} />}{/* eslint-disable-line @next/next/no-img-element */}
+      <strong>{entry.name}</strong>
+      <audio ref={(element) => { mediaRef.current = element; }} src={url} controls autoPlay {...tracking.mediaProps} onEnded={() => { tracking.save(true); onUpNext?.(); }} />
+      {upNext && <small className="audio-next">Next: {upNext.name}</small>}
+      {tracking.resumedFrom !== null && <ResumeNotice from={tracking.resumedFrom} onStartOver={tracking.startOver} />}
+    </div>
+  );
+}
+
+/** What Now playing plays: handed over from a preview, it keeps playing while you browse. */
+export type NowPlaying = {
+  entry: FileEntry;
+  /** The folder's files: the ones of the same kind, in name order, come before and after it. */
+  siblings: FileEntry[];
+  mode: "video" | "audio";
+  startAt?: number;
+  /** It was playing from its playable copy. */
+  copy?: boolean;
+  /** Asked for as picture in picture: a video goes into the browser's own floating window if it can. */
+  picture?: boolean;
+  /** Each hand-off starts a fresh player (going on to the next file keeps it). */
+  session?: number;
+  /** The account it was started by: it never shows for another. */
+  account?: string;
+};
+
+/**
+ * The player that keeps going while you browse: a small video in the corner (which can go into the
+ * browser's picture-in-picture window, over other windows too) or an audio bar, with the folder's
+ * previous and next, and a way back to the full view. Going on to another file keeps the same video
+ * element, so picture in picture carries on into the next episode.
+ */
+function NowPlayingPlayer({ playing, onChange, onClose, onExpand }: { playing: NowPlaying; onChange: (next: NowPlaying) => void; onClose: () => void; onExpand: (entry: FileEntry, siblings: FileEntry[], startAt: number) => void }) {
+  const { entry, siblings, mode } = playing;
+  const mediaRef = useRef<HTMLMediaElement | null>(null);
+  const cardRef = useRef<HTMLElement>(null);
+  const tracking = useWatchTracking(entry.path, mediaRef, playing.startAt);
+  const [copy, setCopy] = useState(Boolean(playing.copy));
+  const [problem, setProblem] = useState("");
+  const [ended, setEnded] = useState(false);
+  const [subtitles, setSubtitles] = useState<Array<{ id: string; label: string; language?: string }>>([]);
+  const resumeAt = useRef(0);
+  const pictureTried = useRef(false);
+  const [inPicture, setInPicture] = useState(false);
+  const [paused, setPaused] = useState(false);
+  // Each file starts afresh.
+  const [shown, setShown] = useState(entry.path);
+  if (shown !== entry.path) {
+    setShown(entry.path);
+    setCopy(Boolean(playing.copy));
+    setProblem("");
+    setEnded(false);
+    setSubtitles([]);
+  }
+  const queue = mediaQueue(siblings, mode);
+  const index = queue.findIndex((item) => item.path === entry.path);
+  const previous = index > 0 ? queue[index - 1] : null;
+  const next = index >= 0 ? queue[index + 1] ?? null : null;
+  const cover = mode === "audio" ? coverFor(siblings) : null;
+  const go = useCallback((item: FileEntry) => onChange({ ...playing, entry: item, startAt: undefined, copy: undefined, picture: undefined }), [onChange, playing]);
+  const playNext = useCallback(() => { if (next) go(next); }, [go, next]);
+  const src = copy ? `/api/fs/playback?path=${encodePath(entry.path)}` : localPreviewUrls(entry).stream;
+  const pictureInPicture = mode === "video" && typeof document !== "undefined" && document.pictureInPictureEnabled;
+
+  useEffect(() => {
+    if (mode !== "video") return;
+    const controller = new AbortController();
+    requestJson<{ tracks: Array<{ id: string; label: string; language?: string }> }>(`/api/fs/subtitles?path=${encodePath(entry.path)}`, { signal: controller.signal })
+      .then((result) => setSubtitles(result.tracks))
+      .catch(() => undefined);
+    return () => controller.abort();
+  }, [entry.path, mode]);
+  // Toasts and job panels make room for it.
+  useEffect(() => {
+    const card = cardRef.current;
+    if (!card) return;
+    const root = document.documentElement;
+    const observer = new ResizeObserver(() => root.style.setProperty("--now-playing-space", `${card.offsetHeight + 12}px`));
+    observer.observe(card);
+    return () => {
+      observer.disconnect();
+      root.style.removeProperty("--now-playing-space");
+    };
+  }, []);
+  // While the video is in the browser's floating window, only the bar shows here. Stopping takes
+  // it out of that window too.
+  useEffect(() => {
+    const video = mediaRef.current;
+    if (mode !== "video" || !video) return;
+    const enter = () => setInPicture(true);
+    const leave = () => setInPicture(false);
+    video.addEventListener("enterpictureinpicture", enter);
+    video.addEventListener("leavepictureinpicture", leave);
+    return () => {
+      video.removeEventListener("enterpictureinpicture", enter);
+      video.removeEventListener("leavepictureinpicture", leave);
+      if (document.pictureInPictureElement === video) void document.exitPictureInPicture().catch(() => undefined);
+    };
+  }, [mode]);
+
+  const togglePicture = () => {
+    const video = mediaRef.current as HTMLVideoElement | null;
+    if (!video) return;
+    if (document.pictureInPictureElement === video) void document.exitPictureInPicture().catch(() => undefined);
+    else void video.requestPictureInPicture().catch(() => undefined);
+  };
+  // A video that won't play as it is plays from its playable copy if there is one.
+  const failed = async () => {
+    if (copy || mode !== "video") {
+      setProblem("This can't play here.");
+      return;
+    }
+    const status = await requestJson<PlaybackStatus>(`/api/fs/playback?path=${encodePath(entry.path)}&status=1`).catch(() => null);
+    if (status?.state === "ready") {
+      resumeAt.current = mediaRef.current?.currentTime ?? 0;
+      setCopy(true);
+    } else setProblem("This video can't play here; open the full view to make it playable.");
+  };
+  const mediaEvents = {
+    ...tracking.mediaProps,
+    onLoadedMetadata: (event: React.SyntheticEvent<HTMLMediaElement>) => {
+      tracking.mediaProps.onLoadedMetadata();
+      if (copy && resumeAt.current) event.currentTarget.currentTime = resumeAt.current;
+      // Straight into the browser's floating window, while the click that asked for it still counts.
+      if (playing.picture && pictureInPicture && !pictureTried.current && navigator.userActivation?.isActive !== false) {
+        pictureTried.current = true;
+        void (event.currentTarget as HTMLVideoElement).requestPictureInPicture().catch(() => undefined);
+      }
+    },
+    onPlay: (event: React.SyntheticEvent<HTMLMediaElement>) => { setEnded(false); setPaused(false); tracking.mediaProps.onPlay(event); },
+    onPause: (event: React.SyntheticEvent<HTMLMediaElement>) => { setPaused(true); tracking.mediaProps.onPause(event); },
+    onError: () => void failed(),
+    onEnded: () => {
+      tracking.save(true);
+      // Audio goes straight on (as an album or audiobook should, even in a background tab); a video counts down.
+      if (mode === "audio") playNext();
+      else setEnded(true);
+    },
+  };
+  const setMedia = (element: HTMLMediaElement | null) => { mediaRef.current = element; };
+  return (
+    <aside ref={cardRef} className={`now-playing now-playing-${mode}${inPicture ? " in-picture" : ""}`} aria-label="Now playing">
+      {mode === "video" && <video ref={setMedia} src={src} controls autoPlay playsInline {...mediaEvents}>{subtitles.map((track) => <track key={track.id} kind="subtitles" label={track.label} srcLang={track.language} src={`/api/fs/subtitles?path=${encodePath(entry.path)}&track=${encodeURIComponent(track.id)}`} />)}</video>}
+      <div className="now-playing-bar">
+        {mode === "audio" && <span className="now-playing-art">{cover ? <img src={thumbnailUrl(cover)} alt="" /> : <FileAudio size={18} />}</span>}{/* eslint-disable-line @next/next/no-img-element */}
+        <div className="now-playing-title"><strong title={entry.name}>{entry.name}</strong><small title={`/${entry.path}`}>{folderLabel(parentOf(entry.path))}{queue.length > 1 && index >= 0 ? ` · ${index + 1} of ${queue.length}` : ""}</small></div>
+        <div className="now-playing-actions">
+          {mode === "video" && <button type="button" className="icon-button" aria-label={paused ? "Play" : "Pause"} title={paused ? "Play" : "Pause"} onClick={() => { const media = mediaRef.current; if (media) void (media.paused ? media.play().catch(() => undefined) : media.pause()); }}>{paused ? <Play size={16} /> : <Pause size={16} />}</button>}
+          <button type="button" className="icon-button" disabled={!previous} aria-label={previous ? `Previous: ${previous.name}` : "Previous"} title={previous ? `Previous: ${previous.name}` : "Previous"} onClick={() => previous && go(previous)}><SkipBack size={16} /></button>
+          <button type="button" className="icon-button" disabled={!next} aria-label={next ? `Next: ${next.name}` : "Next"} title={next ? `Next: ${next.name}` : "Next"} onClick={playNext}><SkipForward size={16} /></button>
+          {pictureInPicture && <button type="button" className="icon-button" aria-label="Picture in picture" title="Picture in picture: a floating window over other windows" onClick={togglePicture}><PictureInPicture2 size={16} /></button>}
+          <button type="button" className="icon-button" aria-label="Open the full view" title="Open the full view" onClick={() => onExpand(entry, siblings, mediaRef.current?.currentTime ?? 0)}><Maximize2 size={16} /></button>
+          <button type="button" className="icon-button" aria-label="Stop playing" title="Stop playing" onClick={onClose}><X size={16} /></button>
+        </div>
+      </div>
+      {mode === "audio" && <audio ref={setMedia} src={src} controls autoPlay {...mediaEvents} />}
+      {tracking.resumedFrom !== null && <ResumeNotice from={tracking.resumedFrom} onStartOver={tracking.startOver} />}
+      {ended && next && <UpNext next={next} seconds={10} onPlay={playNext} onCancel={() => setEnded(false)} />}
+      {problem && <p className="form-error now-playing-problem"><CircleAlert size={14} />{problem}</p>}
+    </aside>
   );
 }
 
@@ -4226,7 +4483,7 @@ export type Slideshow = { playing: boolean; seconds: number; fullscreen: boolean
 const SLIDESHOW_SECONDS = [3, 5, 10, 20];
 const isPicture = (item: FileEntry) => item.mime.startsWith("image/");
 
-export function PreviewDialog({ entry, siblings = [], onStep, onClose, urls = localPreviewUrls, slideshow, onSlideshow }: { entry: FileEntry; siblings?: FileEntry[]; onStep: (entry: FileEntry) => void; onClose: () => void; urls?: PreviewUrls; slideshow?: Slideshow; onSlideshow?: (next: Slideshow) => void }) {
+export function PreviewDialog({ entry, siblings = [], onStep, onClose, urls = localPreviewUrls, slideshow, onSlideshow, onPlayer, startAt }: { entry: FileEntry; siblings?: FileEntry[]; onStep: (entry: FileEntry) => void; onClose: () => void; urls?: PreviewUrls; slideshow?: Slideshow; onSlideshow?: (next: Slideshow) => void; onPlayer?: (playing: NowPlaying) => void; startAt?: number }) {
   const [text, setText] = useState<string | null>(null);
   const [error, setError] = useState("");
   const touchStart = useRef<{ x: number; y: number } | null>(null);
@@ -4246,6 +4503,22 @@ export function PreviewDialog({ entry, siblings = [], onStep, onClose, urls = lo
   const index = siblings.findIndex((item) => item.path === entry.path);
   const previous = index > 0 ? siblings[index - 1] : null;
   const next = index >= 0 && index < siblings.length - 1 ? siblings[index + 1] : null;
+
+  // A local video or audio file can carry on in Now playing while you browse: a video when asked
+  // (picture in picture), audio also when the preview is closed while it plays. Either goes on to
+  // the next of its kind in the folder when it ends.
+  const mediaRef = useRef<HTMLMediaElement | null>(null);
+  const kind = local ? mediaKind(entry) : null;
+  const queue = kind ? mediaQueue(siblings, kind) : [];
+  const queueIndex = queue.findIndex((item) => item.path === entry.path);
+  const upNext = queueIndex >= 0 ? queue[queueIndex + 1] ?? null : null;
+  const playUpNext = useCallback(() => { if (upNext) onStep(upNext); }, [upNext, onStep]);
+  const handOff = (picture: boolean) => {
+    const media = mediaRef.current;
+    if (!onPlayer || !kind) return;
+    if (document.fullscreenElement) void document.exitFullscreen().catch(() => undefined);
+    onPlayer({ entry, siblings, mode: kind, startAt: media?.currentTime ?? 0, copy: Boolean(media?.currentSrc.includes("/api/fs/playback")), picture });
+  };
 
   // A slideshow steps through the folder's pictures (round to the first after the last), each shown
   // for the chosen time once it has loaded. Fullscreen is the whole page, so it lasts across steps.
@@ -4277,6 +4550,11 @@ export function PreviewDialog({ entry, siblings = [], onStep, onClose, urls = lo
     else void document.documentElement.requestFullscreen().catch(() => undefined);
   };
   const close = () => {
+    const media = mediaRef.current;
+    if (kind === "audio" && onPlayer && media && !media.paused && !media.ended) {
+      handOff(false);
+      return;
+    }
     if (document.fullscreenElement) void document.exitFullscreen().catch(() => undefined);
     onClose();
   };
@@ -4332,9 +4610,11 @@ export function PreviewDialog({ entry, siblings = [], onStep, onClose, urls = lo
   else if (entry.mime.startsWith("image/")) preview = <div className="image-preview"><img src={url} alt={entry.name} onLoad={() => setPictureReady(true)} onError={() => setPictureReady(true)} /></div>; // eslint-disable-line @next/next/no-img-element
   else if (entry.mime.startsWith("video/")) {
     const tracks = subtitles.map((track) => <track key={track.id} kind="subtitles" label={track.label} srcLang={track.language} src={`/api/fs/subtitles?path=${encodePath(entry.path)}&track=${encodeURIComponent(track.id)}`} />);
-    preview = local ? <VideoPreview entry={entry} url={url}>{tracks}</VideoPreview> : <video src={url} controls autoPlay>{tracks}</video>;
+    preview = local ? <VideoPreview entry={entry} url={url} mediaRef={mediaRef} startAt={startAt} upNext={upNext} onUpNext={playUpNext}>{tracks}</VideoPreview> : <video src={url} controls autoPlay>{tracks}</video>;
   }
-  else if (entry.mime.startsWith("audio/")) preview = <div className="audio-preview"><FileAudio size={54} /><strong>{entry.name}</strong><audio src={url} controls autoPlay /></div>;
+  else if (entry.mime.startsWith("audio/")) preview = local
+    ? <AudioPreview entry={entry} url={url} mediaRef={mediaRef} startAt={startAt} cover={coverFor(siblings)} upNext={upNext} onUpNext={playUpNext} />
+    : <div className="audio-preview"><FileAudio size={54} /><strong>{entry.name}</strong><audio src={url} controls autoPlay /></div>;
   else if (entry.mime === "application/pdf") preview = <iframe src={url} title={`Preview of ${entry.name}`} />;
   else preview = <div className="preview-message"><File size={42} /><h3>Preview unavailable</h3><p>This file type can still be downloaded.</p></div>;
   const slideshowControls = canShow && onSlideshow && <div className="slideshow-controls">
@@ -4342,7 +4622,7 @@ export function PreviewDialog({ entry, siblings = [], onStep, onClose, urls = lo
     <select aria-label="Seconds per picture" value={show.seconds} onChange={(event) => onSlideshow({ ...show, seconds: Number(event.target.value) })}>{SLIDESHOW_SECONDS.map((seconds) => <option key={seconds} value={seconds}>{seconds} s</option>)}</select>
     {typeof document !== "undefined" && document.fullscreenEnabled && <button type="button" className="icon-button" aria-label={show.fullscreen ? "Leave full screen" : "Full screen"} title={show.fullscreen ? "Leave full screen" : "Full screen"} onClick={toggleFullscreen}>{show.fullscreen ? <Minimize2 size={17} /> : <Maximize2 size={17} />}</button>}
   </div>;
-  return <div className={`preview-overlay${show.fullscreen ? " fullscreen" : ""}`}><section className="preview-modal" role="dialog" aria-modal="true" aria-label={`Preview ${entry.name}`}><header><div><span className={`file-icon ${entry.type}`}>{fileIcon(entry)}</span><div><strong>{entry.name}</strong><span>{extension(entry.name)} · {formatBytes(entry.size)}{index >= 0 && siblings.length > 1 ? ` · ${index + 1} of ${siblings.length}` : ""}</span></div></div><div>{slideshowControls}<a className="button secondary" href={urls(entry).download}><ArrowDownToLine size={16} /> Download</a><button className="icon-button" aria-label="Close preview" onClick={close}><X size={19} /></button></div></header><div className="preview-stage" onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}><div className="preview-body">{preview}</div>{previous && <button type="button" className="preview-nav previous" aria-label={`Previous: ${previous.name}`} title={`${previous.name} (←)`} onClick={() => onStep(previous)}><ChevronLeft size={22} /></button>}{next && <button type="button" className="preview-nav next" aria-label={`Next: ${next.name}`} title={`${next.name} (→)`} onClick={() => onStep(next)}><ChevronRight size={22} /></button>}</div></section></div>;
+  return <div className={`preview-overlay${show.fullscreen ? " fullscreen" : ""}`}><section className="preview-modal" role="dialog" aria-modal="true" aria-label={`Preview ${entry.name}`}><header><div><span className={`file-icon ${entry.type}`}>{fileIcon(entry)}</span><div><strong>{entry.name}</strong><span>{extension(entry.name)} · {formatBytes(entry.size)}{index >= 0 && siblings.length > 1 ? ` · ${index + 1} of ${siblings.length}` : ""}</span></div></div><div>{slideshowControls}{onPlayer && kind && <button type="button" className="button secondary" title={kind === "video" ? "Keep watching in a small player while you browse" : "Keep listening while you browse"} onClick={() => handOff(kind === "video")}><PictureInPicture2 size={16} /> {kind === "video" ? "Picture in picture" : "Keep playing"}</button>}<a className="button secondary" href={urls(entry).download}><ArrowDownToLine size={16} /> Download</a><button className="icon-button" aria-label="Close preview" onClick={close}><X size={19} /></button></div></header><div className="preview-stage" onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}><div className="preview-body">{preview}</div>{previous && <button type="button" className="preview-nav previous" aria-label={`Previous: ${previous.name}`} title={`${previous.name} (←)`} onClick={() => onStep(previous)}><ChevronLeft size={22} /></button>}{next && <button type="button" className="preview-nav next" aria-label={`Next: ${next.name}`} title={`${next.name} (→)`} onClick={() => onStep(next)}><ChevronRight size={22} /></button>}</div></section></div>;
 }
 
 type Checksums = { sha256: string; md5: string };

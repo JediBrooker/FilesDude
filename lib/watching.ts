@@ -7,8 +7,9 @@ import { AppError } from "./http";
 import { scopeRoot, withinScope } from "./scope";
 import { listUsers } from "./users";
 
-// Where each account got to in each video, so it carries on from there, on any device. Kept per
-// account (the last 300 videos), by path; a video watched to the end is marked watched. Positions
+// Where each account got to in each video (and audiobook), so it carries on from there, on any
+// device. Kept per account (the last 300), by path; a video watched to the end is marked watched.
+// Audio is only remembered when it's long (audiobooks, not songs). Positions
 // arrive every few seconds while videos play, so they're kept in memory and written out at most
 // every few seconds (a restart may lose the last few).
 const MAX_PER_ACCOUNT = 300;
@@ -20,6 +21,10 @@ const SAVE_INTERVAL_MS = 3_000;
 const MIN_POSITION = 30;
 /** Within this much of the end (or 95%) counts as watched. */
 const END_SECONDS = 120;
+/** Audio shorter than this (a song) isn't worth carrying on from. */
+const MIN_AUDIO_SECONDS = 600;
+
+const isMedia = (relative: string) => /^(video|audio)\//.test(getMime(relative));
 
 export type WatchEntry = { path: string; position: number; duration: number; watched: boolean; updatedAt: string };
 type Store = Record<string, WatchEntry[]>;
@@ -122,13 +127,13 @@ export function flushWatching() {
 const isFinished = (position: number, duration: number) => duration > 0 && (position >= duration - END_SECONDS || position >= duration * 0.95);
 
 /**
- * A video path the account can reach (nothing is read from it); to record a position, it must be a
- * video that's there.
+ * A video or audio path the account can reach (nothing is read from it); to record a position, it
+ * must be one that's there.
  */
 async function videoPath(raw: unknown, mustExist: boolean) {
   if (typeof raw !== "string" || raw.length > 4096) throw new AppError("Choose a video", 400, "INVALID_PATH");
   const relative = normalizeRelative(raw).replace(/\/+$/, "");
-  if (!relative || !getMime(relative).startsWith("video/")) throw new AppError("Only videos are remembered", 400, "NOT_A_VIDEO");
+  if (!relative || !isMedia(relative)) throw new AppError("Only videos and audio are remembered", 400, "NOT_A_VIDEO");
   const missing = () => new AppError("That video isn't there", 404, "NOT_FOUND");
   let resolved: string;
   try {
@@ -158,8 +163,9 @@ export async function saveWatchPosition(accountKey: string, raw: unknown, rawPos
     const list = store[accountKey] ?? [];
     const previous = list.find((item) => item.path === relative);
     const watched = isFinished(position, duration) || Boolean(previous?.watched && position < MIN_POSITION);
-    // Nothing worth keeping yet for a video just started (unless it was watched before).
+    // Nothing worth keeping yet for a video just started (unless it was watched before), or a song.
     if (!previous && position < MIN_POSITION) return { store: null, result: null };
+    if (getMime(relative).startsWith("audio/") && duration < MIN_AUDIO_SECONDS) return { store: null, result: null };
     if (previous && previous.watched === watched && Date.now() - Date.parse(previous.updatedAt) < SAVE_INTERVAL_MS) return { store: null, result: previous };
     const entry: WatchEntry = { path: relative, position: isFinished(position, duration) ? 0 : Math.round(position), duration: Math.round(duration), watched, updatedAt: new Date().toISOString() };
     const next = [entry, ...list.filter((item) => item.path !== relative)].slice(0, MAX_PER_ACCOUNT);
