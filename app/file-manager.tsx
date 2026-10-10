@@ -639,7 +639,32 @@ export function FileManager() {
   });
   const [folderSizes, setFolderSizes] = useState<{ path: string; sizes: Map<string, number>; complete: boolean } | null>(null);
   const shownFolderSizes = showFolderSizes && folderSizes?.path === currentPath ? folderSizes : null;
-  const sortedEntries = useMemo(() => sortEntries(entries, sort, shownFolderSizes?.sizes), [entries, sort, shownFolderSizes]);
+  const topEntries = useMemo(() => sortEntries(entries, sort, shownFolderSizes?.sizes), [entries, sort, shownFolderSizes]);
+  // Folders opened in place in the list view (Finder-style), with their contents by path. Their
+  // items join the rows shown, indented under them, so selecting, dragging, menus, and keys all work
+  // on them as on any other row. Going to another folder closes them all.
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
+  const [childListings, setChildListings] = useState<Map<string, FileEntry[]>>(() => new Map());
+  const [expandedIn, setExpandedIn] = useState(currentPath);
+  if (expandedIn !== currentPath) {
+    setExpandedIn(currentPath);
+    if (expanded.size) setExpanded(new Set());
+    if (childListings.size) setChildListings(new Map());
+  }
+  const treeMode = view === "list" && !nameSearching && !(searchMode === "contents" && activeSearch);
+  const sortedEntries = useMemo(() => {
+    if (!treeMode || !expanded.size) return topEntries;
+    const rows: FileEntry[] = [];
+    const add = (list: FileEntry[]) => {
+      for (const entry of list) {
+        rows.push(entry);
+        const children = entry.type === "directory" && expanded.has(entry.path) ? childListings.get(entry.path) : undefined;
+        if (children) add(sortEntries(children, sort));
+      }
+    };
+    add(topEntries);
+    return rows;
+  }, [topEntries, treeMode, expanded, childListings, sort]);
   // What the signed-in account may do. The server enforces all of this; the UI just hides what
   // would be refused.
   const home = auth.root ?? "";
@@ -1400,7 +1425,43 @@ export function FileManager() {
     }
   };
 
-  const downloadSelected = () => void downloadEntries(entries.filter((entry) => selected.has(entry.path)));
+  const downloadSelected = () => void downloadEntries(sortedEntries.filter((entry) => selected.has(entry.path)));
+
+  // Opens a folder in place in the list (or closes it, with any opened inside it).
+  const loadChildren = useCallback(async (folder: string) => {
+    try {
+      const result = await requestJson<{ entries: FileEntry[] }>(`/api/fs?path=${encodePath(folder)}&hidden=${showHidden}`);
+      setChildListings((current) => new Map(current).set(folder, result.entries));
+      requestJson<{ tags: Array<{ path: string; colors: TagColor[] }> }>(`/api/tags?folder=${encodePath(folder)}`)
+        .then((found) => setTags((current) => {
+          const next = new Map(current);
+          for (const item of found.tags) next.set(item.path, item.colors);
+          return next;
+        }))
+        .catch(() => undefined);
+    } catch (error) {
+      setExpanded((current) => new Set([...current].filter((item) => item !== folder && !item.startsWith(`${folder}/`))));
+      // A folder that's gone since (moved or deleted) just closes.
+      if ((error as Error & { status?: number }).status !== 404) notify((error as Error).message, "error");
+    }
+  }, [showHidden, notify]);
+  const toggleExpanded = (entry: FileEntry) => {
+    if (expanded.has(entry.path)) {
+      setExpanded(new Set([...expanded].filter((item) => item !== entry.path && !item.startsWith(`${entry.path}/`))));
+      return;
+    }
+    setExpanded(new Set(expanded).add(entry.path));
+    void loadChildren(entry.path);
+  };
+  // When the folder reloads (something changed), the folders open in it are listed again too.
+  const expandedNow = useRef(expanded);
+  useEffect(() => { expandedNow.current = expanded; });
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      for (const folder of expandedNow.current) void loadChildren(folder);
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [entries, loadChildren]);
 
   const toggleFavorite = async (folderPath: string) => {
     const active = favorites.some((favorite) => favorite.path === folderPath);
@@ -1523,6 +1584,25 @@ export function FileManager() {
         return;
       }
 
+      // In the list, → opens the folder at the cursor in place and ← closes it (or goes up to the
+      // folder it's open in), as in Finder.
+      if (treeMode && cursor && !modifier && !event.shiftKey && !event.altKey && (event.key === "ArrowRight" || event.key === "ArrowLeft") && !isTypingTarget(event.target)) {
+        const entry = sortedEntries.find((item) => item.path === cursor);
+        if (entry) {
+          event.preventDefault();
+          if (event.key === "ArrowRight") {
+            if (entry.type === "directory" && !expanded.has(entry.path)) toggleExpanded(entry);
+          } else if (entry.type === "directory" && expanded.has(entry.path)) toggleExpanded(entry);
+          else if (expanded.has(parentOf(entry.path))) {
+            const parent = parentOf(entry.path);
+            anchorRef.current = parent;
+            setSelected(new Set([parent]));
+            setCursor(parent);
+          }
+          return;
+        }
+      }
+
       const grid = view === "grid";
       const current = sortedEntries.findIndex((entry) => entry.path === cursor);
       const nextIndex = modifier || event.altKey ? null : moveCursor(current, sortedEntries.length, event.key, { grid, columns: grid ? gridColumns() : 1 });
@@ -1623,9 +1703,9 @@ export function FileManager() {
     }
   };
 
-  const selectedEntries = entries.filter((entry) => selected.has(entry.path));
+  const selectedEntries = sortedEntries.filter((entry) => selected.has(entry.path));
   const favoritePaths = new Set(favorites.map((favorite) => favorite.path));
-  const allSelected = entries.length > 0 && selected.size === entries.length;
+  const allSelected = sortedEntries.length > 0 && selected.size === sortedEntries.length;
   const diskPercent = disk?.total ? Math.round((disk.used / disk.total) * 100) : 0;
 
   if (auth.loading) return <AppLoading />;
@@ -1850,9 +1930,10 @@ export function FileManager() {
                 cursor={cursor}
                 interactions={interactions}
                 allSelected={allSelected}
-                onToggleAll={() => setSelected(allSelected ? new Set() : new Set(entries.map((entry) => entry.path)))}
+                onToggleAll={() => setSelected(allSelected ? new Set() : new Set(sortedEntries.map((entry) => entry.path)))}
                 onToggle={selectEntry}
                 onOpen={openEntry}
+                tree={treeMode ? { base: currentPath, expanded, loading: new Set([...expanded].filter((item) => !childListings.has(item))), onToggle: toggleExpanded } : undefined}
               />
             ) : (
               <FileGrid entries={sortedEntries} selected={selected} cursor={cursor} interactions={interactions} onToggle={selectEntry} onOpen={openEntry} videoThumbnails={auth.features?.videoThumbnails ?? false} />
@@ -2432,7 +2513,9 @@ function entryStateClasses(entry: FileEntry, interactions: EntryInteractions) {
   return `${interactions.cutPaths.has(entry.path) ? "cut" : ""} ${interactions.dropTarget === entry.path ? "drop-target" : ""}`;
 }
 
-function FileTable({ entries, sort, onSort, selected, cursor, interactions, allSelected, onToggleAll, onToggle, onOpen, folder, folderSizes }: {
+function FileTable({ entries, sort, onSort, selected, cursor, interactions, allSelected, onToggleAll, onToggle, onOpen, folder, folderSizes, tree }: {
+  /** Folders open in place: rows are indented by how far below `base` they are. */
+  tree?: { base: string; expanded: Set<string>; loading: Set<string>; onToggle: (entry: FileEntry) => void };
   /** The folder being shown; search results from elsewhere say where they are. */
   folder?: string;
   /** Counted folder sizes by path, "counting" while they're worked out, or nothing when off. */
@@ -2471,7 +2554,9 @@ function FileTable({ entries, sort, onSort, selected, cursor, interactions, allS
         return (
           <div key={entry.path} data-path={entry.path} aria-selected={isSelected} className={`file-row ${isSelected ? "selected" : ""} ${cursor === entry.path ? "cursor" : ""} ${entryStateClasses(entry, interactions)}`} role="row" {...entryItemProps(entry, interactions)} onMouseDown={(event) => { if (event.shiftKey) event.preventDefault(); }} onDoubleClick={(event) => { if (!(event.target as HTMLElement).closest("button,input,label")) onOpen(entry); }} onClick={(event) => { if ((event.target as HTMLElement).closest("button,input,label")) return; onToggle(entry, { additive: event.metaKey || event.ctrlKey, range: event.shiftKey }); }}>
             <div role="cell"><CheckBox checked={isSelected} onChange={(event) => onToggle(entry, { additive: true, range: event.shiftKey })} label={`Select ${entry.name}`} /></div>
-            <div className="file-name-cell" role="cell"><span className={`file-icon ${entry.type}`}>{fileIcon(entry)}</span>{folder !== undefined && parentOf(entry.path) !== folder ? <div className="file-name-stack"><button className="file-name" onClick={() => onOpen(entry)}>{entry.name}</button><small title={`/${entry.path}`}>{folderLabel(parentOf(entry.path))}</small></div> : <button className="file-name" onClick={() => onOpen(entry)}>{entry.name}</button>}{interactions.sharedPaths.has(entry.path) && <span className="shared-badge" title="Shared by link"><Link2 size={13} /></span>}<WatchMark entry={entry} watching={interactions.watching} /><TagDots colors={interactions.tags.get(entry.path)} />{entry.symlinkBlocked && <span className="warning-badge" title="This link points outside the allowed root"><CircleAlert size={13} /></span>}</div>
+            <div className="file-name-cell" role="cell" style={tree ? { paddingLeft: Math.max(0, entry.path.split("/").length - (tree.base ? tree.base.split("/").length : 0) - 1) * 20 } : undefined}>{tree && (entry.type === "directory"
+              ? <button type="button" className="expand-toggle" aria-expanded={tree.expanded.has(entry.path)} aria-label={tree.expanded.has(entry.path) ? `Close ${entry.name}` : `Show what's in ${entry.name} here`} title={tree.expanded.has(entry.path) ? "Close (←)" : "Show what's inside here (→)"} onClick={() => tree.onToggle(entry)}>{tree.loading.has(entry.path) ? <LoaderCircle className="spin" size={13} /> : <ChevronRight size={14} className={tree.expanded.has(entry.path) ? "tree-open" : ""} />}</button>
+              : <span className="expand-spacer" />)}<span className={`file-icon ${entry.type}`}>{fileIcon(entry)}</span>{folder !== undefined && parentOf(entry.path) !== folder && !tree?.expanded.has(parentOf(entry.path)) ? <div className="file-name-stack"><button className="file-name" onClick={() => onOpen(entry)}>{entry.name}</button><small title={`/${entry.path}`}>{folderLabel(parentOf(entry.path))}</small></div> : <button className="file-name" onClick={() => onOpen(entry)}>{entry.name}</button>}{interactions.sharedPaths.has(entry.path) && <span className="shared-badge" title="Shared by link"><Link2 size={13} /></span>}<WatchMark entry={entry} watching={interactions.watching} /><TagDots colors={interactions.tags.get(entry.path)} />{entry.symlinkBlocked && <span className="warning-badge" title="This link points outside the allowed root"><CircleAlert size={13} /></span>}</div>
             <div className="muted" role="cell">{entry.type !== "directory" ? formatBytes(entry.size) : folderSizes === "counting" ? <LoaderCircle className="spin" size={12} aria-label="Counting" /> : folderSizes?.has(entry.path) ? formatBytes(folderSizes.get(entry.path)!) : "—"}</div>
             <div className="owner-cell" role="cell"><span className="mini-avatar">{entry.owner.slice(0, 1).toUpperCase()}</span><span>{entry.owner}:{entry.group}</span></div>
             <div role="cell"><code className="mode-chip">{entry.mode}</code></div>
