@@ -40,7 +40,7 @@ export async function GET(request: Request) {
       const search = (url.searchParams.get("search") ?? "").trim().slice(0, 256);
       const showHidden = url.searchParams.get("hidden") === "true";
       // Just the folders inside, for the folder tree.
-      if (url.searchParams.get("folders") === "1") return NextResponse.json(await withFilesystemLock(() => listFolders(relativePath, showHidden)), { headers: { "Cache-Control": "no-store" } });
+      if (url.searchParams.get("folders") === "1") return NextResponse.json(await listFolders(relativePath, showHidden), { headers: { "Cache-Control": "no-store" } });
       const kind = (url.searchParams.get("kind") || "any") as SearchKind;
       if (!SEARCH_KINDS.includes(kind)) throw new AppError("Unknown kind of item", 400, "INVALID_FILTER");
       const modifiedWithinDays = Number(url.searchParams.get("modifiedDays") || 0);

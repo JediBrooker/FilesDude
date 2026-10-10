@@ -538,8 +538,17 @@ export function relativeFromAbsolute(absolute: string) {
   return path.relative(canonicalRoot || config.root, absolute).split(path.sep).join("/");
 }
 
-async function identities() {
+// Every item in a listing asks for the account names at once: they share one reading of the files.
+type Identities = { users: Map<number, string>; groups: Map<number, string>; at: number };
+let identitiesLoading: Promise<Identities> | null = null;
+
+async function identities(): Promise<Identities> {
   if (identitiesCache && Date.now() - identitiesCache.at < 60_000) return identitiesCache;
+  identitiesLoading ??= loadIdentities().finally(() => { identitiesLoading = null; });
+  return identitiesLoading;
+}
+
+async function loadIdentities(): Promise<Identities> {
   const users = new Map<number, string>();
   const groups = new Map<number, string>();
   try {
@@ -689,7 +698,12 @@ export async function listDirectory(relativePath = "", showHidden = false) {
   const entries = await withOpen(openDirectory(relative), async (directory) => {
     const names = await fs.readdir(directory.base);
     const visible = names.filter((name) => !INTERNAL_NAMES.has(name) && (showHidden || !name.startsWith(".")));
-    return Promise.all(visible.map((name) => toEntry(inside(directory, name), childOf(relative, name), name)));
+    // A few at a time, so a folder of hundreds of thousands of items doesn't look at them all at once.
+    const found: FileEntry[] = [];
+    for (let start = 0; start < visible.length; start += LIST_BATCH) {
+      found.push(...await Promise.all(visible.slice(start, start + LIST_BATCH).map((name) => toEntry(inside(directory, name), childOf(relative, name), name))));
+    }
+    return found;
   });
   entries.sort((a, b) => {
     if (a.type === "directory" && b.type !== "directory") return -1;
@@ -699,22 +713,49 @@ export async function listDirectory(relativePath = "", showHidden = false) {
   return { path: normalizeRelative(relativePath), entries, disk: await diskInfo() };
 }
 
-/** Folders listed at most for one folder in the folder tree. */
+/** Folders listed at most for one folder in the folder tree, and items read to find them. */
 export const MAX_TREE_FOLDERS = 2_000;
+const MAX_TREE_SCAN = 100_000;
+const LIST_BATCH = 64;
+const nameCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
 
 /**
  * The folders directly inside a folder, by name, for the folder tree: read from the folder's own
  * listing (no look at each item, so a folder of thousands of files is quick), and only real folders
- * (not links to them).
+ * (not links to them). The filesystem lock is only held to open the folder, which is then read
+ * through its handle, as searches are; reading stops after 100,000 items.
  */
 export async function listFolders(relativePath = "", showHidden = false) {
   const relative = cleanRelative(relativePath);
-  const names = await withOpen(openDirectory(relative), async (directory) => {
-    const items = await fs.readdir(directory.base, { withFileTypes: true });
-    return items.filter((item) => item.isDirectory() && !INTERNAL_NAMES.has(item.name) && (showHidden || !item.name.startsWith("."))).map((item) => item.name);
-  });
-  names.sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }));
-  return { path: relative, folders: names.slice(0, MAX_TREE_FOLDERS).map((name) => ({ name, path: childOf(relative, name) })), truncated: names.length > MAX_TREE_FOLDERS };
+  const release = await acquireFilesystemLock();
+  let directory: AnchoredDirectory;
+  try {
+    directory = await openDirectory(relative);
+  } finally {
+    release();
+  }
+  const names: string[] = [];
+  let scanned = 0;
+  let truncated = false;
+  try {
+    for await (const item of await fs.opendir(directory.base)) {
+      if (++scanned > MAX_TREE_SCAN) {
+        truncated = true;
+        break;
+      }
+      if (INTERNAL_NAMES.has(item.name) || (!showHidden && item.name.startsWith("."))) continue;
+      let folder = item.isDirectory();
+      if (!folder && !item.isFile() && !item.isSymbolicLink() && !item.isFIFO() && !item.isSocket() && !item.isBlockDevice() && !item.isCharacterDevice()) {
+        // The filesystem didn't say what it is: look (without following links); one gone since is skipped.
+        folder = await fs.lstat(inside(directory, item.name)).then((stat) => stat.isDirectory(), () => false);
+      }
+      if (folder) names.push(item.name);
+    }
+  } finally {
+    await directory.handle.close().catch(() => undefined);
+  }
+  names.sort(nameCollator.compare);
+  return { path: relative, folders: names.slice(0, MAX_TREE_FOLDERS).map((name) => ({ name, path: childOf(relative, name) })), truncated: truncated || names.length > MAX_TREE_FOLDERS };
 }
 
 export function validateName(name: string) {

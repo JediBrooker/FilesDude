@@ -1545,6 +1545,12 @@ export function FileManager() {
     // Whatever was playing or open belongs to this account: it goes (saving where it got to first).
     setNowPlaying(null);
     setDialog(null);
+    // So do the folders remembered for the tree and the split view, on a computer someone else may use next.
+    try {
+      for (const key of Object.keys(window.localStorage)) if (key.startsWith(TREE_STORAGE_PREFIX) || key.startsWith(SPLIT_STORAGE_PREFIX)) window.localStorage.removeItem(key);
+    } catch {
+      // Nothing was remembered.
+    }
     await new Promise((resolve) => window.setTimeout(resolve, 0));
     await requestJson("/api/auth/logout", { method: "POST", body: JSON.stringify({}) });
     setFavorites([]);
@@ -2151,22 +2157,34 @@ function FolderTree({ account, home, currentPath, showHidden, canWrite, reloadSi
     for (const folder of listings.get(target)?.folders ?? []) if (expanded.has(folder.path)) walk(folder.path);
   };
   if (expanded.has(home)) walk(home);
-  const openKey = openPaths.join("\n");
+  // (A list, not names joined by a character: folder names can contain any character.)
+  const openKey = JSON.stringify(openPaths);
   useEffect(() => {
     const timer = window.setTimeout(() => {
-      for (const target of openKey.split("\n")) if (!listings.has(target) && !failed.has(target)) void load(target);
+      for (const target of JSON.parse(openKey) as string[]) if (!listings.has(target) && !failed.has(target)) void load(target);
     }, 0);
     return () => window.clearTimeout(timer);
   }, [openKey, listings, failed, load]);
-  // Open folders are listed again when anything changes (or hidden folders are shown or not).
+  // When the folder being shown reloads (something in it changed), it and the folder above it are
+  // listed again; going to another folder doesn't list anything again. Showing hidden folders or not
+  // lists every open folder again.
   const openNow = useRef(openPaths);
-  useEffect(() => { openNow.current = openPaths; });
+  const pathNow = useRef(currentPath);
+  useEffect(() => {
+    openNow.current = openPaths;
+    pathNow.current = currentPath;
+  });
+  const lastRefresh = useRef({ path: currentPath, hidden: showHidden });
   useEffect(() => {
     const timer = window.setTimeout(() => {
-      for (const target of openNow.current) void load(target);
+      const last = lastRefresh.current;
+      const here = pathNow.current;
+      const targets = last.hidden !== showHidden ? openNow.current : last.path === here ? openNow.current.filter((target) => target === here || target === parentOf(here)) : [];
+      lastRefresh.current = { path: here, hidden: showHidden };
+      for (const target of targets) void load(target);
     }, 0);
     return () => window.clearTimeout(timer);
-  }, [reloadSignal, load]);
+  }, [reloadSignal, load, showHidden]);
 
   // The folder being shown is scrolled into view in the tree once it's there (once per folder, so
   // scrolling the tree by hand isn't undone).
