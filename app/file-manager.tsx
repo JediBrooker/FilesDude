@@ -150,6 +150,7 @@ type DialogState =
   | { kind: "passkeys" }
   | { kind: "notifications" }
   | { kind: "watching" }
+  | { kind: "tag"; color: TagColor }
   | { kind: "snapshots" }
   | { kind: "duplicates" }
   | { kind: "versions"; entry: FileEntry }
@@ -249,9 +250,15 @@ type EntryInteractions = {
   onDragEnd: () => void;
   /** How far the account got in the videos shown, by path. */
   watching: Map<string, WatchEntry>;
+  /** The account's colour tags on the items shown, by path. */
+  tags: Map<string, TagColor[]>;
 };
 
 const DRAG_TYPE = "application/x-filesdude-paths";
+// Colour tags, as on the server (lib/tags.ts), in the order they're shown.
+type TagColor = "red" | "orange" | "yellow" | "green" | "blue" | "purple" | "gray";
+const TAG_COLORS: Array<[TagColor, string]> = [["red", "Red"], ["orange", "Orange"], ["yellow", "Yellow"], ["green", "Green"], ["blue", "Blue"], ["purple", "Purple"], ["gray", "Grey"]];
+type TaggedEntry = { path: string; name: string; type: "file" | "directory"; size: number; modified: string; mime: string; colors: TagColor[] };
 const MENU_WIDTH = 224;
 const MULTI_ITEM_ACTIONS: EntryAction[] = ["download", "cut", "clipboard", "copy", "move", "compress", "permissions", "ownership", "delete"];
 const ARCHIVE_NAME = /\.(zip|tar\.gz|tgz|tar)$/i;
@@ -580,6 +587,10 @@ export function FileManager() {
   const [loading, setLoading] = useState(false);
   const [dialog, setDialog] = useState<DialogState>(null);
   const [watching, setWatching] = useState<Map<string, WatchEntry>>(() => new Map());
+  const [tags, setTags] = useState<Map<string, TagColor[]>>(() => new Map());
+  const [tagCounts, setTagCounts] = useState<Record<TagColor, number> | null>(null);
+  // Bumped to look at the tags again (after some were taken off in the Tags dialog).
+  const [tagsVersion, setTagsVersion] = useState(0);
   // Video or audio that keeps playing while you browse.
   const [nowPlaying, setNowPlaying] = useState<NowPlaying | null>(null);
   const playerSessions = useRef(0);
@@ -746,6 +757,19 @@ export function FileManager() {
     return () => controller.abort();
     // Counted again whenever the listing reloads, so changes show up.
   }, [auth.authenticated, showFolderSizes, currentPath, entries, nameSearching, searchMode, activeSearch]);
+
+  // The account's colour tags on the items in this folder, and how many items have each colour.
+  useEffect(() => {
+    if (!auth.authenticated) return;
+    const controller = new AbortController();
+    requestJson<{ tags: Array<{ path: string; colors: TagColor[] }> }>(`/api/tags?folder=${encodePath(currentPath)}`, { signal: controller.signal })
+      .then((result) => setTags(new Map(result.tags.map((item) => [item.path, item.colors]))))
+      .catch(() => undefined);
+    requestJson<{ counts: Record<TagColor, number> }>("/api/tags", { signal: controller.signal })
+      .then((result) => setTagCounts(result.counts))
+      .catch(() => undefined);
+    return () => controller.abort();
+  }, [auth.authenticated, auth.username, currentPath, entries, tagsVersion]);
 
   // Videos in this folder the account has watched or is part-way through, marked in the list (and
   // looked at again when a preview closes, as it may have moved on).
@@ -1123,6 +1147,24 @@ export function FileManager() {
     }
   };
 
+  // Adds a colour tag to items, or takes it off.
+  const tagItems = async (paths: string[], color: TagColor, on: boolean) => {
+    try {
+      const result = await requestJson<{ tags: Array<{ path: string; colors: TagColor[] }>; counts: Record<TagColor, number> }>("/api/tags", { method: "POST", body: JSON.stringify({ action: "set", paths, color, on }) });
+      setTags((current) => {
+        const next = new Map(current);
+        for (const item of result.tags) {
+          if (item.colors.length) next.set(item.path, item.colors);
+          else next.delete(item.path);
+        }
+        return next;
+      });
+      setTagCounts(result.counts);
+    } catch (error) {
+      notify((error as Error).message, "error");
+    }
+  };
+
   const clip = (mode: ClipboardState["mode"], paths: string[]) => {
     if (!paths.length) return;
     setClipboard({ mode, paths });
@@ -1284,6 +1326,7 @@ export function FileManager() {
     onDragStart: startDrag,
     onDragEnd: endDrag,
     watching,
+    tags,
   };
 
   const queueUpload = ({ items, folders }: { items: UploadItem[]; folders: string[] }, destination?: string) => {
@@ -1562,6 +1605,18 @@ export function FileManager() {
           {favorites.length ? <div className="favorite-list">{favorites.map((favorite) => <div key={favorite.path} className={`favorite-item ${currentPath === favorite.path ? "active" : ""} ${dropTarget === favorite.path ? "drop-target" : ""}`} data-drop-path={favorite.path} {...(canWrite ? dropHandlers : {})}><button title={`/${favorite.path}`} onClick={() => { navigate(favorite.path); setSidebarOpen(false); }}><Star size={15} fill="currentColor" /><span>{favorite.name}</span></button><button className="favorite-remove" aria-label={`Remove ${favorite.name} from favourites`} title="Remove from favourites" onClick={() => void toggleFavorite(favorite.path)}><X size={13} /></button></div>)}</div> : <p className="favorites-empty"><Star size={14} /> Star folders to pin them here.</p>}
         </div>
 
+        {/* One compact row of the colours in use, each opening everything with it. */}
+        {tagCounts && TAG_COLORS.some(([color]) => tagCounts[color] > 0) && (
+          <div className="sidebar-section">
+            <p className="eyebrow">TAGS</p>
+            <div className="tag-chips">
+              {TAG_COLORS.filter(([color]) => tagCounts[color] > 0).map(([color, label]) => (
+                <button key={color} type="button" className={`tag-chip tag-${color}`} aria-label={`${label} tag: ${tagCounts[color]} ${tagCounts[color] === 1 ? "item" : "items"}`} title={`${label} (${tagCounts[color]})`} onClick={() => { setDialog({ kind: "tag", color }); setSidebarOpen(false); }}><span className="tag-dot" />{tagCounts[color]}</button>
+              ))}
+            </div>
+          </div>
+        )}
+
         {/* Other servers (the owner's); this server's own files are the main view. */}
         {isOwner && <div className="sidebar-section">
           <p className="eyebrow">OTHER SERVERS</p>
@@ -1796,10 +1851,12 @@ export function FileManager() {
           onReveal={(entry) => { setDialog(null); navigate(entry.path.split("/").slice(0, -1).join("/")); }}
           onPreview={showPreview}
           onPlayer={(playing) => { setDialog(null); setNowPlaying({ ...playing, session: ++playerSessions.current, account: auth.username ?? "" }); }}
+          onNavigate={(target) => { setDialog(null); navigate(target); }}
+          onTagsChanged={() => setTagsVersion((version) => version + 1)}
         />
       )}
       {menu && createPortal(menu.kind === "entry"
-        ? <FileActionMenu entry={menu.entry} targets={menuTargets(menu.entry)} position={{ top: menu.top, left: menu.left }} menuRef={menuRef} favoritePaths={favoritePaths} canWrite={canWrite} isOwner={isOwner} snapshots={snapshotsAvailable} canPaste={canWrite && Boolean(clipboard) && menu.entry.type === "directory"} onAction={(action, entry) => { setMenu(null); handleEntryAction(action, entry); }} />
+        ? <FileActionMenu entry={menu.entry} targets={menuTargets(menu.entry)} position={{ top: menu.top, left: menu.left }} menuRef={menuRef} favoritePaths={favoritePaths} canWrite={canWrite} isOwner={isOwner} snapshots={snapshotsAvailable} canPaste={canWrite && Boolean(clipboard) && menu.entry.type === "directory"} onAction={(action, entry) => { setMenu(null); handleEntryAction(action, entry); }} tagsOf={(item) => tags.get(item) ?? []} onTag={(color, on) => { const paths = menuTargets(menu.entry).map((item) => item.path); setMenu(null); void tagItems(paths, color, on); }} />
         : <BackgroundMenu canWrite={canWrite} position={{ top: menu.top, left: menu.left }} menuRef={menuRef} folder={currentPath ? currentPath.split("/").at(-1) || "" : "All files"} clipboardCount={clipboard?.paths.length ?? 0} canSelectAll={sortedEntries.length > 0} onChoose={chooseBackground} />,
       document.body)}
       {nowPlaying && auth.authenticated && nowPlaying.account === (auth.username ?? "") && <NowPlayingPlayer key={nowPlaying.session} playing={nowPlaying} onChange={setNowPlaying} onClose={() => setNowPlaying(null)} onExpand={(entry, siblings, startAt) => { setNowPlaying(null); setDialog({ kind: "preview", entry, siblings, startAt }); }} />}
@@ -2159,7 +2216,7 @@ function FileTable({ entries, sort, onSort, selected, cursor, interactions, allS
         return (
           <div key={entry.path} data-path={entry.path} aria-selected={isSelected} className={`file-row ${isSelected ? "selected" : ""} ${cursor === entry.path ? "cursor" : ""} ${entryStateClasses(entry, interactions)}`} role="row" {...entryItemProps(entry, interactions)} onMouseDown={(event) => { if (event.shiftKey) event.preventDefault(); }} onDoubleClick={(event) => { if (!(event.target as HTMLElement).closest("button,input,label")) onOpen(entry); }} onClick={(event) => { if ((event.target as HTMLElement).closest("button,input,label")) return; onToggle(entry, { additive: event.metaKey || event.ctrlKey, range: event.shiftKey }); }}>
             <div role="cell"><CheckBox checked={isSelected} onChange={(event) => onToggle(entry, { additive: true, range: event.shiftKey })} label={`Select ${entry.name}`} /></div>
-            <div className="file-name-cell" role="cell"><span className={`file-icon ${entry.type}`}>{fileIcon(entry)}</span>{folder !== undefined && parentOf(entry.path) !== folder ? <div className="file-name-stack"><button className="file-name" onClick={() => onOpen(entry)}>{entry.name}</button><small title={`/${entry.path}`}>{folderLabel(parentOf(entry.path))}</small></div> : <button className="file-name" onClick={() => onOpen(entry)}>{entry.name}</button>}{interactions.sharedPaths.has(entry.path) && <span className="shared-badge" title="Shared by link"><Link2 size={13} /></span>}<WatchMark entry={entry} watching={interactions.watching} />{entry.symlinkBlocked && <span className="warning-badge" title="This link points outside the allowed root"><CircleAlert size={13} /></span>}</div>
+            <div className="file-name-cell" role="cell"><span className={`file-icon ${entry.type}`}>{fileIcon(entry)}</span>{folder !== undefined && parentOf(entry.path) !== folder ? <div className="file-name-stack"><button className="file-name" onClick={() => onOpen(entry)}>{entry.name}</button><small title={`/${entry.path}`}>{folderLabel(parentOf(entry.path))}</small></div> : <button className="file-name" onClick={() => onOpen(entry)}>{entry.name}</button>}{interactions.sharedPaths.has(entry.path) && <span className="shared-badge" title="Shared by link"><Link2 size={13} /></span>}<WatchMark entry={entry} watching={interactions.watching} /><TagDots colors={interactions.tags.get(entry.path)} />{entry.symlinkBlocked && <span className="warning-badge" title="This link points outside the allowed root"><CircleAlert size={13} /></span>}</div>
             <div className="muted" role="cell">{entry.type !== "directory" ? formatBytes(entry.size) : folderSizes === "counting" ? <LoaderCircle className="spin" size={12} aria-label="Counting" /> : folderSizes?.has(entry.path) ? formatBytes(folderSizes.get(entry.path)!) : "—"}</div>
             <div className="owner-cell" role="cell"><span className="mini-avatar">{entry.owner.slice(0, 1).toUpperCase()}</span><span>{entry.owner}:{entry.group}</span></div>
             <div role="cell"><code className="mode-chip">{entry.mode}</code></div>
@@ -2174,7 +2231,17 @@ function FileTable({ entries, sort, onSort, selected, cursor, interactions, allS
   );
 }
 
-function FileActionMenu({ entry, targets, position, menuRef, favoritePaths, canWrite, isOwner, snapshots, canPaste, onAction }: {
+/** An item's colour tags, as small dots beside its name. */
+function TagDots({ colors }: { colors?: TagColor[] }) {
+  if (!colors?.length) return null;
+  const labels = colors.map((color) => TAG_COLORS.find(([value]) => value === color)?.[1] ?? color);
+  return <span className="tag-dots" role="img" aria-label={`Tags: ${labels.join(", ")}`} title={labels.join(", ")}>{colors.map((color) => <span key={color} className={`tag-dot tag-${color}`} />)}</span>;
+}
+
+function FileActionMenu({ entry, targets, position, menuRef, favoritePaths, canWrite, isOwner, snapshots, canPaste, onAction, tagsOf, onTag }: {
+  tagsOf: (path: string) => TagColor[];
+  /** Adds a colour to every target, or takes it off. */
+  onTag: (color: TagColor, on: boolean) => void;
   entry: FileEntry;
   targets: FileEntry[];
   position: MenuPosition;
@@ -2195,6 +2262,13 @@ function FileActionMenu({ entry, targets, position, menuRef, favoritePaths, canW
       {multiple
         ? <div className="file-menu-heading"><span className="file-icon"><ListChecks size={17} /></span><div><strong>{itemCount(targets.length)} selected</strong><span>Actions apply to every selected item</span></div></div>
         : <div className="file-menu-heading"><span className={`file-icon ${entry.type}`}>{fileIcon(entry, 17)}</span><div><strong>{entry.name}</strong><span>{entry.type === "directory" ? "Folder" : `${extension(entry.name)} · ${formatBytes(entry.size)}`}</span></div></div>}
+      {/* A colour is ticked when every target has it; choosing it again takes it off them all. */}
+      <div className="menu-tags" role="group" aria-label="Tags">
+        {TAG_COLORS.map(([color, label]) => {
+          const on = targets.every((target) => tagsOf(target.path).includes(color));
+          return <button key={color} type="button" role="menuitemcheckbox" aria-checked={on} aria-label={`${label} tag`} title={on ? `Remove the ${label.toLowerCase()} tag` : `Tag ${label.toLowerCase()}`} className={`tag-swatch tag-${color}${on ? " on" : ""}`} onClick={() => onTag(color, !on)}>{on && <Check size={11} />}</button>;
+        })}
+      </div>
       {!multiple && <div className="file-menu-section">
         {item("open", entry.type === "directory" ? "Open" : "Preview", entry.type === "directory" ? <FolderOpen size={16} /> : <Eye size={16} />)}
         {canWrite && entry.type === "file" && item("edit", "Edit", <FilePenLine size={16} />, { disabled: !isEditable(entry) })}
@@ -2259,7 +2333,7 @@ function BackgroundMenu({ canWrite, position, menuRef, folder, clipboardCount, c
 }
 
 function FileGrid({ entries, selected, cursor, interactions, onToggle, onOpen, videoThumbnails }: { entries: FileEntry[]; selected: Set<string>; cursor: string | null; interactions: EntryInteractions; onToggle: (entry: FileEntry, options?: SelectOptions) => void; onOpen: (entry: FileEntry) => void; videoThumbnails: boolean }) {
-  return <div className="file-grid">{entries.map((entry) => <article key={entry.path} data-path={entry.path} className={`file-card ${selected.has(entry.path) ? "selected" : ""} ${cursor === entry.path ? "cursor" : ""} ${entryStateClasses(entry, interactions)}`} {...entryItemProps(entry, interactions)} onMouseDown={(event) => { if (event.shiftKey) event.preventDefault(); }} onClick={(event) => { if ((event.target as HTMLElement).closest("button,input,label")) return; onToggle(entry, { additive: event.metaKey || event.ctrlKey, range: event.shiftKey }); }} onDoubleClick={() => onOpen(entry)}><CheckBox checked={selected.has(entry.path)} onChange={(event) => onToggle(entry, { additive: true, range: event.shiftKey })} label={`Select ${entry.name}`} /><GridPreview entry={entry} onOpen={onOpen} videoThumbnails={videoThumbnails} /><button className="grid-name" onClick={() => onOpen(entry)}>{entry.name}</button><WatchMark entry={entry} watching={interactions.watching} /><span>{entry.type === "directory" ? "Folder" : `${extension(entry.name)} · ${formatBytes(entry.size)}`}</span></article>)}</div>;
+  return <div className="file-grid">{entries.map((entry) => <article key={entry.path} data-path={entry.path} className={`file-card ${selected.has(entry.path) ? "selected" : ""} ${cursor === entry.path ? "cursor" : ""} ${entryStateClasses(entry, interactions)}`} {...entryItemProps(entry, interactions)} onMouseDown={(event) => { if (event.shiftKey) event.preventDefault(); }} onClick={(event) => { if ((event.target as HTMLElement).closest("button,input,label")) return; onToggle(entry, { additive: event.metaKey || event.ctrlKey, range: event.shiftKey }); }} onDoubleClick={() => onOpen(entry)}><CheckBox checked={selected.has(entry.path)} onChange={(event) => onToggle(entry, { additive: true, range: event.shiftKey })} label={`Select ${entry.name}`} /><GridPreview entry={entry} onOpen={onOpen} videoThumbnails={videoThumbnails} /><button className="grid-name" onClick={() => onOpen(entry)}>{entry.name}</button><WatchMark entry={entry} watching={interactions.watching} /><TagDots colors={interactions.tags.get(entry.path)} /><span>{entry.type === "directory" ? "Folder" : `${extension(entry.name)} · ${formatBytes(entry.size)}`}</span></article>)}</div>;
 }
 
 // A thumbnail for images (and videos, when the server can) it can preview, falling back to the type
@@ -2380,7 +2454,7 @@ function JobPanel({ job, onCancel }: { job: JobState; onCancel: () => void }) {
   );
 }
 
-function DialogHost({ dialog, selected, currentPath, username, role, home, onClose, onRun, notify, onRefresh, onStartJob, onTransfer, onJob, canWrite, onSharesChanged, onCredentialsUpdated, onTwoFactor, onPasskeys, onNotifications, onReveal, onPreview, onPlayer, uploadInPieces }: {
+function DialogHost({ dialog, selected, currentPath, username, role, home, onClose, onRun, notify, onRefresh, onStartJob, onTransfer, onJob, canWrite, onSharesChanged, onCredentialsUpdated, onTwoFactor, onPasskeys, onNotifications, onReveal, onPreview, onPlayer, onNavigate, onTagsChanged, uploadInPieces }: {
   dialog: NonNullable<DialogState>;
   selected: FileEntry[];
   currentPath: string;
@@ -2404,6 +2478,8 @@ function DialogHost({ dialog, selected, currentPath, username, role, home, onClo
   onReveal: (entry: FileEntry) => void;
   onPreview: (entry: FileEntry, siblings?: FileEntry[], slideshow?: Slideshow) => void;
   onPlayer: (playing: NowPlaying) => void;
+  onNavigate: (path: string) => void;
+  onTagsChanged: () => void;
 }) {
   // The server dialogs are shown by FileManager, which holds the list of servers.
   if (dialog.kind === "server" || dialog.kind === "serverSettings" || dialog.kind === "copyToServer") return null;
@@ -2432,6 +2508,7 @@ function DialogHost({ dialog, selected, currentPath, username, role, home, onClo
   if (dialog.kind === "twoFactor") return <TwoFactorDialog onClose={onClose} notify={notify} />;
   if (dialog.kind === "passkeys") return <PasskeysDialog onClose={onClose} notify={notify} />;
   if (dialog.kind === "notifications") return <NotificationsDialog onClose={onClose} notify={notify} />;
+  if (dialog.kind === "tag") return <TagDialog color={dialog.color} onClose={onClose} onPreview={onPreview} onReveal={onReveal} onNavigate={onNavigate} onChanged={onTagsChanged} notify={notify} />;
   if (dialog.kind === "watching") return <ContinueWatchingDialog onClose={onClose} onPreview={onPreview} onReveal={onReveal} notify={notify} />;
   if (dialog.kind === "snapshots") return <SnapshotsDialog isOwner={role === "owner"} canWrite={canWrite} home={home} onClose={onClose} notify={notify} onJob={onJob} />;
   if (dialog.kind === "versions") return <VersionsDialog entry={dialog.entry} canWrite={canWrite} isOwner={role === "owner"} onClose={onClose} notify={notify} onJob={onJob} />;
@@ -4332,6 +4409,48 @@ function saveWatchPosition(pathValue: string, position: number, duration: number
     headers: { "x-filedude-request": "1", "Content-Type": "application/json" },
     body: JSON.stringify({ action: "save", path: pathValue, position, duration }),
   }).catch(() => undefined);
+}
+
+/** Everything with one colour tag, wherever it is: open it, show it in its folder, or take the tag off. */
+function TagDialog({ color, onClose, onPreview, onReveal, onNavigate, onChanged, notify }: { color: TagColor; onClose: () => void; onPreview: (entry: FileEntry) => void; onReveal: (entry: FileEntry) => void; onNavigate: (path: string) => void; onChanged: () => void; notify: (message: string, tone?: "error") => void }) {
+  const [entries, setEntries] = useState<TaggedEntry[] | null>(null);
+  const [error, setError] = useState("");
+  const label = TAG_COLORS.find(([value]) => value === color)?.[1] ?? color;
+  useEffect(() => {
+    const controller = new AbortController();
+    requestJson<{ entries: TaggedEntry[] }>(`/api/tags?color=${encodeURIComponent(color)}`, { signal: controller.signal })
+      .then((result) => setEntries(result.entries))
+      .catch((caught: Error) => { if (caught.name !== "AbortError") setError(caught.message); });
+    return () => controller.abort();
+  }, [color]);
+  const asEntry = (item: TaggedEntry): FileEntry => ({ name: item.name, path: item.path, type: item.type, size: item.size, modified: item.modified, created: item.modified, mode: "", uid: 0, gid: 0, owner: "", group: "", mime: item.mime, hidden: item.name.startsWith(".") });
+  const untag = async (item: TaggedEntry) => {
+    try {
+      await requestJson("/api/tags", { method: "POST", body: JSON.stringify({ action: "set", paths: [item.path], color, on: false }) });
+      setEntries((current) => current?.filter((entry) => entry.path !== item.path) ?? null);
+      onChanged();
+    } catch (caught) {
+      notify((caught as Error).message, "error");
+    }
+  };
+  return (
+    <Modal title={`${label} tag`} subtitle="Everything you've tagged with this colour" icon={<span className={`tag-dot tag-${color} tag-dot-large`} />} onClose={onClose}>
+      {error ? <div className="watching-empty"><CircleAlert size={24} /><strong>Couldn&apos;t load the list</strong><span>{error}</span></div>
+        : !entries ? <div className="watching-empty"><LoaderCircle className="spin" size={22} /></div>
+        : !entries.length ? <div className="watching-empty"><span className={`tag-dot tag-${color} tag-dot-large`} /><strong>Nothing tagged {label.toLowerCase()}</strong><span>Right-click a file or folder to tag it.</span></div>
+        : <ul className="watching-list">{entries.map((item) => (
+          <li key={item.path}>
+            <button type="button" className="watching-play" onClick={() => (item.type === "directory" ? onNavigate(item.path) : onPreview(asEntry(item)))}>
+              <span className={`file-icon ${item.type}`}>{fileIcon(asEntry(item))}</span>
+              <span className="watching-text"><strong>{item.name}</strong><small title={`/${item.path}`}>{folderLabel(parentOf(item.path))}{item.type === "file" ? ` · ${formatBytes(item.size)}` : ""}</small></span>
+              <TagDots colors={item.colors} />
+            </button>
+            <button type="button" className="icon-button" aria-label={`Show ${item.name} in its folder`} title="Show in its folder" onClick={() => onReveal(asEntry(item))}><FolderOpen size={16} /></button>
+            <button type="button" className="icon-button" aria-label={`Take the ${label.toLowerCase()} tag off ${item.name}`} title={`Take the ${label.toLowerCase()} tag off`} onClick={() => void untag(item)}><X size={16} /></button>
+          </li>
+        ))}</ul>}
+    </Modal>
+  );
 }
 
 function ContinueWatchingDialog({ onClose, onPreview, onReveal, notify }: { onClose: () => void; onPreview: (entry: FileEntry) => void; onReveal: (entry: FileEntry) => void; notify: (message: string, tone?: "error") => void }) {
