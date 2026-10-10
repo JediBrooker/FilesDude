@@ -285,6 +285,23 @@ name, and each file shows its progress as it uploads.
 - Like download links, upload links follow the folder when it's renamed or moved, and
   stop working if it's deleted or replaced.
 
+## Image thumbnails
+
+Images (JPEG, PNG, GIF, WebP, and AVIF, up to 64 MB and 100 megapixels) get thumbnails in
+grid view, made by sharp. Decoders parse files other people control, anyone with an upload
+link included, so FilesDude never decodes images itself: a separate Node.js process does,
+handed the already-opened file (never its path) and returning only the thumbnail. When the
+service runs as root, that process runs in the same throwaway sandbox as ffmpeg (below),
+with Node.js and FilesDude's `node_modules` shown to it read-only, so it needs Linux,
+systemd, and those readable by other users (the installer sees to that); without the
+sandbox, a server running as root shows no image thumbnails rather than decode them as
+root. Running as another account (a development machine, or `--service-user filesdude`),
+the process runs as that account with all of its access, so it only keeps a crash or
+runaway decode from taking FilesDude down. Either way only the decoders for those formats
+are enabled, the process is stopped after 15 seconds, and two images are decoded at a
+time. Next.js's built-in image optimizer, which would decode images inside FilesDude, is
+turned off.
+
 ## Video thumbnails
 
 When the host has ffmpeg (`/usr/bin/ffmpeg`, or set `FILEDUDE_FFMPEG_PATH`) and the
@@ -297,7 +314,7 @@ libraries: every other top-level folder is hidden, and `/etc` and `/run` are emp
 from what the dynamic linker needs. The video is passed in as the already-opened file,
 never by path, and ffmpeg may only read that file, as MP4/MOV, Matroska/WebM, or AVI, so a
 crafted file can't make it open playlists, other files, or URLs. One video is worked on at
-a time, separately from images, and a video no frame could be taken from isn't tried
+a time, separately from images, the frame is resized like an image (above), and a video no frame could be taken from isn't tried
 again for six hours unless it changes. Set `FILEDUDE_VIDEO_THUMBNAILS=false` to turn this
 off.
 

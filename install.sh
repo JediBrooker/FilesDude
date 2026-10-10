@@ -129,6 +129,9 @@ FILEDUDE_BUILD_COMMIT="${BUILD_COMMIT}" NEXT_TELEMETRY_DISABLED=1 npm run build 
 RELEASE="${APP_HOME}/releases/$(date -u +%Y%m%d%H%M%S)"
 mkdir -p "${RELEASE}/.next"
 cp -a .next/standalone/. "${RELEASE}/"
+# Images are decoded by Node.js and sharp in a sandbox, as a temporary user who must be able to read
+# the packages (and nothing else of the release).
+chmod -R a+rX "${RELEASE}/node_modules"
 cp -a .next/static "${RELEASE}/.next/static"
 cp -a public "${RELEASE}/public"
 install -m 0755 install.sh "${RELEASE}/install.sh"

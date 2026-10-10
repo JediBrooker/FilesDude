@@ -21,6 +21,9 @@ const nextConfig: NextConfig = {
   poweredByHeader: false,
   // ssh2 loads an optional native add-on, so it is required at run time rather than bundled.
   serverExternalPackages: ["ssh2"],
+  // /_next/image would decode any image FilesDude serves (a share link's included) with sharp inside
+  // this process; thumbnails are made in a sandbox instead (see lib/image-resize.ts).
+  images: { unoptimized: true },
   env: {
     NEXT_PUBLIC_FILESDUDE_VERSION: version,
     NEXT_PUBLIC_FILESDUDE_COMMIT: buildCommit(),

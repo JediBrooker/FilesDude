@@ -7,6 +7,11 @@ import { AppError } from "./http";
 import { MEDIA_FORMATS, inputLimits, sandboxRunner } from "./media-sandbox";
 import { DECODED_FORMATS, MAX_THUMBNAIL_SOURCE_BYTES, THUMBNAIL_TYPES, VIDEO_THUMBNAIL_TYPES, imageSlots, limiter, looksLikeRasterImage, readExactly } from "./thumbnails";
 
+// Reading an image's details shares libuv's small thread pool with file I/O, so sharp keeps no
+// cache and uses one thread per image (and at most two images are read at once).
+sharp.cache(false);
+sharp.concurrency(1);
+
 /**
  * Media details for Properties: an image's dimensions, format, frames, and (from EXIF) camera and
  * date taken, read by sharp; a video's or audio file's length, resolution, frame rate, codecs, and
