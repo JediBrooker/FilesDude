@@ -160,6 +160,8 @@ export interface ShareLink {
   downloads: number;
   /** "upload" links let anyone add files to the folder instead of downloading it. */
   kind: "download" | "upload";
+  /** Whether opening the link needs a password. */
+  protected: boolean;
   /** Upload links: the total size and number of files allowed (null for any number), and received so far. */
   maxBytes?: number;
   maxFiles?: number | null;

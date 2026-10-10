@@ -38,6 +38,7 @@ type Entry = { event: string; [key: string]: unknown };
 /** Who did it: the account, a share link, or FilesDude itself (upkeep). */
 export function activityUser(entry: Entry) {
   if (entry.event === "share.download" || entry.event === "share.upload") return SHARE_LINK_ACTOR;
+  if (entry.event === "share.unlock_failed") return "";
   if (entry.event.startsWith("login.")) return typeof entry.username === "string" ? entry.username : "";
   return typeof entry.username === "string" ? entry.username : SYSTEM_ACTOR;
 }
@@ -140,9 +141,10 @@ function describe(entry: Entry): Omit<ActivityText, "text"> {
     case "duplicates.scan": return { parts: t`looked for duplicates in ${v(slash(entry.path))}` };
     case "duplicates.trash": return { parts: t`moved ${items(paths)} duplicates to the trash`, detail: pathDetail(paths) };
     case "duplicates.link": return { parts: [`replaced ${count(Array.isArray(entry.linked) ? entry.linked.length : 0, "duplicate")} with hard links`] };
-    case "share.create": return entry.kind === "upload" ? { parts: t`made an upload link to ${v(slash(entry.path))}${str(entry.expiresAt) ? `, until ${new Date(str(entry.expiresAt)).toLocaleString()}` : ""}` } : { parts: t`shared ${v(slash(entry.path))}${str(entry.expiresAt) ? `, until ${new Date(str(entry.expiresAt)).toLocaleString()}` : ""}` };
+    case "share.create": return entry.kind === "upload" ? { parts: t`made ${entry.protected ? "a password-protected" : "an"} upload link to ${v(slash(entry.path))}${str(entry.expiresAt) ? `, until ${new Date(str(entry.expiresAt)).toLocaleString()}` : ""}` } : { parts: t`shared ${v(slash(entry.path))}${entry.protected ? " with a password" : ""}${str(entry.expiresAt) ? `, until ${new Date(str(entry.expiresAt)).toLocaleString()}` : ""}` };
     case "share.revoke": return { parts: [entry.reason === "item deleted" ? `revoked ${count(list(entry.ids).length, "share link")} for deleted items` : "revoked a share link"] };
     case "share.download": return { parts: t`downloaded ${v(slash(entry.path))}`, detail: str(entry.address) || undefined };
+    case "share.unlock_failed": return { parts: t`entered a wrong password for the link to ${v(slash(entry.path))}`, detail: str(entry.address) || undefined, tone: "danger" };
     case "fs.upload_discarded": return { parts: t`${entry.reason === "cancelled" ? "cancelled" : "stopped"} uploading ${v(str(entry.name))} to ${v(slash(entry.directory))}${entry.reason === "abandoned" ? " (nothing was sent for 30 minutes)" : entry.reason === "account changed" ? " (their account was changed)" : ""}` };
     case "share.upload": return { parts: str(entry.from) ? t`received ${v(str(entry.name))} in ${v(slash(entry.path))} from ${v(str(entry.from))}` : t`received ${v(str(entry.name))} in ${v(slash(entry.path))}`, detail: str(entry.address) || undefined };
     case "users.create": return { parts: t`added ${str(entry.role) === "viewer" ? "viewer" : "editor"} ${v(str(entry.account))} with ${v(slash(entry.root))}` };

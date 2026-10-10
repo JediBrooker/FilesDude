@@ -259,6 +259,12 @@ copy and revoke buttons.
   if they can reach that address. Over plain HTTP, links and downloads can be read by
   anyone on the network path; use HTTPS for anything sensitive.
 - Set `FILEDUDE_SHARING_ENABLED=false` to turn sharing off entirely.
+- **Passwords:** any download or upload link can also need a password (8 characters or
+  more), entered in the Share dialog. People opening the link see only a password box,
+  not what's shared, until they enter it; it then works in that browser for 12 hours.
+  Only a scrypt hash is stored. Wrong guesses are limited to 10 per visitor and 50 per
+  link every 15 minutes, and each is recorded in Activity. Send the password separately
+  from the link. Protected links show a lock in **Shared links**.
 
 ### Upload links
 

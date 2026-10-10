@@ -1,15 +1,17 @@
 import type { Metadata } from "next";
-import { Clock, Download, File, Folder, FolderOpen, FolderUp, Link2Off } from "lucide-react";
+import { Clock, Download, File, Folder, FolderOpen, FolderUp, Link2Off, LockKeyhole } from "lucide-react";
+import { headers } from "next/headers";
 import { config } from "@/lib/config";
 import { getPreferences } from "@/lib/preferences";
-import { isUploadShare, openSharedItem, resolveShareToken, uploadRoom } from "@/lib/shares";
+import { isProtected, isUnlocked, isUploadShare, openSharedItem, resolveShareToken, uploadRoom } from "@/lib/shares";
+import { UnlockForm } from "./unlock-form";
 import { UploadDrop } from "./upload-drop";
 
 export const dynamic = "force-dynamic";
 export async function generateMetadata({ params }: { params: Promise<{ token: string }> }): Promise<Metadata> {
   const share = await resolveShareToken((await params).token);
   return {
-    title: share && isUploadShare(share) ? "Send files · FilesDude" : "Shared with you · FilesDude",
+    title: share && isProtected(share) ? "Protected link · FilesDude" : share && isUploadShare(share) ? "Send files · FilesDude" : "Shared with you · FilesDude",
     robots: { index: false, follow: false },
     referrer: "no-referrer",
   };
@@ -33,6 +35,27 @@ function expiresIn(expiresAt: string) {
 export default async function SharePage({ params }: { params: Promise<{ token: string }> }) {
   const { token } = await params;
   const share = await resolveShareToken(token);
+  // A link with a password shows nothing about what it holds until the password is entered.
+  if (share && !isUnlocked(share, (await headers()).get("cookie"))) {
+    return (
+      <main className="login-page share-page">
+        <section className="login-card share-card">
+          <div className="login-brand">
+            <div className="brand-mark large"><FolderOpen size={24} /></div>
+            <div><strong>FilesDude</strong><span>Protected link</span></div>
+          </div>
+          <div className="share-item">
+            <span className="file-icon directory"><LockKeyhole size={22} /></span>
+            <div>
+              <strong>This link needs a password</strong>
+              <small>Enter the password you were given with the link.</small>
+            </div>
+          </div>
+          <UnlockForm token={token} />
+        </section>
+      </main>
+    );
+  }
   if (share && isUploadShare(share)) {
     const opened = await openSharedItem(share);
     await opened?.handle.close().catch(() => undefined);

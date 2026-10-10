@@ -9,7 +9,7 @@ import { clientAddress } from "@/lib/auth";
 import { config } from "@/lib/config";
 import { acquireFilesystemLock, removeIfSame, type AnchoredDirectory } from "@/lib/files";
 import { assertMutationRequest, AppError, jsonError } from "@/lib/http";
-import { bytesInProgress, isUploadShare, openUploadFolder, reserveUpload, resolveShareToken, type UploadShare } from "@/lib/shares";
+import { bytesInProgress, isUnlocked, isUploadShare, openUploadFolder, reserveUpload, resolveShareToken, type UploadShare } from "@/lib/shares";
 import { accountBytesStillComing } from "@/lib/chunked-uploads";
 import { claimLinkSlot } from "@/lib/link-slots";
 import { publicName, reservePublicTarget } from "@/lib/upload-target";
@@ -42,6 +42,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ tok
     assertMutationRequest(request);
     const share = await resolveShareToken((await params).token);
     if (!share || !isUploadShare(share)) throw unavailable();
+    if (!isUnlocked(share, request.headers.get("cookie"))) throw new AppError("This link needs its password. Reload the page and enter it.", 401, "PASSWORD_REQUIRED");
     const address = clientAddress(request);
 
     const declared = Number(request.headers.get("content-length"));
