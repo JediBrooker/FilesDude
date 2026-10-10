@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { withAccess } from "@/lib/access";
+import { getSession } from "@/lib/auth";
 import { audit } from "@/lib/audit";
 import { appendChunk, cancelChunkedUpload, chunkedUploadStatus, finishChunkedUpload, startChunkedUpload } from "@/lib/chunked-uploads";
 import { acquireFilesystemLock } from "@/lib/files";
@@ -36,7 +37,8 @@ export async function PUT(request: Request) {
     assertMutationRequest(request);
     return await withAccess(request, "write", async (session) => {
       const url = new URL(request.url);
-      const result = await appendChunk(session, url.searchParams.get("id"), url.searchParams.get("offset"), Number(request.headers.get("content-length")), request.body, request.signal);
+      const length = request.headers.get("content-length");
+      const result = await appendChunk(session, url.searchParams.get("id"), url.searchParams.get("offset"), length === null ? null : Number(length), request.body, request.signal);
       return NextResponse.json(result, noStore);
     });
   } catch (error) {
@@ -54,6 +56,9 @@ export async function POST(request: Request) {
       if (body.action === "start") {
         const release = await acquireFilesystemLock();
         try {
+          // The account may have been changed while this waited for the lock.
+          const current = await getSession(request);
+          if (!current || current.accountKey !== session.accountKey || current.credentialsVersion !== session.credentialsVersion) throw new AppError("Sign in required", 401, "UNAUTHORIZED");
           const destination = await openUploadDestination(new URL(request.url), session);
           try {
             return NextResponse.json(await startChunkedUpload(session, destination, body.name, body.size), noStore);

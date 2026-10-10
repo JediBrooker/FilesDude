@@ -78,6 +78,22 @@ test("a complete upload is written and answered", async () => {
   });
 });
 
+test("an upload doesn't hold the filesystem lock while its body arrives", async () => {
+  await withUploadRoot(async (root, cookie) => {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const body = new ReadableStream<Uint8Array>({ start(streamController) { controller = streamController; controller.enqueue(partHeader("slow.txt")); controller.enqueue(encoder.encode("part")); } });
+    const pending = upload(uploadRequest(cookie, body));
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    // Everyone else can still work while this upload trickles in.
+    assert.equal(await lockIsFree(), true);
+    controller.enqueue(encoder.encode(`\r\n--${BOUNDARY}--\r\n`));
+    controller.close();
+    const response = await withinTime(pending, "The upload");
+    assert.equal(response.status, 200);
+    assert.equal(await fs.readFile(path.join(root, "slow.txt"), "utf8"), "part");
+  });
+});
+
 test("file names outside ASCII arrive intact", async () => {
   await withUploadRoot(async (root, cookie) => {
     const body = new ReadableStream<Uint8Array>({

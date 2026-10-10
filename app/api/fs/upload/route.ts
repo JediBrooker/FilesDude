@@ -56,6 +56,9 @@ export async function POST(request: Request) {
       if (!opened.subfolders.length) throw new AppError("Choose a folder", 400, "INVALID_FOLDER");
       return NextResponse.json({ ok: true, folder: directory });
     }
+    // Only opening the destination and creating each file need the lock: files are created inside
+    // the open folder's handle, so the bytes can stream in without holding everyone else up.
+    releaseFilesystem();
 
     const uploaded: string[] = [];
     const createdTargets: Array<{ name: string; created: Stats }> = [];
@@ -88,7 +91,9 @@ export async function POST(request: Request) {
 
         const task = (async () => {
           const name = uploadName(info.filename);
-          const { name: createdName, relative, handle, created } = await reserveTarget(into, directory, name);
+          const releaseName = await acquireFilesystemLock();
+          const reserved = await reserveTarget(into, directory, name).finally(releaseName);
+          const { name: createdName, relative, handle, created } = reserved;
           createdTargets.push({ name: createdName, created });
           const meter = new Transform({
             transform(chunk: Buffer, _encoding, callback) {
@@ -122,7 +127,7 @@ export async function POST(request: Request) {
     });
 
     // A cancelled or dropped upload must tear the parser down: otherwise it waits forever for
-    // the rest of the body while this request holds the filesystem lock. pipeline() destroys
+    // the rest of the body, holding the folder open. pipeline() destroys
     // the parser when the body errors, and the abort signal covers bodies that simply stall.
     // Destroying the parser also fails the in-progress file stream, so its partial file is removed.
     const abortUpload = () => parser.destroy(new AppError("The upload was cancelled", 400, "UPLOAD_ABORTED"));

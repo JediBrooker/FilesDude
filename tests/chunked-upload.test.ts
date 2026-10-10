@@ -8,7 +8,7 @@ import { createSession } from "../lib/auth";
 import { config } from "../lib/config";
 import { readCopyJournal } from "../lib/copy-journal";
 import { getCredentials } from "../lib/credentials";
-import { createUser } from "../lib/users";
+import { createUser, updateUser } from "../lib/users";
 import { GET as status, POST as action, PUT as piece } from "../app/api/fs/upload/chunks/route";
 
 function scrypt(password: string, salt: Buffer) {
@@ -17,7 +17,7 @@ function scrypt(password: string, salt: Buffer) {
   });
 }
 
-async function withRoot<T>(run: (context: { root: string; owner: string; bob: string }) => Promise<T>) {
+async function withRoot<T>(run: (context: { root: string; owner: string; bob: string; bobId: string }) => Promise<T>) {
   const base = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "filesdude-chunks-")));
   const root = path.join(base, "root");
   await fs.mkdir(path.join(root, "home", "bob"), { recursive: true });
@@ -33,7 +33,7 @@ async function withRoot<T>(run: (context: { root: string; owner: string; bob: st
   try {
     const credentials = await getCredentials();
     const bob = await createUser({ username: "bob", password: "bob-test-password-long", role: "editor", root: "home/bob" });
-    return await run({ root, owner: `fd_session=${createSession(credentials.username, credentials.version)}`, bob: `fd_session=${createSession("bob", 1, bob.id)}` });
+    return await run({ root, owner: `fd_session=${createSession(credentials.username, credentials.version)}`, bob: `fd_session=${createSession("bob", 1, bob.id)}`, bobId: bob.id });
   } finally {
     Object.assign(config, original);
     await fs.rm(base, { recursive: true, force: true });
@@ -111,20 +111,48 @@ test("uploads in pieces stay within the account's folder, limits, and own upload
     assert.deepEqual((await finish(bob, mine.body.id)).body.uploaded, ["home/bob/Album/2024/photo.raw"]);
     assert.equal(await fs.readFile(path.join(root, "home", "bob", "Album", "2024", "photo.raw"), "utf8"), "pixels");
 
-    // A piece must come with its length, and no more than 64 MB.
+    // A piece a proxy passed on without its length is taken, within what the file has left.
     const other = await start(owner, "path=", "other.bin", 100);
-    const noLength = await piece(new Request(`http://localhost/api/fs/upload/chunks?id=${other.body.id}&offset=0`, { method: "PUT", headers: headers(owner), body: new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array(10)); controller.close(); } }), duplex: "half" } as RequestInit));
-    assert.equal(noLength.status, 413);
+    const stream = (bytes: number) => new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array(bytes).fill(7)); controller.close(); } });
+    const noLength = await json(piece(new Request(`http://localhost/api/fs/upload/chunks?id=${other.body.id}&offset=0`, { method: "PUT", headers: headers(owner), body: stream(10), duplex: "half" } as RequestInit)));
+    assert.equal(noLength.body.received, 10);
+    const tooMuch = await piece(new Request(`http://localhost/api/fs/upload/chunks?id=${other.body.id}&offset=10`, { method: "PUT", headers: headers(owner), body: stream(91), duplex: "half" } as RequestInit));
+    assert.equal(tooMuch.status, 400);
     // A piece cut off part-way is taken back, so the upload carries on from the same point.
-    const cut = await piece(new Request(`http://localhost/api/fs/upload/chunks?id=${other.body.id}&offset=0`, { method: "PUT", headers: headers(owner, { "content-length": "50" }), body: new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array(20).fill(7)); controller.close(); } }), duplex: "half" } as RequestInit));
+    const cut = await piece(new Request(`http://localhost/api/fs/upload/chunks?id=${other.body.id}&offset=10`, { method: "PUT", headers: headers(owner, { "content-length": "50" }), body: stream(20), duplex: "half" } as RequestInit));
     assert.equal(cut.status, 400);
-    assert.equal((await where(owner, other.body.id)).body.received, 0);
-    assert.equal((await fs.stat(path.join(root, "other.bin (uploading)"))).size, 0);
-    assert.equal((await send(owner, other.body.id, 0, Buffer.alloc(50, 1))).body.received, 50);
+    assert.equal((await where(owner, other.body.id)).body.received, 10);
+    assert.equal((await fs.stat(path.join(root, "other.bin (uploading)"))).size, 10);
+    assert.equal((await send(owner, other.body.id, 10, Buffer.alloc(50, 1))).body.received, 60);
     // Cancelling removes the placeholder.
     assert.equal((await finish(owner, other.body.id, "cancel")).status, 200);
     assert.ok(!(await fs.readdir(root)).includes("other.bin (uploading)"));
     assert.deepEqual(await readCopyJournal(), []);
+  });
+});
+
+test("an upload ends when its account changes, and isn't finished into a folder that moved", async () => {
+  await withRoot(async ({ root, owner, bob, bobId }) => {
+    const started = await start(bob, "path=home/bob", "drop.bin", 4);
+    assert.equal(started.status, 200);
+    // The owner narrows bob's folder; bob's new session can't carry on the old upload.
+    await fs.mkdir(path.join(root, "home", "bob", "limited"));
+    await updateUser(bobId, { root: "home/bob/limited" });
+    const narrowed = `fd_session=${createSession("bob", 2, bobId)}`;
+    assert.equal((await send(narrowed, started.body.id, 0, Buffer.from("data"))).status, 404);
+    assert.equal((await where(narrowed, started.body.id)).status, 404);
+
+    await fs.mkdir(path.join(root, "inbox"));
+    await fs.mkdir(path.join(root, "Private"));
+    const moving = await start(owner, "path=inbox", "file.bin", 4);
+    assert.equal((await send(owner, moving.body.id, 0, Buffer.from("data"))).status, 200);
+    await fs.rename(path.join(root, "inbox"), path.join(root, "Private", "inbox"));
+    await fs.mkdir(path.join(root, "inbox"));
+    const done = await finish(owner, moving.body.id);
+    assert.equal(done.status, 409);
+    assert.equal(done.body.code, "PATH_CHANGED");
+    assert.ok(!(await fs.readdir(path.join(root, "inbox"))).includes("file.bin"));
+    assert.ok(!(await fs.readdir(path.join(root, "Private", "inbox"))).includes("file.bin"));
   });
 });
 
