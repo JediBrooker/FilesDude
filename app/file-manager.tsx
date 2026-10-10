@@ -2303,10 +2303,23 @@ function useShareLinks(notify: (message: string, tone?: "error") => void, onChan
       notify((error as Error).message, "error");
     }
   };
-  return { links, setLinks, enabled, copy, revoke };
+  const update = async (link: ShareLink, changes: Record<string, unknown>) => {
+    try {
+      const { share } = await requestJson<{ share: ShareLink }>("/api/shares", { method: "POST", body: JSON.stringify({ action: "update", id: link.id, ...changes }) });
+      setLinks((current) => current?.map((item) => (item.id === share.id ? share : item)) ?? null);
+      notify(`Link to ${link.name} updated`);
+      await onChanged();
+      return true;
+    } catch (error) {
+      notify((error as Error).message, "error");
+      return false;
+    }
+  };
+  return { links, setLinks, enabled, copy, revoke, update };
 }
 
-function ShareLinkRow({ link, showLocation, onCopy, onRevoke }: { link: ShareLink; showLocation?: boolean; onCopy: (link: ShareLink) => void; onRevoke: (link: ShareLink) => void }) {
+function ShareLinkRow({ link, showLocation, onCopy, onRevoke, onUpdate }: { link: ShareLink; showLocation?: boolean; onCopy: (link: ShareLink) => void; onRevoke: (link: ShareLink) => void; onUpdate: (link: ShareLink, changes: Record<string, unknown>) => Promise<boolean> }) {
+  const [editing, setEditing] = useState(false);
   return (
     <div className="share-link-row">
       <div className="share-link-info">
@@ -2316,14 +2329,61 @@ function ShareLinkRow({ link, showLocation, onCopy, onRevoke }: { link: ShareLin
       <div className="share-link-actions">
         <input readOnly value={shareAddress(link)} aria-label={`Link to ${link.name}`} onFocus={(event) => event.currentTarget.select()} />
         <button type="button" className="button secondary" onClick={() => onCopy(link)}><Copy size={14} /> Copy</button>
+        <button type="button" className="button secondary" aria-expanded={editing} onClick={() => setEditing(!editing)}><Pencil size={14} /> Edit</button>
         <button type="button" className="button secondary danger-text" onClick={() => onRevoke(link)}><X size={14} /> Revoke</button>
       </div>
+      {editing && <ShareLinkEditor link={link} onCancel={() => setEditing(false)} onSave={async (changes) => { if (await onUpdate(link, changes)) setEditing(false); }} />}
+    </div>
+  );
+}
+
+// Changing a link in place; anything left as "Keep" isn't sent. Not a <form>: it can sit inside one.
+function ShareLinkEditor({ link, onCancel, onSave }: { link: ShareLink; onCancel: () => void; onSave: (changes: Record<string, unknown>) => Promise<void> }) {
+  const [hours, setHours] = useState("keep");
+  const [limit, setLimit] = useState("keep");
+  const [size, setSize] = useState("keep");
+  const [files, setFiles] = useState("keep");
+  const [passwordMode, setPasswordMode] = useState<"keep" | "set" | "remove">("keep");
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const upload = link.kind === "upload";
+  const changes: Record<string, unknown> = {};
+  if (hours !== "keep") changes.hours = Number(hours);
+  if (!upload && limit !== "keep") changes.maxDownloads = limit === "none" ? null : Number(limit);
+  if (upload && size !== "keep") changes.maxBytes = Number(size);
+  if (upload && files !== "keep") changes.maxFiles = files === "none" ? null : Number(files);
+  if (passwordMode === "remove") changes.password = null;
+  if (passwordMode === "set") changes.password = password;
+  const ready = Object.keys(changes).length > 0 && (passwordMode !== "set" || password.length >= 8);
+  const save = async () => {
+    setBusy(true);
+    try {
+      await onSave(changes);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="share-link-editor">
+      <div className="field-pair">
+        <FormField label="Expires"><select value={hours} onChange={(event) => setHours(event.target.value)}><option value="keep">Keep ({formatDateTime(link.expiresAt)})</option>{SHARE_EXPIRY_OPTIONS.map((option) => <option key={option.hours} value={option.hours}>{option.label} from now</option>)}</select></FormField>
+        {upload
+          ? <FormField label="Total size allowed"><select value={size} onChange={(event) => setSize(event.target.value)}><option value="keep">Keep ({formatBytes(link.maxBytes ?? 0)})</option>{UPLOAD_SIZE_OPTIONS.filter((option) => option.bytes >= (link.uploadedBytes ?? 0)).map((option) => <option key={option.bytes} value={option.bytes}>{option.label}</option>)}</select></FormField>
+          : <FormField label="Downloads allowed"><select value={limit} onChange={(event) => setLimit(event.target.value)}><option value="keep">Keep ({link.maxDownloads === null ? "no limit" : link.maxDownloads})</option>{SHARE_LIMIT_OPTIONS.filter((option) => option.value === "none" || Number(option.value) > link.downloads).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></FormField>}
+      </div>
+      <div className="field-pair">
+        {upload && <FormField label="Files allowed"><select value={files} onChange={(event) => setFiles(event.target.value)}><option value="keep">Keep ({link.maxFiles ?? "up to 10,000"})</option>{UPLOAD_FILES_OPTIONS.filter((option) => option.value === "none" || Number(option.value) >= (link.uploadedFiles ?? 0)).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></FormField>}
+        <FormField label="Password"><select value={passwordMode} onChange={(event) => setPasswordMode(event.target.value as "keep" | "set" | "remove")}><option value="keep">{link.protected ? "Keep the password" : "Keep without a password"}</option><option value="set">{link.protected ? "Change the password" : "Add a password"}</option>{link.protected && <option value="remove">Remove the password</option>}</select></FormField>
+      </div>
+      {passwordMode === "set" && <FormField label="New password" hint="At least 8 characters. Anyone who already opened the link will need it."><input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="new-password" maxLength={256} placeholder="At least 8 characters" /></FormField>}
+      {passwordMode === "remove" && <div className="warning-box"><CircleAlert size={17} /> Anyone with the link will be able to open it.</div>}
+      <div className="share-link-editor-actions"><button type="button" className="button secondary" onClick={onCancel}>Cancel</button><button type="button" className="button primary" disabled={!ready || busy} onClick={() => void save()}>{busy ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />} Save changes</button></div>
     </div>
   );
 }
 
 function ShareDialog({ entry, onClose, notify, onChanged }: { entry: FileEntry; onClose: () => void; notify: (message: string, tone?: "error") => void; onChanged: () => Promise<void> }) {
-  const { links, setLinks, enabled, copy, revoke } = useShareLinks(notify, onChanged);
+  const { links, setLinks, enabled, copy, revoke, update } = useShareLinks(notify, onChanged);
   const [hours, setHours] = useState(168);
   const [limit, setLimit] = useState("none");
   const [linkPassword, setLinkPassword] = useState("");
@@ -2369,7 +2429,7 @@ function ShareDialog({ entry, onClose, notify, onChanged }: { entry: FileEntry; 
         {uploading && <FormField label="Files allowed"><select value={uploadFiles} onChange={(event) => setUploadFiles(event.target.value)} disabled={!enabled}>{UPLOAD_FILES_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></FormField>}
         <FormField label="Password (optional)" hint={linkPassword ? "People will need this password to open the link. Send it separately, not with the link." : "Leave empty for anyone with the link to open it"}><div className="password-field"><input type={showLinkPassword ? "text" : "password"} value={linkPassword} onChange={(event) => setLinkPassword(event.target.value)} autoComplete="new-password" minLength={linkPassword ? 8 : undefined} maxLength={256} placeholder="At least 8 characters" disabled={!enabled} /><button type="button" className="password-toggle" aria-label={showLinkPassword ? "Hide password" : "Show password"} onClick={() => setShowLinkPassword(!showLinkPassword)}>{showLinkPassword ? <EyeOff size={15} /> : <Eye size={15} />}</button></div></FormField>
         <div className="info-box"><Info size={17} /> {uploading ? "People with the link can add files but can't see, open, change, or download anything in the folder. Files never replace what's there; a name that's taken gets a number." : entry.type === "directory" ? "The folder downloads as a ZIP file of its current contents." : "The file always downloads; it never opens in the browser."} Links use this address ({typeof window === "undefined" ? "" : window.location.host}), so people can only open them if they can reach FilesDude here.</div>
-        {links === null ? <div className="ownership-loading"><LoaderCircle className="spin" size={18} /> Loading links…</div> : mine.length > 0 && <div className="share-links"><p className="share-links-title">Active links to this {entry.type === "directory" ? "folder" : "file"}</p>{mine.map((link) => <ShareLinkRow key={link.id} link={link} onCopy={copy} onRevoke={revoke} />)}</div>}
+        {links === null ? <div className="ownership-loading"><LoaderCircle className="spin" size={18} /> Loading links…</div> : mine.length > 0 && <div className="share-links"><p className="share-links-title">Active links to this {entry.type === "directory" ? "folder" : "file"}</p>{mine.map((link) => <ShareLinkRow key={link.id} link={link} onCopy={copy} onRevoke={revoke} onUpdate={update} />)}</div>}
         <ModalActions onClose={onClose} submitLabel={mine.length ? "Create another link" : "Create link"} busy={busy} disabled={!enabled} />
       </form>
     </Modal>
@@ -2502,14 +2562,14 @@ function ActivityDialog({ owner, onClose }: { owner: string; onClose: () => void
 }
 
 function SharesDialog({ onClose, notify, onChanged }: { onClose: () => void; notify: (message: string, tone?: "error") => void; onChanged: () => Promise<void> }) {
-  const { links, enabled, copy, revoke } = useShareLinks(notify, onChanged);
+  const { links, enabled, copy, revoke, update } = useShareLinks(notify, onChanged);
   return (
     <Modal title="Shared links" subtitle="Everything people can download, or upload to, without signing in" icon={<Link2 size={19} />} onClose={onClose} wide>
       <div className="storage-browser">
         {!enabled && <div className="warning-box"><CircleAlert size={17} /> Sharing is turned off on this server, so no links work.</div>}
         {links === null ? <div className="storage-scan-state"><LoaderCircle className="spin" size={25} /><strong>Loading links…</strong></div>
           : links.length === 0 ? <div className="storage-scan-state"><Link2 size={25} /><strong>Nothing is shared</strong><span>Right-click a file or folder and choose Share link to create one.</span></div>
-          : <div className="share-links">{links.map((link) => <ShareLinkRow key={link.id} link={link} showLocation onCopy={copy} onRevoke={revoke} />)}</div>}
+          : <div className="share-links">{links.map((link) => <ShareLinkRow key={link.id} link={link} showLocation onCopy={copy} onRevoke={revoke} onUpdate={update} />)}</div>}
         <div className="storage-scan-foot"><span>Expired and used-up links are removed automatically.</span><button className="button primary" onClick={onClose}>Done</button></div>
       </div>
     </Modal>

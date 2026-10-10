@@ -145,7 +145,8 @@ test("extractions are shared, failures aren't retried, each account queues one, 
     // Two requests for the same track share one run.
     const first = subtitleTrack("a.mkv", "stream:2", "bob");
     const second = subtitleTrack("a.mkv", "stream:2", "carol");
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    // Waits until that extraction has started, however busy the machine is.
+    while (runs < 1) await new Promise((resolve) => setTimeout(resolve, 10));
     // Bob can't queue another track while his first is still going.
     await assert.rejects(subtitleTrack("b.mkv", "stream:2", "bob"), /still being prepared/);
     release();

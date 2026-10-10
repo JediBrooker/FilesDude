@@ -142,6 +142,7 @@ function describe(entry: Entry): Omit<ActivityText, "text"> {
     case "duplicates.trash": return { parts: t`moved ${items(paths)} duplicates to the trash`, detail: pathDetail(paths) };
     case "duplicates.link": return { parts: [`replaced ${count(Array.isArray(entry.linked) ? entry.linked.length : 0, "duplicate")} with hard links`] };
     case "share.create": return entry.kind === "upload" ? { parts: t`made ${entry.protected ? "a password-protected" : "an"} upload link to ${v(slash(entry.path))}${str(entry.expiresAt) ? `, until ${new Date(str(entry.expiresAt)).toLocaleString()}` : ""}` } : { parts: t`shared ${v(slash(entry.path))}${entry.protected ? " with a password" : ""}${str(entry.expiresAt) ? `, until ${new Date(str(entry.expiresAt)).toLocaleString()}` : ""}` };
+    case "share.update": return { parts: t`changed the link to ${v(slash(entry.path))}${list(entry.changed).length ? `: ${list(entry.changed).map(String).join(", ")}` : ""}` };
     case "share.revoke": return { parts: [entry.reason === "item deleted" ? `revoked ${count(list(entry.ids).length, "share link")} for deleted items` : "revoked a share link"] };
     case "share.download": return { parts: t`downloaded ${v(slash(entry.path))}`, detail: str(entry.address) || undefined };
     case "share.unlock_locked": return { parts: t`tried so many wrong passwords that the link to ${v(slash(entry.path))} is closed for 15 minutes`, detail: str(entry.address) || undefined, tone: "danger" };
