@@ -364,8 +364,8 @@ The owner can have FilesDude send a message when something needs attention: open
 **Preferences → Notifications**, choose where to send them, paste the address, pick what to
 hear about, and use **Save and send a test**.
 
-- **Where:** [ntfy](https://ntfy.sh) (a topic on ntfy.sh or your own server, with an optional
-  access token for protected topics), a Discord or Slack incoming webhook, or any other
+- **Where:** [ntfy](https://ntfy.sh) (just the topic name for ntfy.sh, or the full address
+  of a topic on your own server, with an optional access token for protected topics), a Discord or Slack incoming webhook, or any other
   service that accepts a JSON POST (`source`, `topic`, `title`, `message`, `urgent`, `at`).
 - **What:**
   - *Files received through upload links*, gathered into one message per link every couple
