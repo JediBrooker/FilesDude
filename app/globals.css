@@ -540,6 +540,8 @@ kbd { padding: 3px 5px; border: 1px solid var(--line); border-bottom-width: 2px;
 .password-field { position: relative; }
 .password-field input { padding-right: 36px; }
 .password-field svg { position: absolute; top: 13px; right: 12px; color: var(--ink-faint); }
+.password-field .password-toggle { position: absolute; top: 0; right: 0; display: grid; width: 38px; height: 100%; place-items: center; padding: 0; border: 0; background: transparent; color: var(--ink-faint); cursor: pointer; }
+.password-field .password-toggle svg { position: static; }
 .show-passwords { display: inline-flex; align-items: center; gap: 7px; margin-top: 11px; color: var(--ink-soft); cursor: pointer; font-size: 9px; font-weight: 600; }
 .show-passwords input { accent-color: var(--brand); }
 .preferences-form > .form-error { margin-top: 14px; }
@@ -695,6 +697,7 @@ kbd { padding: 3px 5px; border: 1px solid var(--line); border-bottom-width: 2px;
 .share-kind-choice span { display: flex; flex-direction: column; gap: 2px; }
 .share-kind-choice strong { color: var(--ink); font-size: 11px; }
 .share-kind-choice small { color: var(--ink-soft); font-size: 9px; }
+.share-kind svg { vertical-align: -1px; }
 .share-kind { margin-right: 5px; padding: 1px 6px; border-radius: 999px; background: var(--brand-soft); color: var(--brand); font-size: 8px; font-weight: 800; }
 .share-links-title { margin: 0; color: var(--ink-soft); font-size: 10px; font-weight: 700; }
 .share-link-row { display: grid; gap: 7px; padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel-soft); }

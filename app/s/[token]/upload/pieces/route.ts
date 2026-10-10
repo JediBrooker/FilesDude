@@ -3,7 +3,7 @@ import { audit } from "@/lib/audit";
 import { clientAddress } from "@/lib/auth";
 import { appendChunk, cancelChunkedUpload, chunkedUploadStatus, finishChunkedUpload, startLinkUpload, type UploadOwner } from "@/lib/chunked-uploads";
 import { assertMutationRequest, assertSameOriginFetch, AppError, jsonError, readJsonBody } from "@/lib/http";
-import { isUploadShare, resolveShareToken } from "@/lib/shares";
+import { isUnlocked, isUploadShare, resolveShareToken } from "@/lib/shares";
 import { addressGroup } from "@/lib/upload-target";
 
 export const runtime = "nodejs";
@@ -21,6 +21,7 @@ const unavailable = () => new AppError("This link is invalid, has expired, or th
 async function linkFor(request: Request, params: Promise<{ token: string }>) {
   const share = await resolveShareToken((await params).token);
   if (!share || !isUploadShare(share)) throw unavailable();
+  if (!isUnlocked(share, request.headers.get("cookie"))) throw new AppError("This link needs its password. Reload the page and enter it.", 401, "PASSWORD_REQUIRED");
   const address = clientAddress(request);
   const owner: UploadOwner = { kind: "link", shareId: share.id, group: addressGroup(address) };
   return { share, address, owner };

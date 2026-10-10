@@ -5,6 +5,8 @@ import path from "node:path";
 import { reservedPathCheck } from "./archives";
 import { config } from "./config";
 import { ensureRoot, normalizeRelative, safeResolve, verifyFileHandleWithinRoot, type AnchoredDirectory, type CopiedItems } from "./files";
+import { verifyPassword } from "./auth";
+import { hashPassword } from "./credentials";
 import { AppError } from "./http";
 import type { ShareLink } from "./types";
 
@@ -35,6 +37,8 @@ interface StoredShare {
   maxFiles?: number | null;
   uploadedBytes?: number;
   uploadedFiles?: number;
+  /** A link with a password: its scrypt hash (the password itself is never stored). */
+  passwordHash?: string;
 }
 
 export type UploadShare = StoredShare & { kind: "upload"; maxBytes: number; maxFiles: number | null; uploadedBytes: number; uploadedFiles: number };
@@ -69,25 +73,124 @@ function isActive(share: StoredShare, now = Date.now()) {
 
 export const isUploadShare = (share: StoredShare): share is UploadShare => share.kind === "upload";
 
-function toLink(share: StoredShare): ShareLink {
+// --- Passwords on links ---
+//
+// A link can need a password as well. Entering it on the link's page sets a cookie for that link
+// only (its path), signed and bound to the link and its password, which lasts 12 hours. Guesses are
+// limited per visitor and per link, and failures are recorded.
+const MIN_LINK_PASSWORD = 8;
+const UNLOCK_SECONDS = 12 * 60 * 60;
+const GUESS_WINDOW_MS = 15 * 60_000;
+const GUESSES_PER_VISITOR = 10;
+const GUESSES_PER_LINK = 50;
+const guesses = new Map<string, { count: number; resetAt: number }>();
+
+async function linkPasswordHash(password: unknown) {
+  if (password === undefined || password === null || password === "") return undefined;
+  if (typeof password !== "string" || password.length < MIN_LINK_PASSWORD || password.length > 256) throw new AppError(`A link's password must be ${MIN_LINK_PASSWORD} to 256 characters`, 400, "INVALID_PASSWORD");
+  return hashPassword(password);
+}
+
+export const isProtected = (share: StoredShare) => Boolean(share.passwordHash);
+
+function unlockKey() {
+  return Buffer.from(crypto.hkdfSync("sha256", config.sessionSecret, Buffer.alloc(0), "filesdude-share-unlock-v1", 32));
+}
+
+const unlockCookieName = (share: StoredShare) => `fdl_${share.id}`;
+const unlockSignature = (share: StoredShare, expires: number) => crypto.createHmac("sha256", unlockKey()).update(`${share.id}|${expires}|${share.passwordHash}`).digest("base64url");
+
+/** Whether this visitor may use the link: it has no password, or they entered it (per its cookie). */
+export function isUnlocked(share: StoredShare, cookieHeader: string | null) {
+  if (!share.passwordHash) return true;
+  const name = unlockCookieName(share);
+  const value = (cookieHeader ?? "").split(/;\s*/).find((part) => part.startsWith(`${name}=`))?.slice(name.length + 1) ?? "";
+  const [expiresRaw, supplied, extra] = value.split(".");
+  const expires = Number(expiresRaw);
+  if (!supplied || extra !== undefined || !Number.isSafeInteger(expires) || expires * 1000 <= Date.now()) return false;
+  const expected = Buffer.from(unlockSignature(share, expires));
+  const actual = Buffer.from(supplied);
+  return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
+}
+
+function currentGuesses(key: string, now: number) {
+  const entry = guesses.get(key);
+  return entry && entry.resetAt > now ? entry : null;
+}
+
+function startGuesses(key: string, now: number) {
+  if (guesses.size > 10_000) for (const [stored, entry] of guesses) if (entry.resetAt <= now) guesses.delete(stored);
+  const entry = { count: 0, resetAt: now + GUESS_WINDOW_MS };
+  guesses.set(key, entry);
+  return entry;
+}
+
+/**
+ * Checks a password for a link, within its limits on wrong guesses: per visitor first, so one visitor
+ * past theirs doesn't use up the link's, then per link. A try is counted before checking (so tries
+ * sent together can't get past the limits) and given back if the password is right. Returns the
+ * Set-Cookie value that unlocks the link for 12 hours.
+ */
+export async function unlockShare(share: StoredShare, password: unknown, address: string, token: string, secure: boolean) {
+  if (!share.passwordHash) throw new AppError("This link doesn't need a password", 400, "NOT_PROTECTED");
+  const now = Date.now();
+  const visitorKey = `${share.id}|${address}`;
+  const linkKey = `${share.id}|*`;
+  const visitorSoFar = currentGuesses(visitorKey, now);
+  if (visitorSoFar && visitorSoFar.count >= GUESSES_PER_VISITOR) throw new AppError("Too many wrong passwords. Try again in 15 minutes.", 429, "TOO_MANY_GUESSES");
+  const link = currentGuesses(linkKey, now) ?? startGuesses(linkKey, now);
+  if (link.count >= GUESSES_PER_LINK) {
+    // The owner hears about it once each time a link is locked.
+    const firstLock = !(link as { notified?: boolean }).notified;
+    (link as { notified?: boolean }).notified = true;
+    throw Object.assign(new AppError("Too many wrong passwords have been tried on this link. Try again in 15 minutes.", 429, "LINK_LOCKED"), { firstLock });
+  }
+  const visitor = visitorSoFar ?? startGuesses(visitorKey, now);
+  visitor.count += 1;
+  link.count += 1;
+  const valid = typeof password === "string" && password.length <= 256 && (await verifyPassword(password, share.passwordHash));
+  if (!valid) throw new AppError("That password isn't right", 401, "WRONG_PASSWORD");
+  // Only wrong guesses count: the right password gives its try back.
+  guesses.delete(visitorKey);
+  link.count = Math.max(0, link.count - 1);
+  const expires = Math.floor(now / 1000) + UNLOCK_SECONDS;
+  return `${unlockCookieName(share)}=${expires}.${unlockSignature(share, expires)}; Path=/s/${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Max-Age=${UNLOCK_SECONDS}${secure ? "; Secure" : ""}`;
+}
+
+function toLink(stored: StoredShare): ShareLink {
+  const { passwordHash, ...share } = stored;
   const url = `/s/${share.id}.${signatureFor(share.id)}`;
-  if (isUploadShare(share)) return { ...share, url };
-  return { ...share, kind: "download", url };
+  const locked = Boolean(passwordHash);
+  if (isUploadShare(stored)) return { ...share, kind: "upload", url, protected: locked };
+  return { ...share, kind: "download", url, protected: locked };
 }
 
 const isCount = (value: unknown) => Number.isInteger(value) && (value as number) >= 0;
 const validUploadFields = (item: StoredShare) => item.kind === undefined
   || (item.kind === "upload" && item.type === "directory" && isCount(item.maxBytes) && (item.maxFiles === null || isCount(item.maxFiles)) && isCount(item.uploadedBytes) && isCount(item.uploadedFiles));
 
+// Links with a password are kept in a file of their own, which versions of FilesDude from before
+// passwords don't read: rolled back, they lose those links rather than serve them to anyone.
+function protectedSharesFile() {
+  return path.join(config.stateDir, "protected-shares.json");
+}
+
 async function readShares(): Promise<StoredShare[]> {
+  const [open, locked] = await Promise.all([readShareFile(sharesFile()), readShareFile(protectedSharesFile())]);
+  const protectedIds = new Set(locked.filter((share) => share.passwordHash).map((share) => share.id));
+  return [...open.filter((share) => !protectedIds.has(share.id)), ...locked.filter((share) => share.passwordHash)];
+}
+
+async function readShareFile(file: string): Promise<StoredShare[]> {
   try {
-    const parsed = JSON.parse(await fs.readFile(sharesFile(), "utf8"));
+    const parsed = JSON.parse(await fs.readFile(file, "utf8"));
     if (!Array.isArray(parsed)) return [];
     return parsed.filter((item): item is StoredShare => Boolean(item) && typeof item.id === "string" && ID_PATTERN.test(item.id)
       && typeof item.path === "string" && typeof item.name === "string" && (item.type === "file" || item.type === "directory")
       && typeof item.dev === "string" && typeof item.ino === "string"
       && typeof item.createdAt === "string" && typeof item.expiresAt === "string" && Number.isInteger(item.downloads)
-      && (item.maxDownloads === null || Number.isInteger(item.maxDownloads)) && validUploadFields(item));
+      && (item.maxDownloads === null || Number.isInteger(item.maxDownloads)) && validUploadFields(item)
+      && (item.passwordHash === undefined || (typeof item.passwordHash === "string" && item.passwordHash.startsWith("scrypt$"))));
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
     if (error instanceof SyntaxError) throw new AppError("Shared links data is corrupted", 500, "SHARES_CORRUPT");
@@ -96,6 +199,11 @@ async function readShares(): Promise<StoredShare[]> {
 }
 
 async function writeShares(shares: StoredShare[]) {
+  await writeShareFile(protectedSharesFile(), shares.filter((share) => share.passwordHash));
+  await writeShareFile(sharesFile(), shares.filter((share) => !share.passwordHash));
+}
+
+async function writeShareFile(file: string, shares: StoredShare[]) {
   await fs.mkdir(config.stateDir, { recursive: true, mode: 0o700 });
   const temporary = path.join(config.stateDir, `shares-${crypto.randomUUID()}.tmp`);
   const handle = await fs.open(temporary, "wx", 0o600);
@@ -105,7 +213,7 @@ async function writeShares(shares: StoredShare[]) {
   } finally {
     await handle.close();
   }
-  await fs.rename(temporary, sharesFile());
+  await fs.rename(temporary, file);
 }
 
 // Serializes read-modify-write cycles; expired and used-up links are dropped on every write.
@@ -126,8 +234,9 @@ function requireSharing() {
   if (!config.sharingEnabled) throw new AppError("Sharing is turned off on this server", 403, "SHARING_DISABLED");
 }
 
-export async function createShare(relativePath: string, hours: number, maxDownloads: number | null): Promise<ShareLink> {
+export async function createShare(relativePath: string, hours: number, maxDownloads: number | null, password?: unknown): Promise<ShareLink> {
   requireSharing();
+  const passwordHash = await linkPasswordHash(password);
   if (!Number.isInteger(hours) || hours < 1 || hours > MAX_SHARE_HOURS) throw new AppError("Links can last from 1 hour to 30 days", 400, "INVALID_EXPIRY");
   if (maxDownloads !== null && (!Number.isInteger(maxDownloads) || maxDownloads < 1 || maxDownloads > MAX_SHARE_DOWNLOADS)) {
     throw new AppError("Choose a download limit between 1 and 1,000, or no limit", 400, "INVALID_LIMIT");
@@ -151,6 +260,7 @@ export async function createShare(relativePath: string, hours: number, maxDownlo
     expiresAt: new Date(now + hours * 3_600_000).toISOString(),
     maxDownloads,
     downloads: 0,
+    ...(passwordHash ? { passwordHash } : {}),
   };
   return mutate(async (shares) => ({ shares: [...shares, share], result: toLink(share) }));
 }
@@ -159,8 +269,9 @@ export async function createShare(relativePath: string, hours: number, maxDownlo
  * Creates an upload link to a folder: anyone with it can add up to `maxBytes` in total (and up to
  * `maxFiles` files, or any number) until it expires. Bound to the folder as download links are.
  */
-export async function createUploadLink(relativePath: string, hours: number, maxBytes: number, maxFiles: number | null): Promise<ShareLink> {
+export async function createUploadLink(relativePath: string, hours: number, maxBytes: number, maxFiles: number | null, password?: unknown): Promise<ShareLink> {
   requireSharing();
+  const passwordHash = await linkPasswordHash(password);
   if (!Number.isInteger(hours) || hours < 1 || hours > MAX_SHARE_HOURS) throw new AppError("Links can last from 1 hour to 30 days", 400, "INVALID_EXPIRY");
   if (!Number.isInteger(maxBytes) || maxBytes < 1024 * 1024 || maxBytes > MAX_UPLOAD_LINK_BYTES) throw new AppError("Choose a total upload size between 1 MB and 1 TB", 400, "INVALID_LIMIT");
   if (maxFiles !== null && (!Number.isInteger(maxFiles) || maxFiles < 1 || maxFiles > MAX_UPLOAD_LINK_FILES)) {
@@ -189,6 +300,7 @@ export async function createUploadLink(relativePath: string, hours: number, maxB
     maxFiles,
     uploadedBytes: 0,
     uploadedFiles: 0,
+    ...(passwordHash ? { passwordHash } : {}),
   };
   return mutate(async (shares) => ({ shares: [...shares, share], result: toLink(share) }));
 }

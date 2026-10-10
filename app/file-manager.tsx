@@ -2305,7 +2305,7 @@ function ShareLinkRow({ link, showLocation, onCopy, onRevoke }: { link: ShareLin
     <div className="share-link-row">
       <div className="share-link-info">
         {showLocation && <strong title={`/${link.path}`}>{link.type === "directory" ? <Folder size={14} /> : <File size={14} />}{link.name}<small>{folderLabel(parentOf(link.path))}</small></strong>}
-        <span>{link.kind === "upload" ? <><span className="share-kind">Upload link</span> Expires {formatDateTime(link.expiresAt)} · {link.uploadedFiles ?? 0}{link.maxFiles ? ` of ${link.maxFiles}` : ""} {(link.maxFiles ?? link.uploadedFiles) === 1 ? "file" : "files"} received · {formatBytes(link.uploadedBytes ?? 0)} of {formatBytes(link.maxBytes ?? 0)} used</> : <>Expires {formatDateTime(link.expiresAt)} · {link.maxDownloads === null ? `${link.downloads} ${link.downloads === 1 ? "download" : "downloads"}` : `${link.downloads} of ${link.maxDownloads} downloads used`}</>}</span>
+        <span>{link.protected && <span className="share-kind"><LockKeyhole size={9} /> Password</span>}{link.kind === "upload" ? <><span className="share-kind">Upload link</span> Expires {formatDateTime(link.expiresAt)} · {link.uploadedFiles ?? 0}{link.maxFiles ? ` of ${link.maxFiles}` : ""} {(link.maxFiles ?? link.uploadedFiles) === 1 ? "file" : "files"} received · {formatBytes(link.uploadedBytes ?? 0)} of {formatBytes(link.maxBytes ?? 0)} used</> : <>Expires {formatDateTime(link.expiresAt)} · {link.maxDownloads === null ? `${link.downloads} ${link.downloads === 1 ? "download" : "downloads"}` : `${link.downloads} of ${link.maxDownloads} downloads used`}</>}</span>
       </div>
       <div className="share-link-actions">
         <input readOnly value={shareAddress(link)} aria-label={`Link to ${link.name}`} onFocus={(event) => event.currentTarget.select()} />
@@ -2320,6 +2320,8 @@ function ShareDialog({ entry, onClose, notify, onChanged }: { entry: FileEntry; 
   const { links, setLinks, enabled, copy, revoke } = useShareLinks(notify, onChanged);
   const [hours, setHours] = useState(168);
   const [limit, setLimit] = useState("none");
+  const [linkPassword, setLinkPassword] = useState("");
+  const [showLinkPassword, setShowLinkPassword] = useState(false);
   const [kind, setKind] = useState<"download" | "upload">("download");
   const [uploadSize, setUploadSize] = useState(UPLOAD_SIZE_OPTIONS[1].bytes);
   const [uploadFiles, setUploadFiles] = useState("100");
@@ -2331,10 +2333,11 @@ function ShareDialog({ entry, onClose, notify, onChanged }: { entry: FileEntry; 
     setBusy(true);
     try {
       const request = uploading
-        ? { action: "create", kind: "upload", path: entry.path, hours, maxBytes: uploadSize, maxFiles: uploadFiles === "none" ? null : Number(uploadFiles) }
-        : { action: "create", path: entry.path, hours, maxDownloads: limit === "none" ? null : Number(limit) };
+        ? { action: "create", kind: "upload", path: entry.path, hours, maxBytes: uploadSize, maxFiles: uploadFiles === "none" ? null : Number(uploadFiles), password: linkPassword || undefined }
+        : { action: "create", path: entry.path, hours, maxDownloads: limit === "none" ? null : Number(limit), password: linkPassword || undefined };
       const { share } = await requestJson<{ share: ShareLink }>("/api/shares", { method: "POST", body: JSON.stringify(request) });
       setLinks((current) => [share, ...(current ?? [])]);
+      setLinkPassword("");
       notify(await copyText(shareAddress(share)) ? "Link created and copied" : "Link created");
       await onChanged();
     } catch (error) {
@@ -2358,6 +2361,7 @@ function ShareDialog({ entry, onClose, notify, onChanged }: { entry: FileEntry; 
             : <FormField label="Downloads allowed"><select value={limit} onChange={(event) => setLimit(event.target.value)} disabled={!enabled}>{SHARE_LIMIT_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></FormField>}
         </div>
         {uploading && <FormField label="Files allowed"><select value={uploadFiles} onChange={(event) => setUploadFiles(event.target.value)} disabled={!enabled}>{UPLOAD_FILES_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></FormField>}
+        <FormField label="Password (optional)" hint={linkPassword ? "People will need this password to open the link. Send it separately, not with the link." : "Leave empty for anyone with the link to open it"}><div className="password-field"><input type={showLinkPassword ? "text" : "password"} value={linkPassword} onChange={(event) => setLinkPassword(event.target.value)} autoComplete="new-password" minLength={linkPassword ? 8 : undefined} maxLength={256} placeholder="At least 8 characters" disabled={!enabled} /><button type="button" className="password-toggle" aria-label={showLinkPassword ? "Hide password" : "Show password"} onClick={() => setShowLinkPassword(!showLinkPassword)}>{showLinkPassword ? <EyeOff size={15} /> : <Eye size={15} />}</button></div></FormField>
         <div className="info-box"><Info size={17} /> {uploading ? "People with the link can add files but can't see, open, change, or download anything in the folder. Files never replace what's there; a name that's taken gets a number." : entry.type === "directory" ? "The folder downloads as a ZIP file of its current contents." : "The file always downloads; it never opens in the browser."} Links use this address ({typeof window === "undefined" ? "" : window.location.host}), so people can only open them if they can reach FilesDude here.</div>
         {links === null ? <div className="ownership-loading"><LoaderCircle className="spin" size={18} /> Loading links…</div> : mine.length > 0 && <div className="share-links"><p className="share-links-title">Active links to this {entry.type === "directory" ? "folder" : "file"}</p>{mine.map((link) => <ShareLinkRow key={link.id} link={link} onCopy={copy} onRevoke={revoke} />)}</div>}
         <ModalActions onClose={onClose} submitLabel={mine.length ? "Create another link" : "Create link"} busy={busy} disabled={!enabled} />

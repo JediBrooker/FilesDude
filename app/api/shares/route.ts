@@ -18,7 +18,7 @@ export async function GET(request: Request) {
   }
 }
 
-type ShareBody = { action?: unknown; kind?: unknown; path?: unknown; hours?: unknown; maxDownloads?: unknown; maxBytes?: unknown; maxFiles?: unknown; id?: unknown };
+type ShareBody = { action?: unknown; kind?: unknown; path?: unknown; hours?: unknown; maxDownloads?: unknown; maxBytes?: unknown; maxFiles?: unknown; password?: unknown; id?: unknown };
 
 export async function POST(request: Request) {
   try {
@@ -30,12 +30,12 @@ export async function POST(request: Request) {
     if (body.action === "create") {
       if (typeof body.path !== "string" || body.path.length > 4096) throw new AppError("Path is invalid", 400, "INVALID_PATH");
       if (body.kind === "upload") {
-        const share = await createUploadLink(body.path, Number(body.hours), Number(body.maxBytes), body.maxFiles === null || body.maxFiles === undefined ? null : Number(body.maxFiles));
-        await audit("share.create", { username: session.username, id: share.id, path: share.path, expiresAt: share.expiresAt, kind: "upload", maxBytes: share.maxBytes, maxFiles: share.maxFiles });
+        const share = await createUploadLink(body.path, Number(body.hours), Number(body.maxBytes), body.maxFiles === null || body.maxFiles === undefined ? null : Number(body.maxFiles), body.password);
+        await audit("share.create", { username: session.username, id: share.id, path: share.path, expiresAt: share.expiresAt, kind: "upload", maxBytes: share.maxBytes, maxFiles: share.maxFiles, protected: share.protected || undefined });
         return NextResponse.json({ ok: true, share }, { headers: { "Cache-Control": "no-store" } });
       }
-      const share = await createShare(body.path, Number(body.hours), body.maxDownloads === null || body.maxDownloads === undefined ? null : Number(body.maxDownloads));
-      await audit("share.create", { username: session.username, id: share.id, path: share.path, expiresAt: share.expiresAt, maxDownloads: share.maxDownloads });
+      const share = await createShare(body.path, Number(body.hours), body.maxDownloads === null || body.maxDownloads === undefined ? null : Number(body.maxDownloads), body.password);
+      await audit("share.create", { username: session.username, id: share.id, path: share.path, expiresAt: share.expiresAt, maxDownloads: share.maxDownloads, protected: share.protected || undefined });
       return NextResponse.json({ ok: true, share }, { headers: { "Cache-Control": "no-store" } });
     }
     if (body.action === "revoke") {

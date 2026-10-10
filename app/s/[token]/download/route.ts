@@ -5,7 +5,7 @@ import { appendDirectory, reservedPathCheck } from "@/lib/archives";
 import { audit } from "@/lib/audit";
 import { clientAddress } from "@/lib/auth";
 import { acquireFilesystemLock, getMime } from "@/lib/files";
-import { isUploadShare, openSharedItem, recordShareDownload, resolveShareToken } from "@/lib/shares";
+import { isUnlocked, isUploadShare, openSharedItem, recordShareDownload, resolveShareToken } from "@/lib/shares";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -64,6 +64,9 @@ export async function GET(request: Request, { params }: { params: Promise<{ toke
   const share = await resolveShareToken((await params).token);
   // An upload link only lets people add files; it never shows or downloads what's there.
   if (!share || isUploadShare(share)) return unavailable();
+  if (!isUnlocked(share, request.headers.get("cookie"))) {
+    return new Response("This link needs its password. Open the link in a browser to enter it.\n", { status: 401, headers: { ...baseHeaders, "Content-Type": "text/plain; charset=utf-8" } });
+  }
   // The lock covers only opening the item; counting, auditing, and streaming happen after it.
   const release = await acquireFilesystemLock();
   const opened = await openSharedItem(share).finally(release);

@@ -132,6 +132,11 @@ test("extractions are shared, failures aren't retried, each account queues one, 
         const read = readSync(fd, name, 0, 3, 0);
         const file = name.subarray(0, read).toString();
         if (file === "bad") return null;
+        // Like the real sandbox, an extraction already called off doesn't start.
+        if (signal.aborted) {
+          aborted += 1;
+          return null;
+        }
         // b.mkv never finishes on its own, so only leaving stops it.
         await Promise.race([file === "b" ? new Promise<void>(() => undefined) : gate, new Promise<void>((resolve) => signal.addEventListener("abort", () => { aborted += 1; resolve(); }, { once: true }))]);
         return signal.aborted ? null : Buffer.from("WEBVTT\n\n00:00.000 --> 00:01.000\nok\n");
@@ -154,7 +159,8 @@ test("extractions are shared, failures aren't retried, each account queues one, 
     // When the only person waiting leaves, the extraction stops.
     const controller = new AbortController();
     const leaving = subtitleTrack("b.mkv", "stream:2", "dave", controller.signal).catch((error) => error);
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    // Waits until the extraction has started, however busy the machine is.
+    while (runs < 3) await new Promise((resolve) => setTimeout(resolve, 10));
     controller.abort();
     assert.match((await leaving).message, /cancelled/);
     assert.equal(aborted, 1);
