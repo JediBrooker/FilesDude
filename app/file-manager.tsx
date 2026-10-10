@@ -84,9 +84,10 @@ import {
   Upload,
   UserRoundCog,
   Users,
+  Wrench,
   X,
 } from "lucide-react";
-import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { FormEvent, ReactNode, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { createPortal } from "react-dom";
 import { PIECES_ABOVE_BYTES, uploadInPieces } from "./upload-pieces";
 import { browserSupportsWebAuthn, startAuthentication, startRegistration, type PublicKeyCredentialCreationOptionsJSON, type PublicKeyCredentialRequestOptionsJSON } from "@simplewebauthn/browser";
@@ -274,6 +275,7 @@ const isNewerBuild = (server: ServerBuild | undefined) => differsFrom(server, { 
 
 const SORT_LABELS: Record<SortKey, string> = { name: "Name", size: "Size", owner: "Owner", mode: "Permissions", modified: "Modified" };
 const SORT_STORAGE_KEY = "filesdude-sort";
+const MANAGE_OPEN_KEY = "filesdude-manage-open";
 
 function storedSort() {
   try {
@@ -558,6 +560,14 @@ export function FileManager() {
   const [contentSearch, setContentSearch] = useState<{ status: "running" | "done" | "error"; result?: ContentSearchResult; error?: string } | null>(null);
   const contentControllerRef = useRef<AbortController | null>(null);
   const [view, setView] = useState<ViewMode>("list");
+  // The owner's Manage group in the sidebar, folded away or open (remembered per browser).
+  const [manageOpen, setManageOpen] = useState(() => {
+    try {
+      return typeof window !== "undefined" && window.localStorage.getItem(MANAGE_OPEN_KEY) === "on";
+    } catch {
+      return false;
+    }
+  });
   // The split view's second folder for the signed-in account, or null when it's closed.
   const [split, setSplit] = useState<{ account: string; path: string | null } | null>(null);
   const account = auth.authenticated ? auth.username ?? "" : null;
@@ -1196,6 +1206,17 @@ export function FileManager() {
     },
   };
 
+  // A menu is placed from a guess at its height; once it's drawn, its real size moves it up if it
+  // would run off the bottom of the window (one taller than the window scrolls).
+  useLayoutEffect(() => {
+    const element = menuRef.current;
+    if (!menu || !element) return;
+    // Its layout height: the opening animation briefly scales it, which a bounding box would include.
+    const height = element.offsetHeight;
+    const room = window.innerHeight - 10;
+    if (menu.top + height > room) element.style.top = `${Math.max(10, room - height)}px`;
+  }, [menu]);
+
   useEffect(() => {
     if (!menu) return;
     const close = (event: MouseEvent) => {
@@ -1493,6 +1514,15 @@ export function FileManager() {
     return [{ label: home ? "Home" : "Root", path: home }, ...parts.map((part, index) => ({ label: part, path: [home, ...parts.slice(0, index + 1)].filter(Boolean).join("/") }))];
   }, [currentPath, home]);
 
+  const toggleManage = () => {
+    setManageOpen(!manageOpen);
+    try {
+      window.localStorage.setItem(MANAGE_OPEN_KEY, manageOpen ? "off" : "on");
+    } catch {
+      // Not remembered in this browser.
+    }
+  };
+
   const selectedEntries = entries.filter((entry) => selected.has(entry.path));
   const favoritePaths = new Set(favorites.map((favorite) => favorite.path));
   const allSelected = entries.length > 0 && selected.size === entries.length;
@@ -1512,14 +1542,19 @@ export function FileManager() {
 
         <nav className="primary-nav" aria-label="File locations">
           <button className={`nav-item ${currentPath === home ? "active" : ""} ${dropTarget === home ? "drop-target" : ""}`} data-drop-path={home} {...(canWrite ? dropHandlers : {})} onClick={() => { navigate(home); setSidebarOpen(false); }}><Home size={18} /><span>{home ? "My files" : "All files"}</span><ChevronRight size={15} /></button>
-          <button className="nav-item" onClick={() => { setShowHidden(true); navigate(home); setSidebarOpen(false); }}><Eye size={18} /><span>Hidden files</span></button>
           <button className="nav-item" onClick={() => { setDialog({ kind: "watching" }); setSidebarOpen(false); }}><MonitorPlay size={18} /><span>Continue watching</span></button>
           {canWrite && <button className="nav-item" onClick={() => { setDialog({ kind: "trash" }); setSidebarOpen(false); }}><Trash2 size={18} /><span>Trash</span></button>}
           {isOwner && <button className="nav-item" onClick={() => { setDialog({ kind: "shares" }); setSidebarOpen(false); }}><Link2 size={18} /><span>Shared links</span>{sharedPaths.size > 0 && <em className="nav-count">{sharedPaths.size}</em>}</button>}
-          {snapshotsAvailable && <button className="nav-item" onClick={() => { setDialog({ kind: "snapshots" }); setSidebarOpen(false); }}><History size={18} /><span>Snapshots</span></button>}
-          {isOwner && <button className="nav-item" onClick={() => { setDialog({ kind: "duplicates" }); setSidebarOpen(false); }}><Files size={18} /><span>Duplicates</span></button>}
-          {isOwner && <button className="nav-item" onClick={() => { setDialog({ kind: "users" }); setSidebarOpen(false); }}><Users size={18} /><span>Users</span></button>}
-          {isOwner && <button className="nav-item" onClick={() => { setDialog({ kind: "activity" }); setSidebarOpen(false); }}><Activity size={18} /><span>Activity</span></button>}
+          {/* The owner's admin pages fold away under Manage, so the sidebar stays short. */}
+          {isOwner ? <>
+            <button className="nav-item" aria-expanded={manageOpen} onClick={toggleManage}><Wrench size={18} /><span>Manage</span><ChevronRight size={15} className={`nav-chevron ${manageOpen ? "open" : ""}`} /></button>
+            {manageOpen && <div className="nav-group">
+              {snapshotsAvailable && <button className="nav-item" onClick={() => { setDialog({ kind: "snapshots" }); setSidebarOpen(false); }}><History size={16} /><span>Snapshots</span></button>}
+              <button className="nav-item" onClick={() => { setDialog({ kind: "duplicates" }); setSidebarOpen(false); }}><Files size={16} /><span>Duplicates</span></button>
+              <button className="nav-item" onClick={() => { setDialog({ kind: "users" }); setSidebarOpen(false); }}><Users size={16} /><span>Users</span></button>
+              <button className="nav-item" onClick={() => { setDialog({ kind: "activity" }); setSidebarOpen(false); }}><Activity size={16} /><span>Activity</span></button>
+            </div>}
+          </> : snapshotsAvailable && <button className="nav-item" onClick={() => { setDialog({ kind: "snapshots" }); setSidebarOpen(false); }}><History size={18} /><span>Snapshots</span></button>}
         </nav>
 
         <div className="sidebar-section favorites-section">
@@ -1527,25 +1562,20 @@ export function FileManager() {
           {favorites.length ? <div className="favorite-list">{favorites.map((favorite) => <div key={favorite.path} className={`favorite-item ${currentPath === favorite.path ? "active" : ""} ${dropTarget === favorite.path ? "drop-target" : ""}`} data-drop-path={favorite.path} {...(canWrite ? dropHandlers : {})}><button title={`/${favorite.path}`} onClick={() => { navigate(favorite.path); setSidebarOpen(false); }}><Star size={15} fill="currentColor" /><span>{favorite.name}</span></button><button className="favorite-remove" aria-label={`Remove ${favorite.name} from favourites`} title="Remove from favourites" onClick={() => void toggleFavorite(favorite.path)}><X size={13} /></button></div>)}</div> : <p className="favorites-empty"><Star size={14} /> Star folders to pin them here.</p>}
         </div>
 
-        <div className="sidebar-section">
-          <p className="eyebrow">{isOwner ? "SERVERS" : "SERVER"}</p>
-          <div className="server-card">
-            <div className="server-card-icon"><Server size={19} /></div>
-            <div><strong>Local filesystem</strong><span>Connected securely</span></div>
-            <span className="live-dot" title="Connected" />
-          </div>
-          {isOwner && <div className="remote-server-list">
+        {/* Other servers (the owner's); this server's own files are the main view. */}
+        {isOwner && <div className="sidebar-section">
+          <p className="eyebrow">OTHER SERVERS</p>
+          <div className="remote-server-list">
             {connections.map((connection) => <button key={connection.id} type="button" className="remote-server-item" title={`${connection.username}@${connection.host}`} onClick={() => { setDialog({ kind: "server", id: connection.id }); setSidebarOpen(false); }}><Server size={15} /><span><strong>{connection.name}</strong><small>{connection.host}</small></span></button>)}
             <button type="button" className="remote-server-add" onClick={() => { setDialog({ kind: "serverSettings" }); setSidebarOpen(false); }}><Plus size={14} /> Add a server</button>
-          </div>}
-        </div>
+          </div>
+        </div>}
 
         <button type="button" className={`storage-card ${isOwner ? "" : "static"}`} title={isOwner ? "Find the largest files" : undefined} aria-label={isOwner ? "Storage usage. Open the largest-files scanner" : "Storage usage"} disabled={!isOwner} onClick={() => setDialog({ kind: "storage" })}>
           <div className="storage-heading"><span><HardDrive size={16} /> Storage</span><strong>{diskPercent}%</strong></div>
           <div className="storage-track"><span style={{ width: `${diskPercent}%` }} /></div>
           <p>{disk ? `${formatBytes(disk.used)} of ${formatBytes(disk.total)} used` : "Calculating…"}</p>
-          <small>{disk ? `${formatBytes(disk.available)} available` : ""}</small>
-          {isOwner && <span className="storage-action">Click to find and manage largest files <ChevronRight size={12} /></span>}
+          <small>{disk ? `${formatBytes(disk.available)} available` : ""}{isOwner ? " · find large files" : ""}</small>
         </button>
 
         <div className="sidebar-footer">
