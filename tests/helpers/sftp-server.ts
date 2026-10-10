@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import path from "node:path";
 import ssh2, { type Attributes, type FileEntry } from "ssh2";
+import { generateKeyPair } from "../../lib/connections";
 
 const { Server, utils } = ssh2;
 const { STATUS_CODE, OPEN_MODE } = utils.sftp;
@@ -12,7 +13,8 @@ const { STATUS_CODE, OPEN_MODE } = utils.sftp;
  * password, or any of the given public keys.
  */
 export async function startSftpServer(root: string, auth: { username: string; password?: string; publicKeys?: string[] }, port = 0) {
-  const hostKey = utils.generateKeyPairSync("ed25519");
+  const pair = generateKeyPair("test host");
+  const hostKey = { private: pair.privateKey, public: pair.publicKey };
   const allowed = (auth.publicKeys ?? []).map((key) => utils.parseKey(key)).filter((key): key is ReturnType<typeof utils.parseKey> & { getPublicSSH(): Buffer; verify(data: Buffer, signature: Buffer, hash?: string): boolean } => !(key instanceof Error) && !Array.isArray(key));
   const local = (requested: string) => {
     const resolved = path.posix.normalize(path.posix.join("/", requested));

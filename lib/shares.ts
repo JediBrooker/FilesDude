@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { reservedPathCheck } from "./archives";
 import { config } from "./config";
-import { ensureRoot, normalizeRelative, safeResolve, verifyFileHandleWithinRoot, type CopiedItems } from "./files";
+import { ensureRoot, normalizeRelative, safeResolve, verifyFileHandleWithinRoot, type AnchoredDirectory, type CopiedItems } from "./files";
 import { AppError } from "./http";
 import type { ShareLink } from "./types";
 
@@ -16,6 +16,9 @@ import type { ShareLink } from "./types";
 // following symlinks: users who can change the shared folder (for example inside an LXC container)
 // cannot swap the item for a link to something else, and a different item later created at the
 // same path is never served.
+//
+// An upload link (kind "upload") is the reverse: anyone with it can add files to a folder, up to a
+// total size and number of files, but can't see, change, or download anything in it.
 interface StoredShare {
   id: string;
   path: string;
@@ -27,10 +30,19 @@ interface StoredShare {
   expiresAt: string;
   maxDownloads: number | null;
   downloads: number;
+  kind?: "upload";
+  maxBytes?: number;
+  maxFiles?: number | null;
+  uploadedBytes?: number;
+  uploadedFiles?: number;
 }
+
+export type UploadShare = StoredShare & { kind: "upload"; maxBytes: number; maxFiles: number | null; uploadedBytes: number; uploadedFiles: number };
 
 export const MAX_SHARE_HOURS = 30 * 24;
 const MAX_SHARE_DOWNLOADS = 1_000;
+export const MAX_UPLOAD_LINK_BYTES = 1024 ** 4;
+const MAX_UPLOAD_LINK_FILES = 10_000;
 const ID_PATTERN = /^[A-Za-z0-9_-]{16}$/;
 let mutationQueue: Promise<void> = Promise.resolve();
 
@@ -55,9 +67,17 @@ function isActive(share: StoredShare, now = Date.now()) {
   return Date.parse(share.expiresAt) > now && (share.maxDownloads === null || share.downloads < share.maxDownloads);
 }
 
+export const isUploadShare = (share: StoredShare): share is UploadShare => share.kind === "upload";
+
 function toLink(share: StoredShare): ShareLink {
-  return { ...share, url: `/s/${share.id}.${signatureFor(share.id)}` };
+  const url = `/s/${share.id}.${signatureFor(share.id)}`;
+  if (isUploadShare(share)) return { ...share, url };
+  return { ...share, kind: "download", url };
 }
+
+const isCount = (value: unknown) => Number.isInteger(value) && (value as number) >= 0;
+const validUploadFields = (item: StoredShare) => item.kind === undefined
+  || (item.kind === "upload" && item.type === "directory" && isCount(item.maxBytes) && (item.maxFiles === null || isCount(item.maxFiles)) && isCount(item.uploadedBytes) && isCount(item.uploadedFiles));
 
 async function readShares(): Promise<StoredShare[]> {
   try {
@@ -67,7 +87,7 @@ async function readShares(): Promise<StoredShare[]> {
       && typeof item.path === "string" && typeof item.name === "string" && (item.type === "file" || item.type === "directory")
       && typeof item.dev === "string" && typeof item.ino === "string"
       && typeof item.createdAt === "string" && typeof item.expiresAt === "string" && Number.isInteger(item.downloads)
-      && (item.maxDownloads === null || Number.isInteger(item.maxDownloads)));
+      && (item.maxDownloads === null || Number.isInteger(item.maxDownloads)) && validUploadFields(item));
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
     if (error instanceof SyntaxError) throw new AppError("Shared links data is corrupted", 500, "SHARES_CORRUPT");
@@ -133,6 +153,100 @@ export async function createShare(relativePath: string, hours: number, maxDownlo
     downloads: 0,
   };
   return mutate(async (shares) => ({ shares: [...shares, share], result: toLink(share) }));
+}
+
+/**
+ * Creates an upload link to a folder: anyone with it can add up to `maxBytes` in total (and up to
+ * `maxFiles` files, or any number) until it expires. Bound to the folder as download links are.
+ */
+export async function createUploadLink(relativePath: string, hours: number, maxBytes: number, maxFiles: number | null): Promise<ShareLink> {
+  requireSharing();
+  if (!Number.isInteger(hours) || hours < 1 || hours > MAX_SHARE_HOURS) throw new AppError("Links can last from 1 hour to 30 days", 400, "INVALID_EXPIRY");
+  if (!Number.isInteger(maxBytes) || maxBytes < 1024 * 1024 || maxBytes > MAX_UPLOAD_LINK_BYTES) throw new AppError("Choose a total upload size between 1 MB and 1 TB", 400, "INVALID_LIMIT");
+  if (maxFiles !== null && (!Number.isInteger(maxFiles) || maxFiles < 1 || maxFiles > MAX_UPLOAD_LINK_FILES)) {
+    throw new AppError("Choose a file limit between 1 and 10,000, or no limit", 400, "INVALID_LIMIT");
+  }
+  const normalized = sharePath(relativePath);
+  if (!normalized) throw new AppError("Upload links can't be made for the root folder; choose a folder inside it", 400, "ROOT_SHARE");
+  const candidate = await safeResolve(normalized, { followSymlink: false });
+  const stat = await fs.lstat(candidate, { bigint: true });
+  if (!stat.isDirectory()) throw new AppError("Upload links are for folders", 400, "UNSUPPORTED_SHARE");
+  if ((await fs.realpath(candidate)) !== candidate) throw new AppError("Choose the folder at its real location, not through a linked folder", 400, "UNSUPPORTED_SHARE");
+  const now = Date.now();
+  const share: UploadShare = {
+    id: crypto.randomBytes(12).toString("base64url"),
+    path: normalized,
+    name: path.posix.basename(normalized),
+    type: "directory",
+    dev: String(stat.dev),
+    ino: String(stat.ino),
+    createdAt: new Date(now).toISOString(),
+    expiresAt: new Date(now + hours * 3_600_000).toISOString(),
+    maxDownloads: null,
+    downloads: 0,
+    kind: "upload",
+    maxBytes,
+    maxFiles,
+    uploadedBytes: 0,
+    uploadedFiles: 0,
+  };
+  return mutate(async (shares) => ({ shares: [...shares, share], result: toLink(share) }));
+}
+
+// Space and files promised to uploads in progress, per link, so uploads at the same time can't
+// together go past a link's limits.
+const uploadsInProgress = new Map<string, { bytes: number; files: number }>();
+
+export function uploadRoom(share: UploadShare) {
+  const pending = uploadsInProgress.get(share.id) ?? { bytes: 0, files: 0 };
+  return {
+    bytes: Math.max(0, share.maxBytes - share.uploadedBytes - pending.bytes),
+    // "No limit" still means at most MAX_UPLOAD_LINK_FILES, so a link can't fill a folder with entries.
+    files: Math.max(0, (share.maxFiles ?? MAX_UPLOAD_LINK_FILES) - share.uploadedFiles - pending.files),
+  };
+}
+
+/** Bytes promised to all uploads through links that are still in progress. */
+export function bytesInProgress() {
+  let total = 0;
+  for (const pending of uploadsInProgress.values()) total += pending.bytes;
+  return total;
+}
+
+/**
+ * Promises room for one file of up to `bytes` through an upload link, or refuses if the link has no
+ * room left. Returns a function that settles it with the bytes actually saved (or nothing, if the
+ * upload failed and the room goes back).
+ */
+export async function reserveUpload(id: string, bytes: number) {
+  await mutate(async (shares) => {
+    const share = shares.find((item) => item.id === id);
+    if (!share || !isUploadShare(share)) throw new AppError("This link isn't available", 404, "NOT_FOUND");
+    const room = uploadRoom(share);
+    if (room.files === 0) throw new AppError("This link has taken all the files it allows", 409, "UPLOAD_LINK_FULL");
+    if (bytes > room.bytes) throw new AppError(room.bytes ? "This file is larger than the room left on this link" : "This link has no room left", 413, "UPLOAD_LINK_FULL");
+    const pending = uploadsInProgress.get(id) ?? { bytes: 0, files: 0 };
+    uploadsInProgress.set(id, { bytes: pending.bytes + bytes, files: pending.files + 1 });
+    return { shares, result: undefined };
+  });
+  let settled = false;
+  return async (saved?: number) => {
+    if (settled) return;
+    settled = true;
+    await mutate(async (shares) => {
+      const pending = uploadsInProgress.get(id);
+      if (pending) {
+        const next = { bytes: pending.bytes - bytes, files: pending.files - 1 };
+        if (next.files <= 0) uploadsInProgress.delete(id);
+        else uploadsInProgress.set(id, next);
+      }
+      if (saved === undefined) return { shares, result: undefined };
+      return {
+        shares: shares.map((item) => (item.id === id && isUploadShare(item) ? { ...item, uploadedBytes: item.uploadedBytes + saved, uploadedFiles: item.uploadedFiles + 1 } : item)),
+        result: undefined,
+      };
+    });
+  };
 }
 
 export async function listShares(): Promise<ShareLink[]> {
@@ -225,11 +339,25 @@ export async function openSharedItem(share: StoredShare) {
   }
 }
 
+/**
+ * Opens an upload link's folder exactly as it was shared, as an anchored folder new files are created
+ * in. Null if it moved, changed, or is no longer a folder.
+ */
+export async function openUploadFolder(share: UploadShare): Promise<AnchoredDirectory | null> {
+  const opened = await openSharedItem(share);
+  if (!opened) return null;
+  if (!opened.stat.isDirectory()) {
+    await opened.handle.close().catch(() => undefined);
+    return null;
+  }
+  return { handle: opened.handle, base: process.platform === "linux" ? `/proc/self/fd/${opened.handle.fd}` : opened.openedPath, real: opened.openedPath, stat: opened.stat };
+}
+
 /** Counts a download, refusing it if the link expired or ran out in the meantime. */
 export async function recordShareDownload(id: string) {
   return mutate(async (shares) => {
     const share = shares.find((item) => item.id === id);
-    if (!share) return { shares, result: false };
+    if (!share || isUploadShare(share)) return { shares, result: false };
     return { shares: shares.map((item) => (item.id === id ? { ...item, downloads: item.downloads + 1 } : item)), result: true };
   });
 }

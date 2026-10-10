@@ -78,6 +78,22 @@ test("a complete upload is written and answered", async () => {
   });
 });
 
+test("file names outside ASCII arrive intact", async () => {
+  await withUploadRoot(async (root, cookie) => {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(partHeader("Café 写真.txt"));
+        controller.enqueue(encoder.encode("hello"));
+        controller.enqueue(encoder.encode(`\r\n--${BOUNDARY}--\r\n`));
+        controller.close();
+      },
+    });
+    const response = await withinTime(upload(uploadRequest(cookie, body)), "The upload");
+    assert.deepEqual((await response.json()).uploaded, ["Café 写真.txt"]);
+    assert.equal(await fs.readFile(path.join(root, "Café 写真.txt"), "utf8"), "hello");
+  });
+});
+
 test("an upload whose body fails part-way releases the lock and removes the partial file", async () => {
   await withUploadRoot(async (root, cookie) => {
     const body = new ReadableStream<Uint8Array>({

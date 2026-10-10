@@ -310,6 +310,23 @@ kbd { padding: 3px 5px; border: 1px solid var(--line); border-bottom-width: 2px;
 .share-missing svg { color: var(--ink-faint); }
 .share-missing strong { color: var(--ink); font-size: 14px; }
 .share-missing span { font-size: 11px; line-height: 1.5; }
+.upload-drop { display: grid; gap: 14px; }
+.upload-from { display: grid; gap: 7px; color: var(--ink-soft); font-size: 10px; font-weight: 700; }
+.upload-zone { position: relative; display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 26px 16px; border: 1.5px dashed var(--line-strong); border-radius: 12px; background: var(--panel-soft); color: var(--ink-soft); text-align: center; cursor: pointer; }
+.upload-zone:hover, .upload-zone.dragging, .upload-zone:focus-within { border-color: var(--brand); background: var(--brand-soft); }
+.upload-zone svg { color: var(--brand); }
+.upload-zone strong { color: var(--ink); font-size: 13px; }
+.upload-zone span { font-size: 10px; }
+.upload-zone input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+.upload-list { display: grid; max-height: 260px; gap: 6px; margin: 0; padding: 0; overflow-y: auto; list-style: none; }
+.upload-list li { display: flex; align-items: flex-start; gap: 9px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 9px; }
+.upload-list li > div { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 3px; }
+.upload-list strong { overflow: hidden; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.upload-list small { color: var(--ink-soft); font-size: 10px; }
+.upload-list progress { width: 100%; height: 4px; accent-color: var(--brand); }
+.upload-status { display: grid; flex: 0 0 auto; color: var(--ink-faint); }
+.upload-list li.done .upload-status { color: var(--brand); }
+.upload-list li.failed .upload-status, .upload-list li.failed small { color: var(--danger); }
 .configuration-warning { display: flex; gap: 10px; padding: 14px; border: 1px solid color-mix(in srgb, var(--warning) 30%, var(--line)); border-radius: 10px; background: var(--warning-soft); color: var(--warning); }
 .configuration-warning svg { flex: 0 0 auto; }
 .configuration-warning p { margin: 5px 0 0; font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; font-size: 9px; }
@@ -672,6 +689,13 @@ kbd { padding: 3px 5px; border: 1px solid var(--line); border-bottom-width: 2px;
 .shared-badge { display: inline-flex; flex: 0 0 auto; color: var(--brand); }
 .nav-count { min-width: 18px; padding: 1px 6px; border-radius: 999px; background: var(--brand-soft); color: var(--brand-strong); font-size: 9px; font-style: normal; font-weight: 800; text-align: center; }
 .share-links { display: grid; gap: 8px; margin: 14px 0 4px; }
+.share-kind-choice { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 14px; }
+.share-kind-choice button { display: flex; align-items: flex-start; gap: 9px; padding: 11px; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--panel); color: var(--ink-soft); text-align: left; cursor: pointer; }
+.share-kind-choice button.active { border-color: var(--brand); background: var(--brand-soft); color: var(--brand); }
+.share-kind-choice span { display: flex; flex-direction: column; gap: 2px; }
+.share-kind-choice strong { color: var(--ink); font-size: 11px; }
+.share-kind-choice small { color: var(--ink-soft); font-size: 9px; }
+.share-kind { margin-right: 5px; padding: 1px 6px; border-radius: 999px; background: var(--brand-soft); color: var(--brand); font-size: 8px; font-weight: 800; }
 .share-links-title { margin: 0; color: var(--ink-soft); font-size: 10px; font-weight: 700; }
 .share-link-row { display: grid; gap: 7px; padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel-soft); }
 .share-link-info { display: flex; min-width: 0; flex-direction: column; gap: 3px; }

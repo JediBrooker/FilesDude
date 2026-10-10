@@ -37,7 +37,7 @@ type Entry = { event: string; [key: string]: unknown };
 
 /** Who did it: the account, a share link, or FilesDude itself (upkeep). */
 export function activityUser(entry: Entry) {
-  if (entry.event === "share.download") return SHARE_LINK_ACTOR;
+  if (entry.event === "share.download" || entry.event === "share.upload") return SHARE_LINK_ACTOR;
   if (entry.event.startsWith("login.")) return typeof entry.username === "string" ? entry.username : "";
   return typeof entry.username === "string" ? entry.username : SYSTEM_ACTOR;
 }
@@ -140,9 +140,10 @@ function describe(entry: Entry): Omit<ActivityText, "text"> {
     case "duplicates.scan": return { parts: t`looked for duplicates in ${v(slash(entry.path))}` };
     case "duplicates.trash": return { parts: t`moved ${items(paths)} duplicates to the trash`, detail: pathDetail(paths) };
     case "duplicates.link": return { parts: [`replaced ${count(Array.isArray(entry.linked) ? entry.linked.length : 0, "duplicate")} with hard links`] };
-    case "share.create": return { parts: t`shared ${v(slash(entry.path))}${str(entry.expiresAt) ? `, until ${new Date(str(entry.expiresAt)).toLocaleString()}` : ""}` };
+    case "share.create": return entry.kind === "upload" ? { parts: t`made an upload link to ${v(slash(entry.path))}${str(entry.expiresAt) ? `, until ${new Date(str(entry.expiresAt)).toLocaleString()}` : ""}` } : { parts: t`shared ${v(slash(entry.path))}${str(entry.expiresAt) ? `, until ${new Date(str(entry.expiresAt)).toLocaleString()}` : ""}` };
     case "share.revoke": return { parts: [entry.reason === "item deleted" ? `revoked ${count(list(entry.ids).length, "share link")} for deleted items` : "revoked a share link"] };
     case "share.download": return { parts: t`downloaded ${v(slash(entry.path))}`, detail: str(entry.address) || undefined };
+    case "share.upload": return { parts: str(entry.from) ? t`received ${v(str(entry.name))} in ${v(slash(entry.path))} from ${v(str(entry.from))}` : t`received ${v(str(entry.name))} in ${v(slash(entry.path))}`, detail: str(entry.address) || undefined };
     case "users.create": return { parts: t`added ${str(entry.role) === "viewer" ? "viewer" : "editor"} ${v(str(entry.account))} with ${v(slash(entry.root))}` };
     case "users.update": return { parts: t`changed ${v(str(entry.account))} (${str(entry.role)}, ${v(slash(entry.root))})${entry.passwordReset ? " and reset their password" : ""}${entry.passkeysRemoved ? ", removing their passkeys" : ""}` };
     case "users.delete": return { parts: t`removed the account ${v(str(entry.account))}`, tone: "warning" };

@@ -1,5 +1,6 @@
 import type { AddressInfo } from "node:net";
 import ssh2 from "ssh2";
+import { generateKeyPair } from "../../lib/connections";
 
 // An SFTP server that answers however a test says, to check FilesDude copes with hostile servers:
 // listings that never end, files bigger than they claim, and requests it never answers.
@@ -22,7 +23,7 @@ export type Scenario = {
 };
 
 export async function startHostileServer(scenario: Scenario) {
-  const hostKey = utils.generateKeyPairSync("ed25519");
+  const hostKey = { private: generateKeyPair("test host").privateKey };
   const opened = new Map<string, number>();
   const server = new Server({ hostKeys: [hostKey.private] }, (client) => {
     client.on("authentication", (context) => (context.method === "password" ? context.accept() : context.reject(["password"])));

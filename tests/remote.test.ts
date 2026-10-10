@@ -3,8 +3,9 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import ssh2 from "ssh2";
 import { config } from "../lib/config";
-import { createConnection, getConnection, listConnections, trustHostKey, updateConnection } from "../lib/connections";
+import { createConnection, generateKeyPair, getConnection, listConnections, trustHostKey, updateConnection } from "../lib/connections";
 import { waitForJob } from "../lib/jobs";
 import { startCopyFromServer, startCopyToServer } from "../lib/remote-transfer";
 import { closeSession, deleteRemote, listRemote, makeRemoteFolder, readRemote, renameRemote, testConnection } from "../lib/sftp";
@@ -97,6 +98,14 @@ test("a server's identity must be confirmed, and a changed one is refused", asyn
     const wrongId = await connect({ name: "Wrong password", password: "wrong" });
     assert.equal((await testConnection(wrongId).catch((error) => error)).code, "REMOTE_AUTH_FAILED");
   });
+});
+
+test("generated keys always read back, despite ssh2 sometimes writing a short one", () => {
+  for (let index = 0; index < 1_500; index += 1) {
+    const pair = generateKeyPair("check");
+    assert.ok(!(ssh2.utils.parseKey(pair.privateKey) instanceof Error));
+    assert.ok(!(ssh2.utils.parseKey(pair.publicKey) instanceof Error));
+  }
 });
 
 test("FilesDude can sign in with a key it generated", async () => {

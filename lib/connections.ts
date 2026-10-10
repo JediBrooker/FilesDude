@@ -161,10 +161,17 @@ function validate(input: ConnectionInput) {
   return { name, host, port, username, auth: input.auth as ConnectionAuth, root: remoteRoot(input.root) };
 }
 
-// A new key pair for FilesDude to sign in with; the owner adds the public half on the server.
-function generateKeyPair(name: string) {
-  const pair = utils.generateKeyPairSync("ed25519", { comment: `filesdude ${name}`.replace(/[^\x20-\x7e]/g, "") });
-  return { privateKey: pair.private, publicKey: pair.public };
+/**
+ * A new key pair for FilesDude to sign in with; the owner adds the public half on the server.
+ * ssh2 writes about one ed25519 key in 200 with its public key a byte short (a leading zero is
+ * dropped), which nothing can read, so a key is only kept once it reads back.
+ */
+export function generateKeyPair(name: string) {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const pair = utils.generateKeyPairSync("ed25519", { comment: `filesdude ${name}`.replace(/[^\x20-\x7e]/g, "") });
+    if (!(utils.parseKey(pair.private) instanceof Error) && !(utils.parseKey(pair.public) instanceof Error)) return { privateKey: pair.private, publicKey: pair.public };
+  }
+  throw new Error("Couldn't generate a usable key");
 }
 
 function checkPrivateKey(privateKey: string, passphrase?: string) {

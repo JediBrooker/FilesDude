@@ -3,7 +3,7 @@ import { audit } from "@/lib/audit";
 import { withAccess } from "@/lib/access";
 import { config } from "@/lib/config";
 import { assertMutationRequest, AppError, jsonError, readJsonBody } from "@/lib/http";
-import { createShare, listShares, revokeShare } from "@/lib/shares";
+import { createShare, createUploadLink, listShares, revokeShare } from "@/lib/shares";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -17,7 +17,7 @@ export async function GET(request: Request) {
   }
 }
 
-type ShareBody = { action?: unknown; path?: unknown; hours?: unknown; maxDownloads?: unknown; id?: unknown };
+type ShareBody = { action?: unknown; kind?: unknown; path?: unknown; hours?: unknown; maxDownloads?: unknown; maxBytes?: unknown; maxFiles?: unknown; id?: unknown };
 
 export async function POST(request: Request) {
   try {
@@ -28,6 +28,11 @@ export async function POST(request: Request) {
     const body = parsed as ShareBody;
     if (body.action === "create") {
       if (typeof body.path !== "string" || body.path.length > 4096) throw new AppError("Path is invalid", 400, "INVALID_PATH");
+      if (body.kind === "upload") {
+        const share = await createUploadLink(body.path, Number(body.hours), Number(body.maxBytes), body.maxFiles === null || body.maxFiles === undefined ? null : Number(body.maxFiles));
+        await audit("share.create", { username: session.username, id: share.id, path: share.path, expiresAt: share.expiresAt, kind: "upload", maxBytes: share.maxBytes, maxFiles: share.maxFiles });
+        return NextResponse.json({ ok: true, share }, { headers: { "Cache-Control": "no-store" } });
+      }
       const share = await createShare(body.path, Number(body.hours), body.maxDownloads === null || body.maxDownloads === undefined ? null : Number(body.maxDownloads));
       await audit("share.create", { username: session.username, id: share.id, path: share.path, expiresAt: share.expiresAt, maxDownloads: share.maxDownloads });
       return NextResponse.json({ ok: true, share }, { headers: { "Cache-Control": "no-store" } });

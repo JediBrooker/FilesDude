@@ -15,6 +15,7 @@ FilesDude File Explorer is a secure, self-hosted web file manager designed for a
 - Multi-file drag-and-drop upload with live progress, transfer speed, time remaining, and cancel (cancelled or interrupted files are discarded and can be resumed), collision-safe names, a configurable size limit, and owner/group confirmation based on the destination folder and its existing contents
 - Direct file downloads and ZIP downloads for folders; select several items (from one folder or from search results) to download them together as one ZIP
 - Share links: let anyone with a private link download a file (or a folder as a ZIP) without signing in, for 1 hour to 30 days and optionally a limited number of downloads; links can be revoked at any time, follow renames and moves, and every download is audited
+- Upload links: let anyone with a private link send files into a folder, without an account and without seeing what's in it, within a total size and number of files you choose
 - Compress selected items into `.zip` or `.tar.gz` and extract `.zip`, `.tar`, `.tar.gz`, and `.tgz` archives into a new folder, as background jobs with progress and cancel; extraction refuses archives with absolute or `..` paths, never creates links or devices, and stops before filling the disk
 - Inline previews for text, code, JSON, images, PDF, audio, and video; media uses byte-range streaming. Videos offer subtitles in the player's CC menu: subtitle files beside them (`Movie.srt`, `Movie.en.vtt`) and text subtitle tracks inside them (extracted once by ffmpeg in the media sandbox and kept). Step through a folder's files with the arrow keys, the on-screen arrows, or a swipe on touch screens; neighbouring photos load ahead
 - Image thumbnails in grid view (JPEG, PNG, GIF, WebP, and AVIF up to 64 MB), generated on the server with EXIF rotation applied and all metadata stripped, and cached in the state directory
@@ -255,6 +256,34 @@ copy and revoke buttons.
   if they can reach that address. Over plain HTTP, links and downloads can be read by
   anyone on the network path; use HTTPS for anything sensitive.
 - Set `FILEDUDE_SHARING_ENABLED=false` to turn sharing off entirely.
+
+### Upload links
+
+To collect files from someone without an account, right-click a folder, choose
+**Share link…**, and pick **Upload**. Choose how long the link lasts, the total size it
+takes (100 MB to 100 GB), and how many files (up to 10,000). The person opening the link
+sees only the folder's name and a place to drop files, with an optional box for their
+name, and each file shows its progress as it uploads.
+
+- People with an upload link can't see, open, download, change, or delete anything in
+  the folder, and the link can't be used as a download link.
+- Files never replace anything: a name that's taken gets a number, as in `report (1).pdf`
+  (or a random ending once many are taken). Invisible and direction-changing characters
+  in names are replaced with `_`, and a leading dot becomes `_`, so nothing arrives
+  hidden (such as `.htaccess`).
+- Each file can be at most `FILEDUDE_MAX_UPLOAD_MB`, and counts at least 4 KB against the
+  link; empty files aren't taken. Uploads stop when the link's size or file limit is
+  reached, and always leave 2 GB free on the folder's disk.
+- A server takes at most 8 uploads through links at once, 3 per link and 3 per address
+  (IPv6 addresses count by /64). An upload that stops sending data for a minute, or runs
+  slower than 64 KB/s overall, is dropped.
+- Behind Cloudflare, its request size limit (100 MB on the Free and Pro plans) also
+  applies to each file.
+- When FilesDude runs as root, received files belong to the folder's owner.
+- Every file received is recorded in Activity, with the sender's address and the name
+  they gave. **Shared links** shows how much each upload link has received.
+- Like download links, upload links follow the folder when it's renamed or moved, and
+  stop working if it's deleted or replaced.
 
 ## Video thumbnails
 
