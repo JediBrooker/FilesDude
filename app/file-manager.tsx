@@ -1169,6 +1169,11 @@ export function FileManager() {
   const openSplit = useCallback((target: string) => {
     if (account === null) return;
     setInfoOpen(false);
+    try {
+      window.localStorage.setItem(INFO_OPEN_KEY, "off");
+    } catch {
+      // Not remembered in this browser.
+    }
     setSplit({ account, path: target });
     try {
       window.localStorage.setItem(`${SPLIT_STORAGE_PREFIX}${account}`, target);
@@ -1576,6 +1581,13 @@ export function FileManager() {
     await new Promise((resolve) => window.setTimeout(resolve, 0));
     await requestJson("/api/auth/logout", { method: "POST", body: JSON.stringify({}) });
     setFavorites([]);
+    // Nothing of this account's listing stays on screen for whoever signs in next.
+    setEntries([]);
+    setSelected(new Set());
+    setCursor(null);
+    setLoadedPath(null);
+    setTags(new Map());
+    setTagCounts(null);
     setAuth(initialAuth);
     await refreshAuth();
   };
@@ -1852,7 +1864,9 @@ export function FileManager() {
           <DetailsPane
             selected={selectedEntries}
             folder={currentPath}
+            home={home}
             entries={entries}
+            folderState={loadedPath !== currentPath ? "loading" : nameSearching || (searchMode === "contents" && activeSearch) ? "search" : "ready"}
             tags={tags}
             isOwner={isOwner}
             videoThumbnails={auth.features?.videoThumbnails ?? false}
@@ -5438,10 +5452,13 @@ function FolderSizePanel({ entry }: { entry: FileEntry }) {
  * once the selection has settled, so stepping through a folder doesn't ask for each), the total of
  * several, or the folder's own. Heavier things (a folder's full size, checksums) stay in Properties.
  */
-function DetailsPane({ selected, folder, entries, tags, isOwner, videoThumbnails, onOpen, onDownload, onShare, onProperties, onClose, notify }: {
+function DetailsPane({ selected, folder, home, entries, folderState, tags, isOwner, videoThumbnails, onOpen, onDownload, onShare, onProperties, onClose, notify }: {
   selected: FileEntry[];
   folder: string;
+  home: string;
   entries: FileEntry[];
+  /** Whether `entries` are the folder's own (not still loading, nor search results). */
+  folderState: "ready" | "loading" | "search";
   tags: Map<string, TagColor[]>;
   isOwner: boolean;
   videoThumbnails: boolean;
@@ -5461,6 +5478,12 @@ function DetailsPane({ selected, folder, entries, tags, isOwner, videoThumbnails
     return () => window.clearTimeout(timer);
   }, [singlePath]);
   const copyPath = async (target: string) => {
+    // A name with hidden control or direction characters could do something unexpected when pasted
+    // (into a terminal, say), so it isn't copied.
+    if (/[\u0000-\u001f\u007f-\u009f‎‏‪-‮⁦-⁩]/.test(target)) {
+      notify("This path has hidden characters in it, so it wasn't copied", "error");
+      return;
+    }
     if (await copyText(`/${target}`)) notify("Path copied");
     else notify("Couldn't copy the path", "error");
   };
@@ -5483,7 +5506,8 @@ function DetailsPane({ selected, folder, entries, tags, isOwner, videoThumbnails
       ["Where", folderLabel(parentOf(single.path))],
     ];
     body = <>
-      <div className="details-pane-preview"><GridPreview key={single.path} entry={single} onOpen={onOpen} videoThumbnails={videoThumbnails} /></div>
+      {/* The picture waits for the selection to settle too, so arrowing through a folder doesn't ask for each. */}
+      <div className="details-pane-preview">{settled === single.path ? <GridPreview key={single.path} entry={single} onOpen={onOpen} videoThumbnails={videoThumbnails} /> : <span className={`file-icon ${single.type}`}>{fileIcon(single, 34)}</span>}</div>
       <div className="details-pane-name"><strong>{single.name}</strong><TagDots colors={tags.get(single.path)} /></div>
       <div className="details-pane-actions">
         <button type="button" className="button secondary" onClick={() => onOpen(single)}>{single.type === "directory" ? <FolderOpen size={14} /> : <Eye size={14} />} {single.type === "directory" ? "Open" : "Preview"}</button>
@@ -5506,15 +5530,18 @@ function DetailsPane({ selected, folder, entries, tags, isOwner, videoThumbnails
         <div><dt>Folders</dt><dd>{folders.toLocaleString()}{folders ? " (what's inside isn't counted)" : ""}</dd></div>
       </dl>
     </>;
+  } else if (folderState === "loading") {
+    body = <div className="details-pane-preview"><LoaderCircle className="spin" size={22} /></div>;
   } else {
     const { files, folders, bytes } = summary(entries);
+    const atHome = folder === home;
     body = <>
-      <div className="details-pane-preview"><span className="file-icon directory"><FolderOpen size={34} /></span></div>
-      <div className="details-pane-name"><strong>{folder ? folder.split("/").at(-1) : "All files"}</strong></div>
+      <div className="details-pane-preview"><span className="file-icon directory">{folderState === "search" ? <Search size={34} /> : <FolderOpen size={34} />}</span></div>
+      <div className="details-pane-name"><strong>{folderState === "search" ? "Search results" : atHome ? (home ? "My files" : "All files") : folder.split("/").at(-1)}</strong></div>
       <dl className="details-list">
         <div><dt>Files</dt><dd>{files.toLocaleString()}{files ? ` · ${formatBytes(bytes)}` : ""}</dd></div>
         <div><dt>Folders</dt><dd>{folders.toLocaleString()}</dd></div>
-        <div><dt>Where</dt><dd>{folder ? folderLabel(parentOf(folder)) : "—"}</dd></div>
+        {folderState === "ready" && !atHome && <div><dt>Where</dt><dd>{folderLabel(parentOf(folder))}</dd></div>}
       </dl>
       <p className="details-pane-hint">Select an item to see its details.</p>
     </>;
