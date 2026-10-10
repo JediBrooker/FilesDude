@@ -8,7 +8,7 @@ import { createSession } from "../lib/auth";
 import { config } from "../lib/config";
 import { getCredentials } from "../lib/credentials";
 import { runInScope } from "../lib/scope";
-import { clearTags, forgetAccountTags, setTag, tagCounts, taggedWith, tagsIn } from "../lib/tags";
+import { clearTags, flushTags, forgetAccountTags, setTag, tagCounts, taggedWith, tagsIn } from "../lib/tags";
 import { rewriteLinkedPaths } from "../lib/transfers";
 import { createUser } from "../lib/users";
 import { GET as tags, POST as tagAction } from "../app/api/tags/route";
@@ -56,7 +56,10 @@ test("items get colour tags, shown per folder, counted, and listed by colour", a
     assert.deepEqual(await tagsIn("docs"), [{ path: "docs/plan.txt", colors: ["blue"] }, { path: "docs/old", colors: ["red"] }]);
     await clearTags(["docs/plan.txt", "docs/old"]);
     assert.deepEqual(await tagsIn("docs"), []);
+    // Kept in memory, then written out.
+    await flushTags();
     assert.equal((await fs.stat(path.join(state, "tags.json"))).mode & 0o777, 0o600);
+    assert.deepEqual(JSON.parse(await fs.readFile(path.join(state, "tags.json"), "utf8")).accounts.owner.map((item: [string]) => item[0]).sort(), ["__proto__", "report.pdf"]);
     // A file named __proto__ is just a name.
     assert.equal(({} as Record<string, unknown>).green, undefined);
   });
@@ -106,6 +109,32 @@ test("tags follow renames and moves, go with deletes, and hide what has gone or 
   });
 });
 
+test("FilesDude's own folders can't be tagged through a link, and gone items lose their tags when listed", async () => {
+  await withRoot(async ({ root }) => {
+    await fs.mkdir(path.join(root, ".filedude"), { recursive: true });
+    await fs.symlink(".filedude", path.join(root, "sneaky"));
+    await assert.rejects(setTag(["sneaky"], "red", true), /reserved/);
+    await setTag(["report.pdf", "docs/plan.txt"], "orange", true);
+    await fs.rm(path.join(root, "report.pdf"));
+    assert.equal((await tagCounts()).orange, 2);
+    assert.deepEqual((await taggedWith("orange")).map((item) => item.path), ["docs/plan.txt"]);
+    // The gone item's tag was dropped.
+    assert.equal((await tagCounts()).orange, 1);
+  });
+});
+
+test("tags moved out of an account's folder don't count towards its limit", async () => {
+  await withRoot(async ({ root }) => {
+    await runInScope({ accountKey: "bob", username: "bob", role: "viewer", root: "home/bob" }, () => setTag(["home/bob/mine.txt"], "red", true));
+    await fs.rename(path.join(root, "home", "bob", "mine.txt"), path.join(root, "mine.txt"));
+    await rewriteLinkedPaths([{ from: "home/bob/mine.txt", to: "mine.txt" }], "owner");
+    await runInScope({ accountKey: "bob", username: "bob", role: "viewer", root: "home/bob" }, async () => {
+      assert.equal((await tagCounts()).red, 0);
+      assert.deepEqual(await taggedWith("red"), []);
+    });
+  });
+});
+
 test("a damaged file is kept aside, odd entries are ignored, and a removed account's tags go", async () => {
   await withRoot(async ({ state }) => {
     await fs.mkdir(state, { recursive: true });
@@ -113,6 +142,10 @@ test("a damaged file is kept aside, odd entries are ignored, and a removed accou
     assert.deepEqual(await tagsIn(""), [{ path: "report.pdf", colors: ["red"] }]);
     await forgetAccountTags("owner");
     assert.deepEqual(await tagsIn(""), []);
+  });
+  // A damaged file found when the tags are first read.
+  await withRoot(async ({ state }) => {
+    await fs.mkdir(state, { recursive: true });
     await fs.writeFile(path.join(state, "tags.json"), "{\"accounts\": [tor");
     assert.deepEqual(await tagsIn(""), []);
     assert.equal(await fs.readFile(path.join(state, "tags.json.bad"), "utf8"), "{\"accounts\": [tor");

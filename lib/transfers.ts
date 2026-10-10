@@ -6,13 +6,17 @@ import { startJob } from "./jobs";
 import { rewriteSharePaths } from "./shares";
 import { rewriteTagPaths } from "./tags";
 
-/** Favourites, tags, and share links follow items that are renamed or moved, and drop deleted ones. */
+/**
+ * Share links, favourites, and tags follow items that are renamed or moved, and drop deleted ones.
+ * Share links come first (they decide what strangers can reach), and favourites or tags failing to
+ * update never stops the rest, or the change itself, from going through.
+ */
 export async function rewriteLinkedPaths(changes: Array<{ from: string; to?: string }>, username: string, copies?: CopiedItems) {
   if (!changes.length) return;
-  await rewriteFavoritePaths(changes);
-  await rewriteTagPaths(changes);
   const revoked = await rewriteSharePaths(changes, copies);
   if (revoked.length) await audit("share.revoke", { username, ids: revoked, reason: "item deleted" });
+  await rewriteFavoritePaths(changes).catch((error: Error) => console.error("Favourites couldn't follow a change:", error.message));
+  await rewriteTagPaths(changes).catch((error: Error) => console.error("Tags couldn't follow a change:", error.message));
 }
 
 /**
