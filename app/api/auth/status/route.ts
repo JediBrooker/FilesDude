@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { configurationIssues } from "@/lib/config";
 import { getSession } from "@/lib/auth";
+import { getPreferences } from "@/lib/preferences";
 import { videoThumbnailsAvailable } from "@/lib/video-frames";
 
 export const runtime = "nodejs";
@@ -17,7 +18,7 @@ export async function GET(request: Request) {
     configurationIssues: issues,
     // What this server can do, for signed-in pages to offer.
     ...(session ? {
-      features: { videoThumbnails: await videoThumbnailsAvailable() },
+      features: { videoThumbnails: await videoThumbnailsAvailable(), uploadInPieces: await getPreferences().then((preferences) => preferences.uploadInPieces, () => true) },
       // The build this server runs, so pages loaded before an update can offer to reload.
       build: { version: process.env.NEXT_PUBLIC_FILESDUDE_VERSION || "dev", commit: process.env.NEXT_PUBLIC_FILESDUDE_COMMIT || "" },
     } : {}),

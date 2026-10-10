@@ -12,6 +12,8 @@ export interface StoredPreferences {
   snapshotSchedule: SnapshotSchedule;
   /** Which accounts besides the owner may browse, download from, and restore from snapshots. */
   snapshotAccess: SnapshotAccess;
+  /** Whether large files upload in pieces (for proxies with a request size limit, such as Cloudflare). */
+  uploadInPieces: boolean;
   updatedAt?: string;
 }
 
@@ -43,7 +45,7 @@ export const MAX_TRASH_RETENTION_DAYS = 3650;
 function preferencesFile() {
   return path.join(config.stateDir, "preferences.json");
 }
-const defaults: StoredPreferences = { uploadOwnership: { mode: "destination" }, trashRetentionDays: null, snapshotSchedule: { frequency: "off", keep: 24 }, snapshotAccess: "owner" };
+const defaults: StoredPreferences = { uploadOwnership: { mode: "destination" }, trashRetentionDays: null, snapshotSchedule: { frequency: "off", keep: 24 }, snapshotAccess: "owner", uploadInPieces: true };
 
 export function parseTrashRetention(value: unknown): number | null {
   if (value === null) return null;
@@ -69,6 +71,7 @@ export async function getPreferences(): Promise<StoredPreferences> {
       trashRetentionDays: value.trashRetentionDays === undefined ? defaults.trashRetentionDays : parseTrashRetention(value.trashRetentionDays),
       snapshotSchedule: value.snapshotSchedule === undefined ? defaults.snapshotSchedule : parseSnapshotSchedule(value.snapshotSchedule),
       snapshotAccess: value.snapshotAccess === undefined ? defaults.snapshotAccess : parseSnapshotAccess(value.snapshotAccess),
+      uploadInPieces: typeof value.uploadInPieces === "boolean" ? value.uploadInPieces : defaults.uploadInPieces,
       updatedAt: typeof value.updatedAt === "string" ? value.updatedAt : undefined,
     };
   } catch (error) {

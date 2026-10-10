@@ -13,7 +13,7 @@ FilesDude File Explorer is a secure, self-hosted web file manager designed for a
 - Create files and folders; edit text/code files up to 2 MB; rename, copy, move, soft-delete, and permanently delete, with a breadcrumb folder browser and autofill suggestions for picking a copy/move destination
 - Upload whole folders, by dropping them or with the arrow on the Upload button, keeping their subfolders (empty ones too); each uploaded folder lands in a new folder ("Photos (1)" if "Photos" exists), and system clutter like `.DS_Store` is left out
 - Multi-file drag-and-drop upload with live progress, transfer speed, time remaining, and cancel (cancelled or interrupted files are discarded and can be resumed), collision-safe names, a configurable size limit, and owner/group confirmation based on the destination folder and its existing contents
-- Large files (over 64 MB) upload in 32 MB pieces, so they get through proxies with a request size limit such as Cloudflare's 100 MB, and a dropped connection only re-sends the piece in flight: the upload waits and carries on by itself, up to five times in a row. The file is written under a visible `name (uploading)` placeholder and takes its real name once complete; an abandoned upload's placeholder is removed after 30 minutes, or when the service restarts. The size limit is still `FILEDUDE_MAX_UPLOAD_MB` per file, so raise it to upload files larger than 512 MB
+- Large files (over 64 MB) upload in 32 MB pieces, so they get through proxies with a request size limit such as Cloudflare's 100 MB, and a dropped connection only re-sends the piece in flight: the upload waits and carries on by itself, up to five times in a row. The file is written under a visible `name (uploading)` placeholder and takes its real name once complete; an abandoned upload's placeholder is removed after 30 minutes, or when the service restarts. This applies to upload links too. The owner can turn it off under **Preferences → Large uploads** when nothing in front of FilesDude limits request sizes; each file then goes in one request, which must finish within an hour. The size limit is still `FILEDUDE_MAX_UPLOAD_MB` per file, so raise it to upload files larger than 512 MB
 - Direct file downloads and ZIP downloads for folders; select several items (from one folder or from search results) to download them together as one ZIP
 - Share links: let anyone with a private link download a file (or a folder as a ZIP) without signing in, for 1 hour to 30 days and optionally a limited number of downloads; links can be revoked at any time, follow renames and moves, and every download is audited
 - Upload links: let anyone with a private link send files into a folder, without an account and without seeing what's in it, within a total size and number of files you choose
@@ -113,6 +113,8 @@ From there you can:
   for account changes; other sessions are invalidated when credentials change.
 - Select the default upload ownership: match the destination folder, keep the
   FilesDude service account, or use a fixed system owner and group.
+- Choose how files over 64 MB are sent (**Large uploads**): in 32 MB pieces, which is
+  needed behind Cloudflare and recovers from dropped connections, or in one request.
 
 Before every upload, FilesDude shows the saved default alongside owner/group
 pairs detected from the destination folder and its existing contents. Applying
@@ -278,9 +280,10 @@ name, and each file shows its progress as it uploads.
 - A server takes at most 8 uploads through links at once, 3 per link and 3 per address
   (IPv6 addresses count by /64). An upload that stops sending data for a minute, or runs
   slower than 64 KB/s overall, is dropped.
-- Behind Cloudflare, its request size limit (100 MB on the Free and Pro plans) also
-  applies to each file sent through an upload link (signed-in uploads are sent in pieces
-  and aren't affected).
+- Files over 64 MB are sent in pieces (unless the owner turned that off), so Cloudflare's
+  request size limit doesn't apply. Each piece upload holds the link's room for its whole
+  file until it finishes or is given up, ends if nothing arrives for 5 minutes or it runs
+  past its deadline, and stops when the link is revoked.
 - When FilesDude runs as root, received files belong to the folder's owner.
 - Every file received is recorded in Activity, with the sender's address and the name
   they gave. **Shared links** shows how much each upload link has received.

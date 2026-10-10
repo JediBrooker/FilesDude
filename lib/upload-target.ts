@@ -1,4 +1,5 @@
-import { constants } from "node:fs";
+import { constants, type Stats } from "node:fs";
+import net from "node:net";
 import fsp, { type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
@@ -71,6 +72,33 @@ function fitName(stem: string, suffix: string, extension: string) {
  * never run out), and fails the same way whatever is in the way.
  */
 export async function reservePublicTarget(folder: AnchoredDirectory, name: string) {
+  let reserved: { name: string; handle: FileHandle; created: Stats } | null = null;
+  await withPublicNames(folder, name, async (candidate) => {
+    try {
+      const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW;
+      const handle = await fsp.open(inside(folder, candidate), flags, 0o640);
+      try {
+        reserved = { name: candidate, handle, created: await handle.stat() };
+        return true;
+      } catch (error) {
+        await handle.close().catch(() => undefined);
+        throw error;
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+      throw error;
+    }
+  });
+  if (!reserved) throw new AppError("The file couldn't be saved", 500, "SAVE_FAILED");
+  return reserved as { name: string; handle: FileHandle; created: Stats };
+}
+
+/**
+ * Offers `take` free-looking names for a stranger's file in `folder` (the name, a few numbered ones,
+ * then random ones) until it takes one, never one of FilesDude's own. Any failure other than the name
+ * being taken is reported the same way, whatever was in the way.
+ */
+export async function withPublicNames(folder: AnchoredDirectory, name: string, take: (candidate: string) => Promise<boolean>) {
   if (INTERNAL_NAMES.has(name)) throw new AppError("That file name can't be used", 400, "INVALID_NAME");
   const state = await fsp.realpath(config.stateDir).catch(() => path.resolve(config.stateDir));
   const extension = path.extname(name);
@@ -79,19 +107,37 @@ export async function reservePublicTarget(folder: AnchoredDirectory, name: strin
     const candidate = attempt === 0 ? name : fitName(stem, attempt <= 20 ? ` (${attempt})` : `-${crypto.randomBytes(6).toString("base64url")}`, extension);
     if (INTERNAL_NAMES.has(candidate) || path.join(folder.real, candidate) === state) continue;
     try {
-      const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW;
-      const handle = await fsp.open(inside(folder, candidate), flags, 0o640);
-      try {
-        return { name: candidate, handle, created: await handle.stat() };
-      } catch (error) {
-        await handle.close().catch(() => undefined);
-        throw error;
-      }
+      if (await take(candidate)) return candidate;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EEXIST") continue;
       console.error(error);
       throw new AppError("The file couldn't be saved", 500, "SAVE_FAILED");
     }
   }
   throw new AppError("The file couldn't be saved", 500, "SAVE_FAILED");
+}
+
+// Names come from strangers and are shown in the owner's file list: invisible and direction-changing
+// characters are replaced so a name reads as what it is, lookalike spacing is collapsed, and a leading
+// dot (a hidden file other software may act on, such as .htaccess) becomes an underscore.
+export function publicName(raw: string) {
+  const cleaned = raw.normalize("NFC").replace(/[\p{Cc}\p{Cf}]/gu, "_").replace(/\s+/g, " ").trim();
+  const name = uploadName(cleaned);
+  return name.startsWith(".") ? `_${name.slice(1)}` : name;
+}
+
+// IPv6 visitors are counted by their /64, which one person usually has all of.
+export function addressGroup(address: string) {
+  if (net.isIPv6(address)) {
+    const bare = address.split("%")[0].toLowerCase();
+    const groups = bare.includes("::") ? expandIPv6(bare) : bare.split(":");
+    return `${groups.slice(0, 4).map((group) => group.replace(/^0+(?=.)/, "")).join(":")}::/64`;
+  }
+  return address;
+}
+
+function expandIPv6(address: string) {
+  const [head, tail] = address.split("::");
+  const left = head ? head.split(":") : [];
+  const right = tail ? tail.split(":") : [];
+  return [...left, ...Array(8 - left.length - right.length).fill("0"), ...right];
 }

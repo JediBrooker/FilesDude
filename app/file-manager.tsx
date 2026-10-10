@@ -75,6 +75,7 @@ import {
 } from "lucide-react";
 import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { createPortal } from "react-dom";
+import { PIECES_ABOVE_BYTES, uploadInPieces } from "./upload-pieces";
 import { browserSupportsWebAuthn, startAuthentication, startRegistration, type PublicKeyCredentialCreationOptionsJSON, type PublicKeyCredentialRequestOptionsJSON } from "@simplewebauthn/browser";
 import { ACTIVITY_CATEGORIES, activityCategory, activityUser, describeActivity, groupUploads, SHARE_LINK_ACTOR, SYSTEM_ACTOR, visibleText, type ActivityCategory } from "@/lib/activity-text";
 import { isNewerBuild as differsFrom, type BuildIdentity } from "@/lib/build";
@@ -95,7 +96,7 @@ type AuthState = {
   root: string | null;
   configurationIssues: string[];
   /** What this server can do (sent once signed in). */
-  features?: { videoThumbnails: boolean };
+  features?: { videoThumbnails: boolean; uploadInPieces?: boolean };
   /** The build the server runs (sent once signed in). */
   build?: ServerBuild;
 };
@@ -473,78 +474,6 @@ export function uploadFile<T>(url: string, file: File, onProgress: (loaded: numb
     form.append("files", file);
     xhr.send(form);
   });
-}
-
-// Files larger than this are sent in pieces, so no request is bigger than a proxy such as
-// Cloudflare allows (100 MB), and a dropped connection only costs the piece in flight.
-const PIECES_ABOVE_BYTES = 64 * 1024 * 1024;
-
-function sendPiece(url: string, piece: Blob, onProgress: (loaded: number) => void, signal: AbortSignal) {
-  return new Promise<{ received: number }>((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    const abort = () => xhr.abort();
-    const settle = () => signal.removeEventListener("abort", abort);
-    signal.addEventListener("abort", abort, { once: true });
-    xhr.upload.onprogress = (event) => onProgress(Math.min(piece.size, event.loaded));
-    xhr.onload = () => {
-      settle();
-      let data: { error?: string; code?: string; received?: number } = {};
-      try {
-        data = JSON.parse(xhr.responseText || "{}");
-      } catch {
-        // Non-JSON error pages fall back to the status message below.
-      }
-      if (xhr.status >= 200 && xhr.status < 300) resolve(data as { received: number });
-      else reject(Object.assign(new Error(data.error || `Request failed (${xhr.status})`), { status: xhr.status, code: data.code, received: data.received }));
-    };
-    xhr.onerror = () => { settle(); reject(new Error("The connection was interrupted during the upload")); };
-    xhr.onabort = () => { settle(); reject(new DOMException("The upload was cancelled", "AbortError")); };
-    xhr.open("PUT", url);
-    xhr.setRequestHeader("x-filedude-request", "1");
-    xhr.setRequestHeader("Content-Type", "application/octet-stream");
-    xhr.send(piece);
-  });
-}
-
-const pause = (ms: number, signal: AbortSignal) => new Promise<void>((resolve, reject) => {
-  const timer = window.setTimeout(resolve, ms);
-  signal.addEventListener("abort", () => { window.clearTimeout(timer); reject(new DOMException("The upload was cancelled", "AbortError")); }, { once: true });
-});
-
-/**
- * Uploads a large file in pieces. A piece that fails for a lost connection or a busy server is sent
- * again (after asking the server where to carry on), up to a few times in a row before giving up.
- */
-export async function uploadInPieces(query: URLSearchParams, file: File, onProgress: (loaded: number) => void, signal: AbortSignal) {
-  const base = "/api/fs/upload/chunks";
-  const { id, chunkBytes } = await requestJson<{ id: string; chunkBytes: number }>(`${base}?${query}`, { method: "POST", body: JSON.stringify({ action: "start", name: file.name, size: file.size }), signal });
-  let received = 0;
-  let failures = 0;
-  try {
-    while (received < file.size) {
-      const from = received;
-      try {
-        const result = await sendPiece(`${base}?id=${encodeURIComponent(id)}&offset=${from}`, file.slice(from, Math.min(file.size, from + chunkBytes)), (loaded) => onProgress(from + loaded), signal);
-        received = result.received;
-        failures = 0;
-      } catch (caught) {
-        const typed = caught as Error & { status?: number; received?: number };
-        if (typed.name === "AbortError") throw caught;
-        // Only a lost connection, a busy or restarting server, or a piece out of step is worth retrying.
-        const retryable = typed.status === undefined || typed.status === 409 || typed.status === 429 || typed.status >= 500;
-        failures += 1;
-        if (!retryable || failures > 5) throw caught;
-        await pause(Math.min(30_000, 1_000 * 2 ** failures), signal);
-        received = typed.received ?? (await requestJson<{ received: number }>(`${base}?id=${encodeURIComponent(id)}`, { signal }).then((status) => status.received, () => received));
-        onProgress(received);
-      }
-    }
-    return await requestJson<{ uploaded: string[] }>(base, { method: "POST", body: JSON.stringify({ action: "finish", id }), signal });
-  } catch (caught) {
-    // The server would remove it after a while anyway; this frees the space now.
-    void requestJson(base, { method: "POST", body: JSON.stringify({ action: "cancel", id }) }).catch(() => undefined);
-    throw caught;
-  }
 }
 
 export async function requestJson<T>(url: string, options: RequestInit = {}): Promise<T> {
@@ -1698,6 +1627,7 @@ export function FileManager() {
           onCredentialsUpdated={async () => { setDialog(null); await refreshAuth(); notify("Account preferences updated"); }}
           onTwoFactor={() => setDialog({ kind: "twoFactor" })}
           onPasskeys={() => setDialog({ kind: "passkeys" })}
+          uploadInPieces={auth.features?.uploadInPieces ?? true}
           onReveal={(entry) => { setDialog(null); navigate(entry.path.split("/").slice(0, -1).join("/")); }}
           onPreview={showPreview}
         />
@@ -2104,7 +2034,7 @@ function JobPanel({ job, onCancel }: { job: JobState; onCancel: () => void }) {
   );
 }
 
-function DialogHost({ dialog, selected, currentPath, username, role, home, onClose, onRun, notify, onRefresh, onStartJob, onTransfer, onJob, canWrite, onSharesChanged, onCredentialsUpdated, onTwoFactor, onPasskeys, onReveal, onPreview }: {
+function DialogHost({ dialog, selected, currentPath, username, role, home, onClose, onRun, notify, onRefresh, onStartJob, onTransfer, onJob, canWrite, onSharesChanged, onCredentialsUpdated, onTwoFactor, onPasskeys, onReveal, onPreview, uploadInPieces }: {
   dialog: NonNullable<DialogState>;
   selected: FileEntry[];
   currentPath: string;
@@ -2123,12 +2053,13 @@ function DialogHost({ dialog, selected, currentPath, username, role, home, onClo
   onCredentialsUpdated: () => Promise<void>;
   onTwoFactor: () => void;
   onPasskeys: () => void;
+  uploadInPieces: boolean;
   onReveal: (entry: FileEntry) => void;
   onPreview: (entry: FileEntry, siblings?: FileEntry[]) => void;
 }) {
   // The server dialogs are shown by FileManager, which holds the list of servers.
   if (dialog.kind === "server" || dialog.kind === "serverSettings" || dialog.kind === "copyToServer") return null;
-  if (dialog.kind === "upload") return <UploadDialog items={dialog.items} folders={dialog.folders} currentPath={currentPath} chooseOwnership={role === "owner"} onClose={onClose} notify={notify} onComplete={onRefresh} />;
+  if (dialog.kind === "upload") return <UploadDialog items={dialog.items} folders={dialog.folders} currentPath={currentPath} chooseOwnership={role === "owner"} inPieces={uploadInPieces} onClose={onClose} notify={notify} onComplete={onRefresh} />;
   if (dialog.kind === "users") return <UsersDialog onClose={onClose} notify={notify} />;
   if (dialog.kind === "duplicates") return <DuplicatesDialog startPath={currentPath} onClose={onClose} notify={notify} onRefresh={onRefresh} onReveal={onReveal} />;
   if (dialog.kind === "storage") return <StorageDialog onClose={onClose} onReveal={onReveal} onPreview={onPreview} notify={notify} />;
@@ -3057,7 +2988,7 @@ function TrashDialog({ onClose, notify, onRefresh }: { onClose: () => void; noti
 }
 
 // Only the owner picks upload ownership; other accounts' uploads take the destination folder's owner.
-function UploadDialog({ items, folders, currentPath, chooseOwnership, onClose, notify, onComplete }: { items: UploadItem[]; folders: string[]; currentPath: string; chooseOwnership: boolean; onClose: () => void; notify: (message: string, tone?: "error") => void; onComplete: () => Promise<void> }) {
+function UploadDialog({ items, folders, currentPath, chooseOwnership, inPieces, onClose, notify, onComplete }: { items: UploadItem[]; folders: string[]; currentPath: string; chooseOwnership: boolean; inPieces: boolean; onClose: () => void; notify: (message: string, tone?: "error") => void; onComplete: () => Promise<void> }) {
   const files = useMemo(() => items.map((item) => item.file), [items]);
   // The names the uploaded top folders got ("Photos (1)" if "Photos" was taken), and which empty
   // folders exist already, kept so trying again after a failure carries on in the same folders.
@@ -3161,7 +3092,7 @@ function UploadDialog({ items, folders, currentPath, chooseOwnership, onClose, n
       for (let index = uploadedCount; index < files.length; index += 1) {
         report(index, 0);
         const destination = items[index].folder ? folderParams(items[index].folder) : params;
-        if (files[index].size > PIECES_ABOVE_BYTES) await uploadInPieces(destination, files[index], (loaded) => report(index, loaded), controller.signal);
+        if (inPieces && files[index].size > PIECES_ABOVE_BYTES) await uploadInPieces({ base: "/api/fs/upload/chunks", query: destination.toString() }, files[index], (loaded) => report(index, loaded), controller.signal);
         else await uploadFile<{ uploaded: string[] }>(`/api/fs/upload?${destination}`, files[index], (loaded) => report(index, loaded), controller.signal);
         completedCount = index + 1;
         setUploadedCount(completedCount);
@@ -3684,6 +3615,7 @@ function PreferencesDialog({ username: initialUsername, onClose, onUpdated, onTw
   const [fixedUid, setFixedUid] = useState("0");
   const [fixedGid, setFixedGid] = useState("0");
   const [retentionDays, setRetentionDays] = useState<number | null>(null);
+  const [uploadInPieces, setUploadInPieces] = useState(true);
   const [users, setUsers] = useState<IdentityOption[]>([]);
   const [groups, setGroups] = useState<IdentityOption[]>([]);
   const [loaded, setLoaded] = useState(false);
@@ -3692,11 +3624,12 @@ function PreferencesDialog({ username: initialUsername, onClose, onUpdated, onTw
 
   useEffect(() => {
     const controller = new AbortController();
-    requestJson<{ username: string; uploadOwnership: UploadOwnershipPreference; trashRetentionDays: number | null; identities: { users: IdentityOption[]; groups: IdentityOption[] } }>("/api/auth/preferences", { signal: controller.signal })
+    requestJson<{ username: string; uploadOwnership: UploadOwnershipPreference; trashRetentionDays: number | null; uploadInPieces: boolean; identities: { users: IdentityOption[]; groups: IdentityOption[] } }>("/api/auth/preferences", { signal: controller.signal })
       .then((result) => {
         setUsername(result.username);
         setUploadMode(result.uploadOwnership.mode);
         setRetentionDays(result.trashRetentionDays);
+        setUploadInPieces(result.uploadInPieces);
         setUsers(result.identities.users);
         setGroups(result.identities.groups);
         if (result.uploadOwnership.mode === "fixed") {
@@ -3732,7 +3665,7 @@ function PreferencesDialog({ username: initialUsername, onClose, onUpdated, onTw
     try {
       await requestJson("/api/auth/preferences", {
         method: "POST",
-        body: JSON.stringify({ currentPassword: currentPassword || undefined, username, newPassword: newPassword || undefined, uploadOwnership, trashRetentionDays: retentionDays }),
+        body: JSON.stringify({ currentPassword: currentPassword || undefined, username, newPassword: newPassword || undefined, uploadOwnership, trashRetentionDays: retentionDays, uploadInPieces }),
       });
       await onUpdated();
     } catch (caught) {
@@ -3742,7 +3675,7 @@ function PreferencesDialog({ username: initialUsername, onClose, onUpdated, onTw
     }
   };
 
-  return <Modal title="Preferences" subtitle="Account, sign-in security, and upload defaults" icon={<Settings2 size={19} />} onClose={onClose}><form className="preferences-form" onSubmit={submit}><div className="preferences-intro"><div className="avatar large-avatar">{initialUsername.slice(0, 1).toUpperCase()}</div><div><strong>Administrator account</strong><span>Account changes invalidate other signed-in sessions.</span></div></div><div className="settings-section"><div className="settings-section-title"><span><Upload size={16} /></span><div><strong>Default upload ownership</strong><small>This choice is preselected for confirmation before every upload</small></div></div><FormField label="Default owner and group"><select value={uploadMode} onChange={(event) => setUploadMode(event.target.value as UploadOwnershipPreference["mode"])} disabled={!loaded}><option value="destination">Match the destination folder</option><option value="service">Keep FilesDude service ownership</option><option value="fixed">Use a fixed owner and group</option></select></FormField>{uploadMode === "fixed" && <div className="field-pair preference-identity-pair"><FormField label="Owner"><select value={fixedUid} onChange={(event) => setFixedUid(event.target.value)} required>{!users.some((user) => String(user.id) === fixedUid) && <option value={fixedUid}>UID {fixedUid}</option>}{users.map((user) => <option key={user.id} value={user.id}>{user.name} ({user.id})</option>)}</select></FormField><FormField label="Group"><select value={fixedGid} onChange={(event) => setFixedGid(event.target.value)} required>{!groups.some((group) => String(group.id) === fixedGid) && <option value={fixedGid}>GID {fixedGid}</option>}{groups.map((group) => <option key={group.id} value={group.id}>{group.name} ({group.id})</option>)}</select></FormField></div>}<div className="info-box"><Info size={17} /> FilesDude still shows the detected owner/group choices each time, so unusual folders can be handled safely.</div></div><div className="settings-section"><div className="settings-section-title"><span><Trash2 size={16} /></span><div><strong>Trash</strong><small>How long deleted items can be restored before they are removed for good</small></div></div><FormField label="Keep deleted items" hint={retentionDays ? `Items deleted more than ${retentionDays} ${retentionDays === 1 ? "day" : "days"} ago are removed automatically, for every account` : "Items stay until someone restores them, deletes them forever, or empties the trash"}><select value={retentionDays ?? ""} onChange={(event) => setRetentionDays(event.target.value ? Number(event.target.value) : null)} disabled={!loaded}><option value="">Until removed by hand</option>{retentionDays !== null && !RETENTION_CHOICES.includes(retentionDays) && <option value={retentionDays}>{retentionDays} days</option>}{RETENTION_CHOICES.map((days) => <option key={days} value={days}>{days === 365 ? "1 year" : `${days} days`}</option>)}</select></FormField></div><div className="settings-section"><div className="settings-section-title"><span><UserRoundCog size={16} /></span><div><strong>Username</strong><small>Used on the FilesDude sign-in screen</small></div></div><FormField label="Username"><input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" minLength={3} maxLength={64} pattern="[A-Za-z0-9._-]+" required /></FormField></div><div className="settings-section"><div className="settings-section-title"><span><LockKeyhole size={16} /></span><div><strong>Password</strong><small>Only required when changing the username or password</small></div></div><FormField label="Current password" hint={credentialsChanged ? "Required to save account changes" : "Not needed for upload preferences"}><div className="password-field"><input type={showPasswords ? "text" : "password"} value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} autoComplete="current-password" required={credentialsChanged} /><LockKeyhole size={15} /></div></FormField><div className="field-pair preferences-passwords"><FormField label="New password"><input type={showPasswords ? "text" : "password"} value={newPassword} onChange={(event) => setNewPassword(event.target.value)} autoComplete="new-password" minLength={newPassword ? 12 : undefined} placeholder="At least 12 characters" /></FormField><FormField label="Confirm new password"><input type={showPasswords ? "text" : "password"} value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} autoComplete="new-password" placeholder="Repeat new password" /></FormField></div><label className="show-passwords"><input type="checkbox" checked={showPasswords} onChange={(event) => setShowPasswords(event.target.checked)} />{showPasswords ? <EyeOff size={15} /> : <Eye size={15} />} Show passwords</label></div><TwoFactorSummary onOpen={onTwoFactor} /><PasskeySummary onOpen={onPasskeys} />{error && <div className="form-error"><CircleAlert size={16} />{error}</div>}<div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy || !loaded}>{busy ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}Save preferences</button></div></form></Modal>;
+  return <Modal title="Preferences" subtitle="Account, sign-in security, and upload defaults" icon={<Settings2 size={19} />} onClose={onClose}><form className="preferences-form" onSubmit={submit}><div className="preferences-intro"><div className="avatar large-avatar">{initialUsername.slice(0, 1).toUpperCase()}</div><div><strong>Administrator account</strong><span>Account changes invalidate other signed-in sessions.</span></div></div><div className="settings-section"><div className="settings-section-title"><span><Upload size={16} /></span><div><strong>Default upload ownership</strong><small>This choice is preselected for confirmation before every upload</small></div></div><FormField label="Default owner and group"><select value={uploadMode} onChange={(event) => setUploadMode(event.target.value as UploadOwnershipPreference["mode"])} disabled={!loaded}><option value="destination">Match the destination folder</option><option value="service">Keep FilesDude service ownership</option><option value="fixed">Use a fixed owner and group</option></select></FormField>{uploadMode === "fixed" && <div className="field-pair preference-identity-pair"><FormField label="Owner"><select value={fixedUid} onChange={(event) => setFixedUid(event.target.value)} required>{!users.some((user) => String(user.id) === fixedUid) && <option value={fixedUid}>UID {fixedUid}</option>}{users.map((user) => <option key={user.id} value={user.id}>{user.name} ({user.id})</option>)}</select></FormField><FormField label="Group"><select value={fixedGid} onChange={(event) => setFixedGid(event.target.value)} required>{!groups.some((group) => String(group.id) === fixedGid) && <option value={fixedGid}>GID {fixedGid}</option>}{groups.map((group) => <option key={group.id} value={group.id}>{group.name} ({group.id})</option>)}</select></FormField></div>}<div className="info-box"><Info size={17} /> FilesDude still shows the detected owner/group choices each time, so unusual folders can be handled safely.</div></div><div className="settings-section"><div className="settings-section-title"><span><Server size={16} /></span><div><strong>Large uploads</strong><small>How files over 64 MB are sent, for every account and upload link</small></div></div><FormField label="Send files over 64 MB" hint={uploadInPieces ? "Each file goes in 32 MB pieces, so it gets through Cloudflare (which refuses requests over 100 MB) and other proxies, and a dropped connection carries on where it stopped" : "Each file goes in one request, which must finish within an hour; uploads over 100 MB will fail through Cloudflare"}><select value={uploadInPieces ? "pieces" : "whole"} onChange={(event) => setUploadInPieces(event.target.value === "pieces")} disabled={!loaded}><option value="pieces">In pieces (needed behind Cloudflare)</option><option value="whole">In one request</option></select></FormField></div><div className="settings-section"><div className="settings-section-title"><span><Trash2 size={16} /></span><div><strong>Trash</strong><small>How long deleted items can be restored before they are removed for good</small></div></div><FormField label="Keep deleted items" hint={retentionDays ? `Items deleted more than ${retentionDays} ${retentionDays === 1 ? "day" : "days"} ago are removed automatically, for every account` : "Items stay until someone restores them, deletes them forever, or empties the trash"}><select value={retentionDays ?? ""} onChange={(event) => setRetentionDays(event.target.value ? Number(event.target.value) : null)} disabled={!loaded}><option value="">Until removed by hand</option>{retentionDays !== null && !RETENTION_CHOICES.includes(retentionDays) && <option value={retentionDays}>{retentionDays} days</option>}{RETENTION_CHOICES.map((days) => <option key={days} value={days}>{days === 365 ? "1 year" : `${days} days`}</option>)}</select></FormField></div><div className="settings-section"><div className="settings-section-title"><span><UserRoundCog size={16} /></span><div><strong>Username</strong><small>Used on the FilesDude sign-in screen</small></div></div><FormField label="Username"><input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" minLength={3} maxLength={64} pattern="[A-Za-z0-9._-]+" required /></FormField></div><div className="settings-section"><div className="settings-section-title"><span><LockKeyhole size={16} /></span><div><strong>Password</strong><small>Only required when changing the username or password</small></div></div><FormField label="Current password" hint={credentialsChanged ? "Required to save account changes" : "Not needed for upload preferences"}><div className="password-field"><input type={showPasswords ? "text" : "password"} value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} autoComplete="current-password" required={credentialsChanged} /><LockKeyhole size={15} /></div></FormField><div className="field-pair preferences-passwords"><FormField label="New password"><input type={showPasswords ? "text" : "password"} value={newPassword} onChange={(event) => setNewPassword(event.target.value)} autoComplete="new-password" minLength={newPassword ? 12 : undefined} placeholder="At least 12 characters" /></FormField><FormField label="Confirm new password"><input type={showPasswords ? "text" : "password"} value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} autoComplete="new-password" placeholder="Repeat new password" /></FormField></div><label className="show-passwords"><input type="checkbox" checked={showPasswords} onChange={(event) => setShowPasswords(event.target.checked)} />{showPasswords ? <EyeOff size={15} /> : <Eye size={15} />} Show passwords</label></div><TwoFactorSummary onOpen={onTwoFactor} /><PasskeySummary onOpen={onPasskeys} />{error && <div className="form-error"><CircleAlert size={16} />{error}</div>}<div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy || !loaded}>{busy ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}Save preferences</button></div></form></Modal>;
 }
 
 function AccountPasswordDialog({ username, role, home, onClose, onUpdated, onTwoFactor, onPasskeys }: { username: string; role: Role; home: string; onClose: () => void; onUpdated: () => Promise<void>; onTwoFactor: () => void; onPasskeys: () => void }) {

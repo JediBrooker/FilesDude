@@ -1,6 +1,5 @@
 import type { Stats } from "node:fs";
 import fsp, { type FileHandle } from "node:fs/promises";
-import net from "node:net";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import Busboy from "busboy";
@@ -11,7 +10,7 @@ import { config } from "@/lib/config";
 import { acquireFilesystemLock, removeIfSame, type AnchoredDirectory } from "@/lib/files";
 import { assertMutationRequest, AppError, jsonError } from "@/lib/http";
 import { bytesInProgress, isUploadShare, openUploadFolder, reserveUpload, resolveShareToken, type UploadShare } from "@/lib/shares";
-import { reservePublicTarget, uploadName } from "@/lib/upload-target";
+import { addressGroup, publicName, reservePublicTarget } from "@/lib/upload-target";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -38,23 +37,6 @@ let activeUploads = 0;
 const uploadsByAddress = new Map<string, number>();
 const uploadsByLink = new Map<string, number>();
 
-// IPv6 visitors are counted by their /64, which one person usually has all of.
-function addressGroup(address: string) {
-  if (net.isIPv6(address)) {
-    const bare = address.split("%")[0].toLowerCase();
-    const groups = bare.includes("::") ? expandIPv6(bare) : bare.split(":");
-    return `${groups.slice(0, 4).map((group) => group.replace(/^0+(?=.)/, "")).join(":")}::/64`;
-  }
-  return address;
-}
-
-function expandIPv6(address: string) {
-  const [head, tail] = address.split("::");
-  const left = head ? head.split(":") : [];
-  const right = tail ? tail.split(":") : [];
-  return [...left, ...Array(8 - left.length - right.length).fill("0"), ...right];
-}
-
 function adjust(counts: Map<string, number>, key: string, change: number) {
   const next = (counts.get(key) ?? 0) + change;
   if (next <= 0) counts.delete(key);
@@ -62,16 +44,6 @@ function adjust(counts: Map<string, number>, key: string, change: number) {
 }
 
 const unavailable = () => new AppError("This link is invalid, has expired, or the folder is no longer available.", 404, "NOT_FOUND");
-
-// Names come from strangers and are shown in the owner's file list: invisible and direction-changing
-// characters are replaced so a name reads as what it is.
-// Lookalike spacing is collapsed, and a leading dot (a hidden file other software may act on, such
-// as .htaccess) becomes an underscore.
-function publicName(raw: string) {
-  const cleaned = raw.normalize("NFC").replace(/[\p{Cc}\p{Cf}]/gu, "_").replace(/\s+/g, " ").trim();
-  const name = uploadName(cleaned);
-  return name.startsWith(".") ? `_${name.slice(1)}` : name;
-}
 
 function takeSlot(address: string, link: string) {
   const group = addressGroup(address);

@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Clock, Download, File, Folder, FolderOpen, FolderUp, Link2Off } from "lucide-react";
 import { config } from "@/lib/config";
+import { getPreferences } from "@/lib/preferences";
 import { isUploadShare, openSharedItem, resolveShareToken, uploadRoom } from "@/lib/shares";
 import { UploadDrop } from "./upload-drop";
 
@@ -36,6 +37,7 @@ export default async function SharePage({ params }: { params: Promise<{ token: s
     const opened = await openSharedItem(share);
     await opened?.handle.close().catch(() => undefined);
     const room = uploadRoom(share);
+    const pieces = await getPreferences().then((preferences) => preferences.uploadInPieces, () => true);
     const full = room.bytes === 0 || room.files === 0;
     return (
       <main className="login-page share-page">
@@ -53,7 +55,7 @@ export default async function SharePage({ params }: { params: Promise<{ token: s
                   <small>You can add files here, but not see what&apos;s already in the folder.</small>
                 </div>
               </div>
-              <UploadDrop token={token} folderName={share.name} perFileBytes={config.maxUploadBytes} roomBytes={room.bytes} roomFiles={share.maxFiles === null ? null : room.files} />
+              <UploadDrop pieces={pieces} token={token} folderName={share.name} perFileBytes={config.maxUploadBytes} roomBytes={room.bytes} roomFiles={share.maxFiles === null ? null : room.files} />
               <p className="share-meta"><Clock size={14} /> This link expires in {expiresIn(share.expiresAt)}.</p>
             </>
           ) : (

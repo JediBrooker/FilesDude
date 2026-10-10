@@ -10,6 +10,8 @@ import { readCopyJournal } from "../lib/copy-journal";
 import { getCredentials } from "../lib/credentials";
 import { createUser, updateUser } from "../lib/users";
 import { GET as status, POST as action, PUT as piece } from "../app/api/fs/upload/chunks/route";
+import { GET as readPreferences, POST as savePreferences } from "../app/api/auth/preferences/route";
+import { GET as authStatus } from "../app/api/auth/status/route";
 
 function scrypt(password: string, salt: Buffer) {
   return new Promise<Buffer>((resolve, reject) => {
@@ -153,6 +155,22 @@ test("an upload ends when its account changes, and isn't finished into a folder 
     assert.equal(done.body.code, "PATH_CHANGED");
     assert.ok(!(await fs.readdir(path.join(root, "inbox"))).includes("file.bin"));
     assert.ok(!(await fs.readdir(path.join(root, "Private", "inbox"))).includes("file.bin"));
+  });
+});
+
+test("the owner chooses whether large files upload in pieces, and every page is told", async () => {
+  await withRoot(async ({ owner, bob }) => {
+    const prefs = (cookie: string, body?: unknown) => json(body === undefined
+      ? readPreferences(new Request("http://localhost/api/auth/preferences", { headers: headers(cookie) }))
+      : savePreferences(new Request("http://localhost/api/auth/preferences", { method: "POST", headers: headers(cookie, { "content-type": "application/json" }), body: JSON.stringify(body) })));
+    const features = async (cookie: string) => ((await json(authStatus(new Request("http://localhost/api/auth/status", { headers: headers(cookie) })))).body.features as { uploadInPieces: boolean }).uploadInPieces;
+    assert.equal((await prefs(owner)).body.uploadInPieces, true);
+    assert.equal(await features(bob), true);
+    assert.equal((await prefs(bob, { uploadInPieces: false })).status, 403);
+    assert.equal((await prefs(owner, { uploadInPieces: "no" })).status, 400);
+    assert.equal((await prefs(owner, { uploadInPieces: false })).status, 200);
+    assert.equal((await prefs(owner)).body.uploadInPieces, false);
+    assert.equal(await features(bob), false);
   });
 });
 
