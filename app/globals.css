@@ -322,7 +322,8 @@ kbd { padding: 3px 5px; border: 1px solid var(--line); border-bottom-width: 2px;
 .modal-title > span { display: grid; width: 36px; height: 36px; place-items: center; border-radius: 10px; background: var(--brand-soft); color: var(--brand); }
 .modal h2 { margin: 0; font-size: 15px; letter-spacing: -.02em; }
 .modal header p { margin: 4px 0 0; color: var(--ink-soft); font-size: 9px; }
-.modal form, .modal > .details-hero, .modal > .details-list { margin-right: 22px; margin-left: 22px; }
+.modal form, .modal > .details-hero, .modal > .details-list, .modal > .preferences-form { margin-right: 22px; margin-left: 22px; }
+.modal form.passkey-rename { margin: 0; padding: 0; }
 .modal form { padding-top: 20px; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 22px; padding: 15px 0 19px; border-top: 1px solid var(--line); }
 .modal > .modal-actions { margin: 20px 22px 0; }
@@ -755,6 +756,18 @@ button.snapshot-entry-name { cursor: pointer; font-weight: 700; }
 .recovery-codes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 18px; margin: 0; padding-left: 22px; font-size: 13px; }
 .two-factor-badge { display: inline-flex; align-items: center; gap: 3px; margin-left: 7px; padding: 1px 6px; border-radius: 999px; background: var(--brand-soft); color: var(--brand); font-size: 9px; font-weight: 800; vertical-align: middle; }
 .login-hint { margin: -4px 0 0; color: var(--ink-soft); font-size: 11px; }
+.login-divider { display: flex; align-items: center; gap: 10px; margin: -4px 0 -8px; color: var(--ink-faint); font-size: 10px; }
+.login-divider::before, .login-divider::after { content: ""; flex: 1; border-top: 1px solid var(--line); }
+.login-form > .login-divider + .login-button { margin-top: 0; }
+.passkey-list { display: grid; gap: 6px; margin: 16px 0 0; padding: 0; list-style: none; }
+.passkey-list > li { display: flex; align-items: center; gap: 10px; padding: 9px 10px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel-soft); }
+.passkey-icon { display: grid; flex: 0 0 auto; width: 30px; height: 30px; place-items: center; border-radius: 8px; background: var(--brand-soft); color: var(--brand); }
+.passkey-details { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 2px; }
+.passkey-details strong { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.passkey-details small { color: var(--ink-faint); font-size: 10px; }
+.passkey-actions { display: flex; flex: 0 0 auto; gap: 4px; }
+.passkey-rename { display: flex; min-width: 0; flex: 1; gap: 6px; }
+.passkey-rename input { min-width: 0; flex: 1; }
 .settings-section-title > .button { margin-left: auto; }
 .preferences-form .modal-actions { flex-wrap: wrap; }
 @media (max-width: 560px) { .two-factor-qr { flex-direction: column; align-items: flex-start; } .recovery-codes { grid-template-columns: 1fr; } }
