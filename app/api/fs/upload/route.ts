@@ -5,23 +5,16 @@ import Busboy from "busboy";
 import { withAccess } from "@/lib/access";
 import { config } from "@/lib/config";
 import { audit } from "@/lib/audit";
-import { acquireFilesystemLock, ensureFolders, isAvailableUploadOwnership, MAX_UPLOAD_FOLDER_DEPTH, openDirectory, removeIfSame, resolveOwnershipPair, uploadOwnershipOptions, withFilesystemLock, type AnchoredDirectory } from "@/lib/files";
+import { acquireFilesystemLock, removeIfSame, resolveOwnershipPair, uploadOwnershipOptions, withFilesystemLock } from "@/lib/files";
 import { assertMutationRequest, AppError, jsonError } from "@/lib/http";
 import { getPreferences } from "@/lib/preferences";
 import { NextResponse } from "next/server";
 import type { UploadOwnershipOptions } from "@/lib/types";
-import { reserveTarget, uploadName } from "@/lib/upload-target";
+import { openUploadDestination, type UploadDestination } from "@/lib/upload-destination";
+import { applyOwnership, reserveTarget, uploadName } from "@/lib/upload-target";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-// The folder inside the destination a file goes into, when uploading a folder: "Photos/2024".
-function folderNames(raw: string | null) {
-  if (raw === null) return [];
-  const names = raw.split("/");
-  if (raw.length > 4096 || names.length > MAX_UPLOAD_FOLDER_DEPTH || names.some((name) => !name)) throw new AppError("The upload folder is invalid", 400, "INVALID_FOLDER");
-  return names;
-}
 
 export async function GET(request: Request) {
   try {
@@ -48,8 +41,7 @@ export async function POST(request: Request) {
     assertMutationRequest(request);
     return await withAccess(request, "write", async (session) => {
     const releaseFilesystem = await acquireFilesystemLock();
-    let folder: AnchoredDirectory | null = null;
-    let target: AnchoredDirectory | null = null;
+    let opened: UploadDestination | null = null;
     try {
       const contentLength = Number(request.headers.get("content-length") || 0);
     if (contentLength > config.maxUploadBytes + 1024 * 1024) {
@@ -58,61 +50,12 @@ export async function POST(request: Request) {
     if (!request.body) throw new AppError("Upload body is missing");
 
     const url = new URL(request.url);
-    const baseDirectory = url.searchParams.get("path") || "";
-    const subfolders = folderNames(url.searchParams.get("folder"));
-    // The upload this request is part of (each file is its own request), so Activity can show the
-    // whole upload as one entry. Every file is still recorded on its own.
-    const batchValue = url.searchParams.get("batch");
-    const batch = batchValue && /^[A-Za-z0-9-]{8,64}$/.test(batchValue) ? batchValue : undefined;
-    folder = await openDirectory(baseDirectory).catch((error: unknown) => {
-      if (error instanceof AppError && error.code === "NOT_A_DIRECTORY") throw new AppError("Upload destination is not a folder", 400);
-      throw error;
-    });
-    const destination = folder;
-
-    const uidValue = url.searchParams.get("uid");
-    const gidValue = url.searchParams.get("gid");
-    if ((uidValue === null) !== (gidValue === null)) throw new AppError("Choose both an owner and group", 400, "INVALID_UPLOAD_OWNERSHIP");
-    let requestedOwnership: { uid: number; gid: number } | null = null;
-    if (session.role !== "owner") {
-      // Only the owner chooses ownership; other accounts' uploads take the destination folder's
-      // owner, so files a root service writes stay usable by that folder's users.
-      if (uidValue !== null || gidValue !== null) throw new AppError("Only the owner account can choose upload ownership", 403, "FORBIDDEN");
-      if (typeof process.getuid === "function" && process.getuid() === 0) {
-        requestedOwnership = { uid: destination.stat.uid, gid: destination.stat.gid };
-      }
-    } else if (uidValue !== null && gidValue !== null) {
-      const uid = Number(uidValue);
-      const gid = Number(gidValue);
-      const preference = (await getPreferences()).uploadOwnership;
-      const savedDefault = preference.mode === "fixed" ? { uid: preference.uid, gid: preference.gid } : undefined;
-      if (!(await isAvailableUploadOwnership(baseDirectory, uid, gid, savedDefault))) {
-        throw new AppError("That owner and group are not available for this folder", 400, "INVALID_UPLOAD_OWNERSHIP");
-      }
-      requestedOwnership = { uid, gid };
+    opened = await openUploadDestination(url, session);
+    const { into, directory, ownership: requestedOwnership, batch } = opened;
+    if (url.searchParams.get("createFolder") === "1") {
+      if (!opened.subfolders.length) throw new AppError("Choose a folder", 400, "INVALID_FOLDER");
+      return NextResponse.json({ ok: true, folder: directory });
     }
-
-    // Uploading a folder: its top folder is made first (always new, so nothing is merged into an
-    // existing folder by accident), and each file then goes into its place inside it, with any
-    // folders on the way created as needed.
-    let directory = baseDirectory;
-    if (subfolders.length) {
-      // Other accounts' new folders take the owner of the folder each is made in, as their other new
-      // items do; the owner's choice (if any) applies throughout.
-      const inherit = session.role !== "owner";
-      const ensured = await ensureFolders(destination, baseDirectory, subfolders, { owner: inherit ? null : requestedOwnership, inheritOwner: inherit && requestedOwnership !== null, uniqueFirst: url.searchParams.get("unique") === "1" });
-      target = ensured.folder;
-      directory = ensured.relative;
-      if (inherit && requestedOwnership) requestedOwnership = { uid: target.stat.uid, gid: target.stat.gid };
-      // Every folder made is recorded now, under its actual name, even if the upload then fails.
-      for (const made of ensured.made) {
-        await audit("fs.create", { username: session.username, path: made.split("/").slice(0, -1).join("/"), name: made.split("/").at(-1), upload: true, batch });
-      }
-      if (url.searchParams.get("createFolder") === "1") return NextResponse.json({ ok: true, folder: directory });
-    } else if (url.searchParams.get("createFolder") === "1") {
-      throw new AppError("Choose a folder", 400, "INVALID_FOLDER");
-    }
-    const into = target ?? destination;
 
     const uploaded: string[] = [];
     const createdTargets: Array<{ name: string; created: Stats }> = [];
@@ -158,17 +101,7 @@ export async function POST(request: Request) {
             // Ownership is applied before writing because the write stream closes the handle when
             // it finishes. A stream created with autoClose: false keeps a reference that makes
             // FileHandle.close() wait forever, which hung every upload on current Node releases.
-            if (requestedOwnership) {
-              try {
-                await handle.chown(requestedOwnership.uid, requestedOwnership.gid);
-              } catch (error) {
-                const code = (error as NodeJS.ErrnoException).code;
-                if (code === "EPERM" || code === "EACCES") {
-                  throw new AppError("FilesDude cannot apply that ownership. Run the service as root or choose service ownership.", 403, "CHOWN_DENIED");
-                }
-                throw error;
-              }
-            }
+            await applyOwnership(handle, requestedOwnership);
             stream.resume();
             await pipeline(stream, meter, handle.createWriteStream());
             if (truncated) throw new AppError("Upload is larger than the configured limit", 413, "UPLOAD_TOO_LARGE");
@@ -212,8 +145,7 @@ export async function POST(request: Request) {
     await audit("fs.upload", { username: session.username, directory, files: uploaded, bytes: totalBytes, ownership: requestedOwnership || "service", batch });
     return NextResponse.json({ ok: true, uploaded, ownership: requestedOwnership || null });
     } finally {
-      await target?.handle.close().catch(() => undefined);
-      await folder?.handle.close().catch(() => undefined);
+      await opened?.close();
       releaseFilesystem();
     }
     });

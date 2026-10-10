@@ -1,10 +1,22 @@
 import { constants } from "node:fs";
-import fsp from "node:fs/promises";
+import fsp, { type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
 import { config } from "./config";
 import { INTERNAL_NAMES, inside, safeResolve, type AnchoredDirectory } from "./files";
 import { AppError } from "./http";
+
+/** Gives an uploaded file its owner and group, through its open handle. */
+export async function applyOwnership(handle: FileHandle, ownership: { uid: number; gid: number } | null) {
+  if (!ownership) return;
+  try {
+    await handle.chown(ownership.uid, ownership.gid);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "EPERM" || code === "EACCES") throw new AppError("FilesDude cannot apply that ownership. Run the service as root or choose service ownership.", 403, "CHOWN_DENIED");
+    throw error;
+  }
+}
 
 export function uploadName(raw: string) {
   const name = path.basename(raw).trim();
