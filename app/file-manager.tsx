@@ -2264,7 +2264,7 @@ type TrashConfirmation = { kind: "delete"; items: TrashItem[] } | { kind: "empty
 const SHARE_EXPIRY_OPTIONS = [{ hours: 1, label: "1 hour" }, { hours: 24, label: "1 day" }, { hours: 168, label: "7 days" }, { hours: 720, label: "30 days" }];
 const SHARE_LIMIT_OPTIONS = [{ value: "none", label: "No limit" }, { value: "1", label: "1 download (single use)" }, { value: "5", label: "5 downloads" }, { value: "25", label: "25 downloads" }];
 const UPLOAD_SIZE_OPTIONS = [{ bytes: 100 * 1024 ** 2, label: "100 MB" }, { bytes: 1024 ** 3, label: "1 GB" }, { bytes: 10 * 1024 ** 3, label: "10 GB" }, { bytes: 100 * 1024 ** 3, label: "100 GB" }];
-const UPLOAD_FILES_OPTIONS = [{ value: "none", label: "No limit" }, { value: "1", label: "1 file" }, { value: "10", label: "10 files" }, { value: "100", label: "100 files" }];
+const UPLOAD_FILES_OPTIONS = [{ value: "1", label: "1 file" }, { value: "10", label: "10 files" }, { value: "100", label: "100 files" }, { value: "1000", label: "1,000 files" }, { value: "none", label: "Up to 10,000 files" }];
 
 function useShareLinks(notify: (message: string, tone?: "error") => void, onChanged: () => Promise<void>) {
   const [links, setLinks] = useState<ShareLink[] | null>(null);
@@ -2319,7 +2319,7 @@ function ShareDialog({ entry, onClose, notify, onChanged }: { entry: FileEntry; 
   const [limit, setLimit] = useState("none");
   const [kind, setKind] = useState<"download" | "upload">("download");
   const [uploadSize, setUploadSize] = useState(UPLOAD_SIZE_OPTIONS[1].bytes);
-  const [uploadFiles, setUploadFiles] = useState("none");
+  const [uploadFiles, setUploadFiles] = useState("100");
   const [busy, setBusy] = useState(false);
   const mine = links?.filter((link) => link.path === entry.path) ?? [];
   const uploading = entry.type === "directory" && kind === "upload";

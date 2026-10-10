@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { config } from "../lib/config";
-import { createShare, createUploadLink, listShares, recordShareDownload, reserveUpload, revokeShare } from "../lib/shares";
+import { createShare, createUploadLink, listShares, recordShareDownload, reserveUpload, resolveShareToken, revokeShare, uploadRoom, type UploadShare } from "../lib/shares";
 import { GET as download } from "../app/s/[token]/download/route";
 import { POST as upload } from "../app/s/[token]/upload/route";
 
@@ -57,11 +57,20 @@ test("anyone with an upload link can add files to its folder, never replacing an
     assert.equal((await send(token, [{ name: `invoice\u202Etxt.exe`, content: "x" }])).status, 200);
     assert.equal((await send(token, [{ name: "Café 写真.jpg", content: "x" }])).status, 200);
     assert.deepEqual(await inbox(root), ["Café 写真.jpg", "escape.txt", "invoice_txt.exe", "photo.jpg", "report (1).pdf", "report.pdf"]);
-    assert.equal((await send(token, [{ name: ".filedude", content: "x" }])).status, 403);
+    // Hidden names (FilesDude's own folder among them) become visible ones.
+    assert.equal((await send(token, [{ name: ".filedude", content: "x" }])).status, 200);
+    assert.equal((await send(token, [{ name: ".htaccess", content: "x" }])).status, 200);
+    assert.ok((await inbox(root)).includes("_filedude") && (await inbox(root)).includes("_htaccess"));
+    await fs.rm(path.join(root, "inbox", "_filedude"));
+    await fs.rm(path.join(root, "inbox", "_htaccess"));
+    // Empty files aren't taken.
+    assert.equal((await send(token, [{ name: "empty.txt", content: "" }])).status, 400);
+    assert.ok(!(await inbox(root)).includes("empty.txt"));
 
     const [stored] = await listShares();
-    assert.equal(stored.uploadedFiles, 5);
-    assert.equal(stored.uploadedBytes, "jpeg bytes".length + "a stranger's report".length + 3);
+    assert.equal(stored.uploadedFiles, 7);
+    // Each file counts at least 4 KB, so tiny files can't be sent without end.
+    assert.equal(stored.uploadedBytes, 7 * 4096);
     const audit = await fs.readFile(path.join(config.stateDir, "audit.jsonl"), "utf8");
     assert.match(audit, /"event":"share\.upload".*"name":"photo\.jpg".*"from":"Sam"/);
   });
@@ -122,6 +131,34 @@ test("upload links keep to their size and file limits, and leave nothing behind 
     const settleAgain = await reserveUpload(small.id, 600 * 1024);
     await settleAgain(600 * 1024);
     await assert.rejects(reserveUpload(small.id, 600 * 1024), /larger than the room left/);
+  });
+});
+
+test("names that are taken never run out or say what's in the folder", async () => {
+  await withRoot(async (root) => {
+    const link = await createUploadLink("inbox", 24, 100 * 1024 * 1024, null);
+    const token = tokenOf(link.url);
+    assert.equal(uploadRoom((await resolveShareToken(token)) as UploadShare).files, 10_000);
+    await fs.writeFile(path.join(root, "inbox", "a.txt"), "owner");
+    for (let index = 1; index <= 20; index += 1) await fs.writeFile(path.join(root, "inbox", `a (${index}).txt`), "owner");
+    assert.equal((await send(token, [{ name: "a.txt", content: "new" }])).status, 200);
+    const random = (await inbox(root)).filter((name) => /^a-[A-Za-z0-9_-]{8}\.txt$/.test(name));
+    assert.equal(random.length, 1);
+
+    // Whatever is in the way of a name, the answer is the same.
+    await fs.symlink("/etc/passwd", path.join(root, "inbox", "outside.txt"));
+    await fs.symlink("loop.txt", path.join(root, "inbox", "loop.txt"));
+    assert.equal((await send(token, [{ name: "outside.txt", content: "x" }])).status, 200);
+    assert.equal((await send(token, [{ name: "loop.txt", content: "x" }])).status, 200);
+    assert.equal((await fs.lstat(path.join(root, "inbox", "outside.txt"))).isSymbolicLink(), true);
+    assert.equal(await fs.readFile(path.join(root, "inbox", "outside (1).txt"), "utf8"), "x");
+
+    // A long name that's taken is shortened to fit its number.
+    const long = `${"n".repeat(250)}.txt`;
+    await fs.writeFile(path.join(root, "inbox", long), "owner");
+    assert.equal((await send(token, [{ name: long, content: "x" }])).status, 200);
+    const shortened = (await inbox(root)).find((name) => name.endsWith(" (1).txt") && name.startsWith("nnn"));
+    assert.ok(shortened && Buffer.byteLength(shortened) <= 255);
   });
 });
 

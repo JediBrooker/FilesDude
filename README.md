@@ -261,18 +261,24 @@ copy and revoke buttons.
 
 To collect files from someone without an account, right-click a folder, choose
 **Share link…**, and pick **Upload**. Choose how long the link lasts, the total size it
-takes (100 MB to 100 GB), and optionally how many files. The person opening the link
+takes (100 MB to 100 GB), and how many files (up to 10,000). The person opening the link
 sees only the folder's name and a place to drop files, with an optional box for their
 name, and each file shows its progress as it uploads.
 
 - People with an upload link can't see, open, download, change, or delete anything in
   the folder, and the link can't be used as a download link.
-- Files never replace anything: a name that's taken gets a number, as in `report (1).pdf`.
-  Invisible and direction-changing characters in names are replaced with `_`.
-- Each file can be at most `FILEDUDE_MAX_UPLOAD_MB`. Uploads stop when the link's size or
-  file limit is reached, and always leave 2 GB free on the disk. A server takes at most 8
-  uploads through links at once, 3 per address, and drops any that stop sending data
-  for a minute.
+- Files never replace anything: a name that's taken gets a number, as in `report (1).pdf`
+  (or a random ending once many are taken). Invisible and direction-changing characters
+  in names are replaced with `_`, and a leading dot becomes `_`, so nothing arrives
+  hidden (such as `.htaccess`).
+- Each file can be at most `FILEDUDE_MAX_UPLOAD_MB`, and counts at least 4 KB against the
+  link; empty files aren't taken. Uploads stop when the link's size or file limit is
+  reached, and always leave 2 GB free on the folder's disk.
+- A server takes at most 8 uploads through links at once, 3 per link and 3 per address
+  (IPv6 addresses count by /64). An upload that stops sending data for a minute, or runs
+  slower than 64 KB/s overall, is dropped.
+- Behind Cloudflare, its request size limit (100 MB on the Free and Pro plans) also
+  applies to each file.
 - When FilesDude runs as root, received files belong to the folder's owner.
 - Every file received is recorded in Activity, with the sender's address and the name
   they gave. **Shared links** shows how much each upload link has received.

@@ -201,8 +201,16 @@ export function uploadRoom(share: UploadShare) {
   const pending = uploadsInProgress.get(share.id) ?? { bytes: 0, files: 0 };
   return {
     bytes: Math.max(0, share.maxBytes - share.uploadedBytes - pending.bytes),
-    files: share.maxFiles === null ? null : Math.max(0, share.maxFiles - share.uploadedFiles - pending.files),
+    // "No limit" still means at most MAX_UPLOAD_LINK_FILES, so a link can't fill a folder with entries.
+    files: Math.max(0, (share.maxFiles ?? MAX_UPLOAD_LINK_FILES) - share.uploadedFiles - pending.files),
   };
+}
+
+/** Bytes promised to all uploads through links that are still in progress. */
+export function bytesInProgress() {
+  let total = 0;
+  for (const pending of uploadsInProgress.values()) total += pending.bytes;
+  return total;
 }
 
 /**

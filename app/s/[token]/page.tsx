@@ -53,7 +53,7 @@ export default async function SharePage({ params }: { params: Promise<{ token: s
                   <small>You can add files here, but not see what&apos;s already in the folder.</small>
                 </div>
               </div>
-              <UploadDrop token={token} folderName={share.name} perFileBytes={config.maxUploadBytes} roomBytes={room.bytes} roomFiles={room.files} />
+              <UploadDrop token={token} folderName={share.name} perFileBytes={config.maxUploadBytes} roomBytes={room.bytes} roomFiles={share.maxFiles === null ? null : room.files} />
               <p className="share-meta"><Clock size={14} /> This link expires in {expiresIn(share.expiresAt)}.</p>
             </>
           ) : (
