@@ -158,6 +158,13 @@ export interface ShareLink {
   /** Null when downloads are unlimited until the link expires. */
   maxDownloads: number | null;
   downloads: number;
+  /** "upload" links let anyone add files to the folder instead of downloading it. */
+  kind: "download" | "upload";
+  /** Upload links: the total size and number of files allowed (null for any number), and received so far. */
+  maxBytes?: number;
+  maxFiles?: number | null;
+  uploadedBytes?: number;
+  uploadedFiles?: number;
   /** The public path to share, e.g. /s/<token>; the browser adds its own origin. */
   url: string;
 }

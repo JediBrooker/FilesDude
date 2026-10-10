@@ -2263,6 +2263,8 @@ type TrashConfirmation = { kind: "delete"; items: TrashItem[] } | { kind: "empty
 
 const SHARE_EXPIRY_OPTIONS = [{ hours: 1, label: "1 hour" }, { hours: 24, label: "1 day" }, { hours: 168, label: "7 days" }, { hours: 720, label: "30 days" }];
 const SHARE_LIMIT_OPTIONS = [{ value: "none", label: "No limit" }, { value: "1", label: "1 download (single use)" }, { value: "5", label: "5 downloads" }, { value: "25", label: "25 downloads" }];
+const UPLOAD_SIZE_OPTIONS = [{ bytes: 100 * 1024 ** 2, label: "100 MB" }, { bytes: 1024 ** 3, label: "1 GB" }, { bytes: 10 * 1024 ** 3, label: "10 GB" }, { bytes: 100 * 1024 ** 3, label: "100 GB" }];
+const UPLOAD_FILES_OPTIONS = [{ value: "none", label: "No limit" }, { value: "1", label: "1 file" }, { value: "10", label: "10 files" }, { value: "100", label: "100 files" }];
 
 function useShareLinks(notify: (message: string, tone?: "error") => void, onChanged: () => Promise<void>) {
   const [links, setLinks] = useState<ShareLink[] | null>(null);
@@ -2300,7 +2302,7 @@ function ShareLinkRow({ link, showLocation, onCopy, onRevoke }: { link: ShareLin
     <div className="share-link-row">
       <div className="share-link-info">
         {showLocation && <strong title={`/${link.path}`}>{link.type === "directory" ? <Folder size={14} /> : <File size={14} />}{link.name}<small>{folderLabel(parentOf(link.path))}</small></strong>}
-        <span>Expires {formatDateTime(link.expiresAt)} · {link.maxDownloads === null ? `${link.downloads} ${link.downloads === 1 ? "download" : "downloads"}` : `${link.downloads} of ${link.maxDownloads} downloads used`}</span>
+        <span>{link.kind === "upload" ? <><span className="share-kind">Upload link</span> Expires {formatDateTime(link.expiresAt)} · {link.uploadedFiles ?? 0}{link.maxFiles ? ` of ${link.maxFiles}` : ""} {(link.maxFiles ?? link.uploadedFiles) === 1 ? "file" : "files"} received · {formatBytes(link.uploadedBytes ?? 0)} of {formatBytes(link.maxBytes ?? 0)} used</> : <>Expires {formatDateTime(link.expiresAt)} · {link.maxDownloads === null ? `${link.downloads} ${link.downloads === 1 ? "download" : "downloads"}` : `${link.downloads} of ${link.maxDownloads} downloads used`}</>}</span>
       </div>
       <div className="share-link-actions">
         <input readOnly value={shareAddress(link)} aria-label={`Link to ${link.name}`} onFocus={(event) => event.currentTarget.select()} />
@@ -2315,13 +2317,20 @@ function ShareDialog({ entry, onClose, notify, onChanged }: { entry: FileEntry; 
   const { links, setLinks, enabled, copy, revoke } = useShareLinks(notify, onChanged);
   const [hours, setHours] = useState(168);
   const [limit, setLimit] = useState("none");
+  const [kind, setKind] = useState<"download" | "upload">("download");
+  const [uploadSize, setUploadSize] = useState(UPLOAD_SIZE_OPTIONS[1].bytes);
+  const [uploadFiles, setUploadFiles] = useState("none");
   const [busy, setBusy] = useState(false);
   const mine = links?.filter((link) => link.path === entry.path) ?? [];
+  const uploading = entry.type === "directory" && kind === "upload";
   const create = async (event: FormEvent) => {
     event.preventDefault();
     setBusy(true);
     try {
-      const { share } = await requestJson<{ share: ShareLink }>("/api/shares", { method: "POST", body: JSON.stringify({ action: "create", path: entry.path, hours, maxDownloads: limit === "none" ? null : Number(limit) }) });
+      const request = uploading
+        ? { action: "create", kind: "upload", path: entry.path, hours, maxBytes: uploadSize, maxFiles: uploadFiles === "none" ? null : Number(uploadFiles) }
+        : { action: "create", path: entry.path, hours, maxDownloads: limit === "none" ? null : Number(limit) };
+      const { share } = await requestJson<{ share: ShareLink }>("/api/shares", { method: "POST", body: JSON.stringify(request) });
       setLinks((current) => [share, ...(current ?? [])]);
       notify(await copyText(shareAddress(share)) ? "Link created and copied" : "Link created");
       await onChanged();
@@ -2332,14 +2341,21 @@ function ShareDialog({ entry, onClose, notify, onChanged }: { entry: FileEntry; 
     }
   };
   return (
-    <Modal title={`Share ${entry.name}`} subtitle="Anyone with the link can download it without signing in" icon={<Link2 size={19} />} onClose={onClose} wide>
+    <Modal title={`Share ${entry.name}`} subtitle={uploading ? "Anyone with the link can add files to this folder without signing in" : "Anyone with the link can download it without signing in"} icon={<Link2 size={19} />} onClose={onClose} wide>
       <form onSubmit={create}>
         {!enabled && <div className="warning-box"><CircleAlert size={17} /> Sharing is turned off on this server (FILEDUDE_SHARING_ENABLED=false).</div>}
+        {entry.type === "directory" && <div className="share-kind-choice" role="radiogroup" aria-label="What the link does">
+          <button type="button" role="radio" aria-checked={kind === "download"} className={kind === "download" ? "active" : ""} onClick={() => setKind("download")}><Download size={16} /><span><strong>Download</strong><small>People get a ZIP of the folder</small></span></button>
+          <button type="button" role="radio" aria-checked={kind === "upload"} className={kind === "upload" ? "active" : ""} onClick={() => setKind("upload")}><FolderUp size={16} /><span><strong>Upload</strong><small>People send files into the folder</small></span></button>
+        </div>}
         <div className="field-pair">
           <FormField label="Link expires after"><select value={hours} onChange={(event) => setHours(Number(event.target.value))} disabled={!enabled}>{SHARE_EXPIRY_OPTIONS.map((option) => <option key={option.hours} value={option.hours}>{option.label}</option>)}</select></FormField>
-          <FormField label="Downloads allowed"><select value={limit} onChange={(event) => setLimit(event.target.value)} disabled={!enabled}>{SHARE_LIMIT_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></FormField>
+          {uploading
+            ? <FormField label="Total size allowed"><select value={uploadSize} onChange={(event) => setUploadSize(Number(event.target.value))} disabled={!enabled}>{UPLOAD_SIZE_OPTIONS.map((option) => <option key={option.bytes} value={option.bytes}>{option.label}</option>)}</select></FormField>
+            : <FormField label="Downloads allowed"><select value={limit} onChange={(event) => setLimit(event.target.value)} disabled={!enabled}>{SHARE_LIMIT_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></FormField>}
         </div>
-        <div className="info-box"><Info size={17} /> {entry.type === "directory" ? "The folder downloads as a ZIP file of its current contents." : "The file always downloads; it never opens in the browser."} Links use this address ({typeof window === "undefined" ? "" : window.location.host}), so people can only open them if they can reach FilesDude here.</div>
+        {uploading && <FormField label="Files allowed"><select value={uploadFiles} onChange={(event) => setUploadFiles(event.target.value)} disabled={!enabled}>{UPLOAD_FILES_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></FormField>}
+        <div className="info-box"><Info size={17} /> {uploading ? "People with the link can add files but can't see, open, change, or download anything in the folder. Files never replace what's there; a name that's taken gets a number." : entry.type === "directory" ? "The folder downloads as a ZIP file of its current contents." : "The file always downloads; it never opens in the browser."} Links use this address ({typeof window === "undefined" ? "" : window.location.host}), so people can only open them if they can reach FilesDude here.</div>
         {links === null ? <div className="ownership-loading"><LoaderCircle className="spin" size={18} /> Loading links…</div> : mine.length > 0 && <div className="share-links"><p className="share-links-title">Active links to this {entry.type === "directory" ? "folder" : "file"}</p>{mine.map((link) => <ShareLinkRow key={link.id} link={link} onCopy={copy} onRevoke={revoke} />)}</div>}
         <ModalActions onClose={onClose} submitLabel={mine.length ? "Create another link" : "Create link"} busy={busy} disabled={!enabled} />
       </form>
@@ -2446,7 +2462,7 @@ function ActivityDialog({ owner, onClose }: { owner: string; onClose: () => void
               lastDay = day;
               const { parts, detail, tone } = describeActivity(entry);
               const user = activityUser(entry);
-              const actor = entry.event === "login.failed" || !user ? "Someone" : user === SYSTEM_ACTOR ? "FilesDude" : user === SHARE_LINK_ACTOR ? "A share link" : user;
+              const actor = entry.event === "login.failed" || !user ? "Someone" : user === SYSTEM_ACTOR ? "FilesDude" : user === SHARE_LINK_ACTOR ? (entry.event === "share.upload" ? "An upload link" : "A share link") : user;
               const kind = activityCategory(entry.event);
               return (
                 <div key={`${entry.at}-${index}`}>
@@ -2475,7 +2491,7 @@ function ActivityDialog({ owner, onClose }: { owner: string; onClose: () => void
 function SharesDialog({ onClose, notify, onChanged }: { onClose: () => void; notify: (message: string, tone?: "error") => void; onChanged: () => Promise<void> }) {
   const { links, enabled, copy, revoke } = useShareLinks(notify, onChanged);
   return (
-    <Modal title="Shared links" subtitle="Everything currently downloadable without signing in" icon={<Link2 size={19} />} onClose={onClose} wide>
+    <Modal title="Shared links" subtitle="Everything people can download, or upload to, without signing in" icon={<Link2 size={19} />} onClose={onClose} wide>
       <div className="storage-browser">
         {!enabled && <div className="warning-box"><CircleAlert size={17} /> Sharing is turned off on this server, so no links work.</div>}
         {links === null ? <div className="storage-scan-state"><LoaderCircle className="spin" size={25} /><strong>Loading links…</strong></div>

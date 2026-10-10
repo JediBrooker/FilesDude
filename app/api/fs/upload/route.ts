@@ -1,53 +1,19 @@
-import { constants, type Stats } from "node:fs";
-import fsp from "node:fs/promises";
-import path from "node:path";
+import type { Stats } from "node:fs";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import Busboy from "busboy";
 import { withAccess } from "@/lib/access";
 import { config } from "@/lib/config";
 import { audit } from "@/lib/audit";
-import { acquireFilesystemLock, ensureFolders, inside, isAvailableUploadOwnership, MAX_UPLOAD_FOLDER_DEPTH, openDirectory, removeIfSame, resolveOwnershipPair, safeResolve, uploadOwnershipOptions, withFilesystemLock, type AnchoredDirectory } from "@/lib/files";
+import { acquireFilesystemLock, ensureFolders, isAvailableUploadOwnership, MAX_UPLOAD_FOLDER_DEPTH, openDirectory, removeIfSame, resolveOwnershipPair, uploadOwnershipOptions, withFilesystemLock, type AnchoredDirectory } from "@/lib/files";
 import { assertMutationRequest, AppError, jsonError } from "@/lib/http";
 import { getPreferences } from "@/lib/preferences";
 import { NextResponse } from "next/server";
 import type { UploadOwnershipOptions } from "@/lib/types";
+import { reserveTarget, uploadName } from "@/lib/upload-target";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-function uploadName(raw: string) {
-  const name = path.basename(raw).trim();
-  if (!name || name === "." || name === ".." || name.includes("\0") || name.includes("/") || name.includes("\\") || Buffer.byteLength(name, "utf8") > 255) {
-    throw new AppError("An uploaded file has an invalid name", 400, "INVALID_NAME");
-  }
-  return name;
-}
-
-// Files are created inside the destination folder's open handle, so the folder can't be swapped for
-// a symlink between the check and the write.
-async function reserveTarget(folder: AnchoredDirectory, directory: string, name: string) {
-  const extension = path.extname(name);
-  const stem = extension ? name.slice(0, -extension.length) : name;
-  for (let index = 0; index < 10_000; index += 1) {
-    const candidateName = index === 0 ? name : `${stem} (${index})${extension}`;
-    const relative = [directory, candidateName].filter(Boolean).join("/");
-    await safeResolve(relative, { mustExist: false });
-    try {
-      const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW;
-      const handle = await fsp.open(inside(folder, candidateName), flags, 0o640);
-      try {
-        return { name: candidateName, relative, handle, created: await handle.stat() };
-      } catch (error) {
-        await handle.close().catch(() => undefined);
-        throw error;
-      }
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    }
-  }
-  throw new AppError("Unable to choose an available upload name", 409);
-}
 
 // The folder inside the destination a file goes into, when uploading a folder: "Photos/2024".
 function folderNames(raw: string | null) {
@@ -158,6 +124,8 @@ export async function POST(request: Request) {
     try {
       parser = Busboy({
         headers: Object.fromEntries(request.headers.entries()),
+        // Browsers send file names as UTF-8; busboy otherwise reads them as Latin-1 and garbles them.
+        defParamCharset: "utf8",
         limits: { files: 100, fileSize: config.maxUploadBytes, fields: 5, parts: 105 },
       });
     } catch {

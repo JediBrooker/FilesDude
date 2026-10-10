@@ -5,7 +5,7 @@ import { appendDirectory, reservedPathCheck } from "@/lib/archives";
 import { audit } from "@/lib/audit";
 import { clientAddress } from "@/lib/auth";
 import { acquireFilesystemLock, getMime } from "@/lib/files";
-import { openSharedItem, recordShareDownload, resolveShareToken } from "@/lib/shares";
+import { isUploadShare, openSharedItem, recordShareDownload, resolveShareToken } from "@/lib/shares";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -62,7 +62,8 @@ function parseRange(header: string, size: number) {
 
 export async function GET(request: Request, { params }: { params: Promise<{ token: string }> }) {
   const share = await resolveShareToken((await params).token);
-  if (!share) return unavailable();
+  // An upload link only lets people add files; it never shows or downloads what's there.
+  if (!share || isUploadShare(share)) return unavailable();
   // The lock covers only opening the item; counting, auditing, and streaming happen after it.
   const release = await acquireFilesystemLock();
   const opened = await openSharedItem(share).finally(release);
