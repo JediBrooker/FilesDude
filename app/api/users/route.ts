@@ -5,6 +5,7 @@ import { assertMutationRequest, AppError, jsonError, readJsonBody } from "@/lib/
 import { cancelAccountUploads } from "@/lib/chunked-uploads";
 import { cancelAccountJobs } from "@/lib/jobs";
 import { removeAccountPasskeys } from "@/lib/passkeys";
+import { forgetAccountWatching } from "@/lib/watching";
 import { resetTwoFactor } from "@/lib/two-factor";
 import { createUser, deleteUser, listUsers, updateUser } from "@/lib/users";
 
@@ -64,6 +65,7 @@ export async function POST(request: Request) {
           cancelAccountJobs(id);
           await cancelAccountUploads(id);
           await removeAccountPasskeys(id);
+          await forgetAccountWatching(id);
           await audit("users.delete", { username: session.username, account: user.username });
           break;
         default:
