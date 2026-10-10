@@ -34,14 +34,14 @@ export async function POST(request: Request) {
         }
         case "update": {
           // Uploads in progress to the server end first, so their temporary files are removed with the old settings.
-          await cancelConnectionUploads(id);
+          cancelConnectionUploads(id);
           const connection = await updateConnection(id, body);
           await closeSession(id);
           await audit("connections.update", { username: session.username, name: connection.name, host: connection.host, port: connection.port, account: connection.username });
           return NextResponse.json({ connection });
         }
         case "delete": {
-          await cancelConnectionUploads(id);
+          cancelConnectionUploads(id);
           const connection = await deleteConnection(id);
           await closeSession(id);
           await audit("connections.delete", { username: session.username, name: connection.name, host: connection.host });

@@ -18,7 +18,7 @@ import { addressGroup, applyOwnership, publicName, reservePublicTarget, reserveT
 // front of FilesDude allows (Cloudflare's is 100 MB) and an interrupted upload carries on where it
 // stopped. The pieces are written in order into a visible "name (uploading)" placeholder, journaled
 // like a copy's so a restart doesn't leave it behind; once complete it's given its real name.
-export const CHUNK_BYTES = 32 * 1024 * 1024;
+export const CHUNK_BYTES = 16 * 1024 * 1024;
 const MAX_CHUNK_BYTES = 64 * 1024 * 1024;
 const MAX_PER_ACCOUNT = 4;
 const MAX_UPLOADS = 32;
@@ -29,6 +29,7 @@ const IDLE_MS = 30 * 60_000;
 // per address, a shorter idle time, a deadline (a minute plus the file at a slow 64 KB/s), and the
 // disk always keeps some space free.
 const LINK_IDLE_MS = 5 * 60_000;
+const PIECE_IDLE_MS = 60_000;
 const SLOWEST_BYTES_PER_SECOND = 64 * 1024;
 const LINK_KEEP_FREE_BYTES = 2 * 1024 ** 3;
 const MIN_FILE_COST = 4096;
@@ -68,6 +69,10 @@ type ChunkedUpload = {
   size: number;
   received: number;
   busy: boolean;
+  /** A finish is under way: it's left to complete rather than discarded. */
+  finishing: boolean;
+  /** Bytes of the piece being received, not yet counted in `received`. */
+  inFlight: number;
   lastActivity: number;
 };
 
@@ -97,14 +102,15 @@ function placeholderName(name: string) {
 }
 
 function expired(upload: ChunkedUpload, now = Date.now()) {
-  // A piece or a finish in progress is left to end first.
-  if (upload.busy) return false;
+  // A finish in progress is left to complete. A piece in progress isn't protected: discarding closes
+  // the file, so its write fails and nothing is left behind.
+  if (upload.finishing) return false;
   if (upload.deadline !== null && now > upload.deadline) return true;
   if (upload.owner.kind === "link") {
     // A stranger's upload has to keep up a slow but steady pace after its first two minutes, so it
-    // can't hold the link's room with a byte now and then.
+    // can't hold the link's room with a byte now and then (the piece arriving counts).
     const elapsed = now - upload.startedAt - 120_000;
-    if (elapsed > 0 && upload.received < (elapsed / 1000) * SLOWEST_BYTES_PER_SECOND) return true;
+    if (elapsed > 0 && upload.received + upload.inFlight < (elapsed / 1000) * SLOWEST_BYTES_PER_SECOND) return true;
   }
   return now - upload.lastActivity > (upload.owner.kind === "link" ? LINK_IDLE_MS : IDLE_MS);
 }
@@ -162,6 +168,8 @@ async function begin(owner: UploadOwner, destination: PieceDestination, name: st
       size,
       received: 0,
       busy: false,
+      finishing: false,
+      inFlight: 0,
       lastActivity: Date.now(),
       startedAt: Date.now(),
       discarded: false,
@@ -187,7 +195,10 @@ function checkSize(rawSize: unknown) {
 // in pieces, and everything promised to uploads through links (in pieces or not).
 async function freeBytes(folder: PieceDestination["into"]) {
   const disk = await fsp.statfs(folder.base);
-  return Number(disk.bavail) * Number(disk.bsize) - accountBytesStillComing() - linkBytesInProgress();
+  // Link uploads in pieces are promised their whole size, but what they've written is already off
+  // the free space, so it's added back.
+  const linkPiecesWritten = [...uploads.values()].reduce((total, upload) => total + (upload.owner.kind === "link" ? upload.received : 0), 0);
+  return Number(disk.bavail) * Number(disk.bsize) - accountBytesStillComing() - linkBytesInProgress() + linkPiecesWritten;
 }
 
 /** Space accounts' uploads in pieces have still to write. */
@@ -248,7 +259,7 @@ export async function startLinkUpload(share: UploadShare, address: string, rawNa
     return await begin(owner, destination, name, size, { from, settle, releaseSlot, deadline: Date.now() + 60_000 + (size / SLOWEST_BYTES_PER_SECOND) * 1000 });
   } catch (error) {
     await folder?.handle.close().catch(() => undefined);
-    await settle?.();
+    await settle?.().catch(() => undefined);
     releaseSlot();
     throw error;
   } finally {
@@ -277,8 +288,14 @@ export async function appendChunk(owner: UploadOwner, id: unknown, rawOffset: un
   if (!body) throw new AppError("The piece is missing", 400, "INVALID_UPLOAD");
   upload.busy = true;
   let written = 0;
+  // A piece that sends nothing for a minute is given up on, so it can't hold the upload open.
+  const idle = new AbortController();
+  let idleTimer = setTimeout(() => idle.abort(), PIECE_IDLE_MS);
   try {
-    for await (const chunk of Readable.fromWeb(body as never, { signal }) as AsyncIterable<Buffer>) {
+    for await (const chunk of Readable.fromWeb(body as never, { signal: AbortSignal.any([signal, idle.signal]) }) as AsyncIterable<Buffer>) {
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => idle.abort(), PIECE_IDLE_MS);
+      if (upload.discarded) throw new AppError("That upload has expired or was cancelled. Start it again.", 404, "UPLOAD_NOT_FOUND");
       if (written + chunk.length > limit) throw new AppError(declaredLength === null ? "The piece is too large" : "The piece is larger than it said", 400, "INVALID_UPLOAD");
       let done = 0;
       while (done < chunk.length) {
@@ -286,14 +303,19 @@ export async function appendChunk(owner: UploadOwner, id: unknown, rawOffset: un
         done += bytesWritten;
       }
       written += chunk.length;
+      upload.inFlight = written;
+      upload.lastActivity = Date.now();
     }
     if (declaredLength !== null ? written !== declaredLength : written === 0) throw new AppError("The piece ended early", 400, "INVALID_UPLOAD");
     upload.received += written;
     return { received: upload.received, size: upload.size };
   } catch (error) {
     await upload.handle.truncate(upload.received).catch(() => undefined);
+    if (idle.signal.aborted) throw new AppError("The piece stopped arriving", 408, "UPLOAD_STALLED");
     throw error;
   } finally {
+    clearTimeout(idleTimer);
+    upload.inFlight = 0;
     upload.busy = false;
     upload.lastActivity = Date.now();
   }
@@ -305,6 +327,7 @@ export async function finishChunkedUpload(owner: UploadOwner, id: unknown) {
   if (upload.busy) throw new AppError("A piece of this upload is still being received", 409, "UPLOAD_BUSY");
   if (upload.received !== upload.size) throw Object.assign(new AppError("The upload isn't complete yet", 409, "UPLOAD_INCOMPLETE"), { received: upload.received });
   upload.busy = true;
+  upload.finishing = true;
   const { into, directory, ownership } = upload.destination;
   const release = await acquireFilesystemLock();
   try {
@@ -364,6 +387,7 @@ export async function finishChunkedUpload(owner: UploadOwner, id: unknown) {
     return { name: placed as string, relative: [directory, placed].filter(Boolean).join("/"), bytes: upload.size, ownership, batch: upload.destination.batch, directory, from: upload.from };
   } catch (error) {
     upload.busy = false;
+    upload.finishing = false;
     throw error;
   } finally {
     release();

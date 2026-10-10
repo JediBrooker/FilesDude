@@ -75,9 +75,29 @@ test("remote uploads in pieces recover from a cut-off piece and can be cancelled
     await cancelRemoteUpload(owner, started.id);
     assert.deepEqual(await fs.readdir(path.join(remote, "backups")), []);
 
+    // Changing or removing the server ends its uploads at once; the temporary file goes in the background.
     const other = await startRemoteUpload(owner, id, "backups", "b.bin", 10);
-    await cancelConnectionUploads(id);
+    cancelConnectionUploads(id);
     assert.throws(() => remoteUploadStatus(owner, other.id), /expired or was cancelled/);
+    for (let attempt = 0; attempt < 50 && (await fs.readdir(path.join(remote, "backups"))).length; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 20));
     assert.deepEqual(await fs.readdir(path.join(remote, "backups")), []);
+
+    // Cancelling while a piece is arriving stops it and removes the upload once it has stopped.
+    const slow = await startRemoteUpload(owner, id, "backups", "c.bin", 100);
+    let push!: (data: Uint8Array) => void;
+    const body = new ReadableStream<Uint8Array>({ start(controller) { push = (data) => controller.enqueue(data); } });
+    const arriving = appendRemoteChunk(owner, slow.id, 0, 100, body, new AbortController().signal);
+    push(new Uint8Array(10));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await cancelRemoteUpload(owner, slow.id);
+    await assert.rejects(arriving);
+    assert.throws(() => remoteUploadStatus(owner, slow.id), /expired or was cancelled/);
+    assert.deepEqual(await fs.readdir(path.join(remote, "backups")), []);
+
+    // The file keeps the mode it was created with (pieces don't reset it).
+    const moded = await startRemoteUpload(owner, id, "backups", "d.bin", 4);
+    await send(moded.id, 0, Buffer.from("data"));
+    await finishRemoteUpload(owner, moded.id);
+    assert.equal((await fs.stat(path.join(remote, "backups", "d.bin"))).mode & 0o777, 0o644);
   });
 });

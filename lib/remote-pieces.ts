@@ -2,17 +2,17 @@ import crypto from "node:crypto";
 import path from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import type { Stats } from "ssh2";
+import type { SFTPWrapper, Stats } from "ssh2";
 import type { Session } from "./auth";
 import { config } from "./config";
 import { AppError } from "./http";
-import { availableRemoteName, remoteName, remotePath, sftpCall, withSftp } from "./sftp";
+import { remoteExists, remoteName, remotePath, sftpCall, withSftp } from "./sftp";
 
 // Large files uploaded to another server in pieces, each its own request, so none is bigger than a
 // proxy in front of FilesDude allows and a dropped connection carries on where it stopped. The pieces
 // are written in order into a hidden temporary file in the folder on that server, which is renamed
 // to a name nothing has ("name (1).ext") once complete, and removed if the upload is given up.
-const CHUNK_BYTES = 32 * 1024 * 1024;
+const CHUNK_BYTES = 16 * 1024 * 1024;
 const MAX_CHUNK_BYTES = 64 * 1024 * 1024;
 const MAX_UPLOADS = 4;
 const IDLE_MS = 30 * 60_000;
@@ -31,7 +31,15 @@ type RemoteUpload = {
   received: number;
   busy: boolean;
   lastActivity: number;
+  /** Stops the piece being received (to cancel while one is under way). */
+  stopPiece?: () => void;
+  cancelRequested?: boolean;
 };
+
+// A piece that makes no progress for this long is given up: a server that stopped acknowledging
+// writes is disconnected; a browser that stopped sending just loses the piece.
+const PIECE_STALL_MS = 60_000;
+const serverStalled = () => new AppError("The server stopped responding", 504, "REMOTE_STALLED");
 
 const uploads = new Map<string, RemoteUpload>();
 let starting = 0;
@@ -59,6 +67,33 @@ function find(session: Session, id: unknown) {
 async function discard(upload: RemoteUpload) {
   if (!uploads.delete(upload.id)) return;
   await withSftp(upload.connection, (sftp) => sftpCall<void>((done) => sftp.unlink(upload.temporary, done))).catch(() => undefined);
+}
+
+// Puts the finished file at a name nothing has, never over something: with the OpenSSH hard-link
+// extension where the server has it (which fails if the name is taken), otherwise by renaming.
+async function placeRemote(sftp: SFTPWrapper, directory: string, temporary: string, name: string) {
+  const extension = path.posix.extname(name);
+  const stem = name.slice(0, name.length - extension.length);
+  const hardLinks = (sftp as unknown as { _extensions?: Record<string, string> })._extensions?.["hardlink@openssh.com"] === "1";
+  for (let index = 0; index < 1_000; index += 1) {
+    const candidate = index ? `${stem} (${index})${extension}` : name;
+    const target = path.posix.join(directory, candidate);
+    if (await remoteExists(sftp, target)) continue;
+    if (!hardLinks) {
+      await sftpCall<void>((done) => sftp.rename(temporary, target, done));
+      return candidate;
+    }
+    try {
+      await sftpCall<void>((done) => sftp.ext_openssh_hardlink(temporary, target, done));
+    } catch (error) {
+      // Taken in the meantime: try the next name.
+      if (await remoteExists(sftp, target)) continue;
+      throw error;
+    }
+    await sftpCall<void>((done) => sftp.unlink(temporary, done)).catch(() => undefined);
+    return candidate;
+  }
+  throw new AppError("Unable to choose an available name on the server", 409);
 }
 
 export async function startRemoteUpload(session: Session, connection: string, folder: string, rawName: unknown, rawSize: unknown) {
@@ -106,27 +141,49 @@ export async function appendRemoteChunk(session: Session, id: unknown, rawOffset
   if (!body) throw new AppError("The piece is missing", 400, "INVALID_UPLOAD");
   upload.busy = true;
   let written = 0;
+  const stop = new AbortController();
+  upload.stopPiece = () => stop.abort();
   try {
     await withSftp(upload.connection, async (sftp) => {
+      let lastProgress = Date.now();
       const meter = new Transform({
         transform(chunk: Buffer, _encoding, done) {
           written += chunk.length;
+          lastProgress = Date.now();
           done(written > limit ? new AppError(declaredLength === null ? "The piece is too large" : "The piece is larger than it said", 400, "INVALID_UPLOAD") : null, chunk);
         },
       });
-      const target = sftp.createWriteStream(upload.temporary, { flags: "r+", start: offset });
+      // Opened here (with a time limit) and handed to the stream, so the stream doesn't open it again
+      // or change its mode: the file keeps the 0644 it was created with.
+      const handle = await sftpCall<Buffer>((done) => sftp.open(upload.temporary, "r+", done));
+      const target = sftp.createWriteStream(upload.temporary, { handle, start: offset, autoClose: true } as never);
+      let failure: AppError | null = null;
+      const watchdog = setInterval(() => {
+        if (Date.now() - lastProgress < PIECE_STALL_MS) return;
+        // Data waiting to be written means the server stopped taking it; otherwise the browser stopped.
+        failure = target.writableLength > 0 ? serverStalled() : new AppError("The piece stopped arriving", 408, "UPLOAD_STALLED");
+        stop.abort();
+      }, 5_000);
       try {
-        await pipeline(Readable.fromWeb(body as never, { signal }), meter, target);
-        // The server has the piece once the stream has closed its handle.
+        await pipeline(Readable.fromWeb(body as never, { signal: AbortSignal.any([signal, stop.signal]) }), meter, target);
+        // The server has the piece once the stream has closed its handle; one that never confirms that
+        // has stopped responding.
         await new Promise<void>((resolve, reject) => {
           if (target.closed) return resolve();
-          target.once("close", resolve);
-          target.once("error", reject);
+          const timer = setTimeout(() => reject(serverStalled()), PIECE_STALL_MS);
+          const settle = (error?: Error) => { clearTimeout(timer); if (error) reject(error); else resolve(); };
+          target.once("close", () => settle());
+          target.once("error", settle);
+          stop.signal.addEventListener("abort", () => settle(new AppError("The upload was cancelled", 400, "UPLOAD_ABORTED")), { once: true });
         });
       } catch (error) {
         target.destroy();
-        await sftpCall<void>((done) => sftp.setstat(upload.temporary, { size: upload.received } as never, done)).catch(() => undefined);
-        throw error;
+        if (!(failure && (failure as AppError).code === "REMOTE_STALLED")) {
+          await sftpCall<void>((done) => sftp.setstat(upload.temporary, { size: upload.received } as never, done)).catch(() => undefined);
+        }
+        throw failure ?? error;
+      } finally {
+        clearInterval(watchdog);
       }
     });
     if (declaredLength !== null ? written !== declaredLength : written === 0) {
@@ -137,7 +194,10 @@ export async function appendRemoteChunk(session: Session, id: unknown, rawOffset
     return { received: upload.received, size: upload.size };
   } finally {
     upload.busy = false;
+    upload.stopPiece = undefined;
     upload.lastActivity = Date.now();
+    // Cancelled while this piece was arriving: removed now that it has stopped.
+    if (upload.cancelRequested) await discard(upload);
   }
 }
 
@@ -151,9 +211,7 @@ export async function finishRemoteUpload(session: Session, id: unknown) {
     const chosen = await withSftp(upload.connection, async (sftp) => {
       const stats = await sftpCall<Stats>((done) => sftp.lstat(upload.temporary, done));
       if (!stats.isFile() || Number(stats.size) !== upload.size) throw new AppError("The file on the server isn't the one uploaded; upload it again", 409, "REMOTE_CHANGED");
-      const name = await availableRemoteName(sftp, upload.directory, upload.name);
-      await sftpCall<void>((done) => sftp.rename(upload.temporary, path.posix.join(upload.directory, name), done));
-      return name;
+      return placeRemote(sftp, upload.directory, upload.temporary, upload.name);
     });
     uploads.delete(upload.id);
     return { connection: upload.connection, folder: upload.folder, name: chosen, bytes: upload.size };
@@ -164,11 +222,26 @@ export async function finishRemoteUpload(session: Session, id: unknown) {
 
 export async function cancelRemoteUpload(session: Session, id: unknown) {
   const upload = find(session, id);
-  if (upload.busy) throw new AppError("A piece of this upload is still being received", 409, "UPLOAD_BUSY");
+  // A piece under way is stopped, and the upload removed once it has.
+  if (upload.busy) {
+    if (upload.stopPiece) {
+      upload.cancelRequested = true;
+      upload.stopPiece();
+      return;
+    }
+    throw new AppError("The upload is being finished", 409, "UPLOAD_BUSY");
+  }
   await discard(upload);
 }
 
-/** Gives up uploads to a server that was removed or changed. */
-export async function cancelConnectionUploads(connection: string) {
-  for (const upload of [...uploads.values()]) if (upload.connection === connection) await discard(upload);
+/**
+ * Gives up uploads to a server that was removed or changed, straight away; their temporary files are
+ * removed in the background, so an unreachable server doesn't hold up the change.
+ */
+export function cancelConnectionUploads(connection: string) {
+  for (const upload of [...uploads.values()]) {
+    if (upload.connection !== connection) continue;
+    upload.stopPiece?.();
+    void discard(upload);
+  }
 }
