@@ -1,4 +1,5 @@
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import crypto from "node:crypto";
 import { constants, fstatSync, readdirSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -15,13 +16,15 @@ import { config } from "./config";
 
 /**
  * Runs the tool with these arguments on an open file, returning its output, or null on failure. It
- * is stopped after `seconds` (15 by default; reading a whole large video for its subtitles needs more).
+ * is stopped after `seconds` (15 by default; reading a whole large video for its subtitles needs more),
+ * or when `signal` fires.
  */
-export type SandboxRun = (args: string[], fd: number, maxBytes: number, seconds?: number) => Promise<Buffer | null>;
+export type SandboxRun = (args: string[], fd: number, maxBytes: number, seconds?: number, signal?: AbortSignal) => Promise<Buffer | null>;
 
 const DEFAULT_SECONDS = 15;
 const MAX_SECONDS = 600;
 const SYSTEMD_RUN = "/usr/bin/systemd-run";
+const SYSTEMCTL = "/usr/bin/systemctl";
 
 /** Container formats each use may read: video thumbnails only need the video ones. */
 export const VIDEO_FORMATS = "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi";
@@ -62,7 +65,8 @@ export async function sandboxRunner(tool: string): Promise<SandboxRun | null> {
   if (typeof process.getuid !== "function" || process.getuid() !== 0) return null;
   if (!(await executable(tool)) || !(await executable(SYSTEMD_RUN))) return null;
   const hidden = hiddenPaths();
-  return async (args, fd, maxBytes, seconds = DEFAULT_SECONDS) => {
+  return async (args, fd, maxBytes, seconds = DEFAULT_SECONDS, signal) => {
+    if (signal?.aborted) return null;
     // Each run reads from its own fresh opening of the file, at its start: the tool moves the file
     // position as it reads, and an earlier run must not leave it somewhere else.
     const source = await fs.open(`/proc/self/fd/${fd}`, constants.O_RDONLY | constants.O_NOCTTY).catch(() => null);
@@ -71,19 +75,24 @@ export async function sandboxRunner(tool: string): Promise<SandboxRun | null> {
       const original = fstatSync(fd);
       const reopened = await source.stat();
       if (!reopened.isFile() || original.dev !== reopened.dev || original.ino !== reopened.ino) return null;
-      return await run(tool, hidden, args, source.fd, maxBytes, Math.min(Math.max(1, Math.round(seconds)), MAX_SECONDS));
+      const limit = Number.isFinite(seconds) ? Math.min(Math.max(1, Math.round(seconds)), MAX_SECONDS) : DEFAULT_SECONDS;
+      return await run(tool, hidden, args, source.fd, maxBytes, limit, signal);
     } finally {
       await source.close().catch(() => undefined);
     }
   };
 }
 
-function run(tool: string, hidden: string[], toolArgs: string[], fd: number, maxBytes: number, seconds: number) {
+function run(tool: string, hidden: string[], toolArgs: string[], fd: number, maxBytes: number, seconds: number, signal?: AbortSignal) {
   return new Promise<Buffer | null>((resolve) => {
+    // Each run is a named unit, so stopping it stops the tool itself, not just the client waiting on it.
+    const unit = `filesdude-media-${crypto.randomUUID()}`;
     const args = [
-      "--pipe", "--wait", "--quiet", "--collect", "--service-type=exec",
+      "--pipe", "--wait", "--quiet", "--collect", "--service-type=exec", `--unit=${unit}`,
       ...SANDBOX.flatMap((property) => ["-p", property]),
       "-p", `RuntimeMaxSec=${seconds}`,
+      // Long runs read whole videos; they yield the disk to everything else.
+      ...(seconds > DEFAULT_SECONDS ? ["-p", "IOWeight=10", "-p", "CPUWeight=20"] : []),
       // Wherever the data root and state folder are, they are out of reach too.
       "-p", `InaccessiblePaths=${[...hidden, config.root, config.stateDir].map((location) => quote(`-${path.resolve(location)}`)).join(" ")}`,
       tool, ...toolArgs,
@@ -91,25 +100,27 @@ function run(tool: string, hidden: string[], toolArgs: string[], fd: number, max
     const child = spawn(SYSTEMD_RUN, args, { stdio: [fd, "pipe", "ignore"] });
     const chunks: Buffer[] = [];
     let size = 0;
-    let tooBig = false;
+    let stopped = false;
+    const stop = () => {
+      if (stopped) return;
+      stopped = true;
+      execFile(SYSTEMCTL, ["stop", unit], () => undefined);
+      child.kill("SIGKILL");
+    };
     // A backstop in case systemd's own limit doesn't stop it.
-    const timer = setTimeout(() => child.kill("SIGKILL"), (seconds + 10) * 1000);
+    const timer = setTimeout(stop, (seconds + 10) * 1000);
+    signal?.addEventListener("abort", stop, { once: true });
     child.stdout!.on("data", (chunk: Buffer) => {
       size += chunk.length;
-      if (size > maxBytes) {
-        tooBig = true;
-        child.kill("SIGKILL");
-      } else {
-        chunks.push(chunk);
-      }
+      if (size > maxBytes) stop();
+      else chunks.push(chunk);
     });
-    child.on("error", () => {
+    const finish = (output: Buffer | null) => {
       clearTimeout(timer);
-      resolve(null);
-    });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      resolve(code === 0 && !tooBig && size > 0 ? Buffer.concat(chunks) : null);
-    });
+      signal?.removeEventListener("abort", stop);
+      resolve(output);
+    };
+    child.on("error", () => finish(null));
+    child.on("close", (code) => finish(code === 0 && !stopped && size > 0 ? Buffer.concat(chunks) : null));
   });
 }

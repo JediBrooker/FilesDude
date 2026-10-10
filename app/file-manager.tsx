@@ -3612,12 +3612,13 @@ export function PreviewDialog({ entry, siblings = [], onStep, onClose, urls = lo
   // A local video's subtitles (files beside it and tracks inside it), offered in the player's CC menu.
   const [subtitles, setSubtitles] = useState<Array<{ id: string; label: string; language?: string }>>([]);
   const local = urls === localPreviewUrls;
+  // Each preview is its own component instance (keyed by path), so these tracks are this video's.
   useEffect(() => {
     if (!local || !entry.mime.startsWith("video/")) return;
     const controller = new AbortController();
     requestJson<{ tracks: Array<{ id: string; label: string; language?: string }> }>(`/api/fs/subtitles?path=${encodePath(entry.path)}`, { signal: controller.signal })
       .then((result) => setSubtitles(result.tracks))
-      .catch(() => undefined);
+      .catch(() => setSubtitles([]));
     return () => controller.abort();
   }, [entry.path, entry.mime, local]);
   const index = siblings.findIndex((item) => item.path === entry.path);

@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { config } from "../lib/config";
-import { listSubtitles, setSubtitleRunners, srtToVtt, subtitleTrack } from "../lib/subtitles";
+import { listSubtitles, plainVtt, setSubtitleRunners, srtToVtt, subtitleTrack } from "../lib/subtitles";
 import { runInScope } from "../lib/scope";
 
 async function withRoot<T>(run: (root: string, state: string) => Promise<T>) {
@@ -91,6 +91,73 @@ test("text subtitles inside a video are listed, extracted once, and kept", async
     assert.equal((await fs.readdir(path.join(state, "subtitles"))).length, 1);
     // A picture-based track (not offered) can't be asked for.
     await assert.rejects(subtitleTrack("film.mkv", "stream:3"), /Unknown subtitle track/);
+  });
+});
+
+test("subtitle files are read only as plain files beside a real video, never through links", async () => {
+  await withRoot(async (root, state) => {
+    await write(root, { "clip.mp4": "v", "notes.txt": "private notes", "clip.\\..\\other.srt": SRT, "x.srt": SRT });
+    await fs.mkdir(state, { recursive: true });
+    await fs.writeFile(path.join(state, "users.json"), "secret hashes");
+    await fs.symlink(path.join(state, "users.json"), path.join(root, "clip.state.srt"));
+    await fs.symlink("notes.txt", path.join(root, "clip.notes.srt"));
+    setSubtitleRunners(null);
+    assert.deepEqual(await listSubtitles("clip.mp4"), []);
+    for (const id of ["file:clip.state.srt", "file:clip.notes.srt", "file:clip.\\..\\other.srt"]) await assert.rejects(subtitleTrack("clip.mp4", id), /Unknown subtitle track/, id);
+    // Only for a video that exists.
+    await assert.rejects(subtitleTrack("x", "file:x.srt"), /Only videos/);
+    await assert.rejects(subtitleTrack("missing.mp4", "file:missing.srt"));
+  });
+});
+
+test("styling blocks are removed from WebVTT", () => {
+  const vtt = "WEBVTT\n\nSTYLE\n::cue { background-image: url(https://example.com/track.png) }\n\nREGION\nid:a\n\n00:00.000 --> 00:01.000\nHi\n";
+  assert.equal(plainVtt(vtt), "WEBVTT\n\n00:00.000 --> 00:01.000\nHi\n");
+  assert.equal(plainVtt("00:00.000 --> 00:01.000\nNo header"), "WEBVTT\n\n00:00.000 --> 00:01.000\nNo header\n");
+});
+
+test("extractions are shared, failures aren't retried, each account queues one, and leaving stops them", async () => {
+  await withRoot(async (root) => {
+    await write(root, { "a.mkv": "a", "b.mkv": "b", "bad.mkv": "bad" });
+    let runs = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let aborted = 0;
+    setSubtitleRunners({
+      probe: async () => Buffer.from(JSON.stringify({ streams: [{ index: 2, codec_name: "subrip" }] })),
+      extract: async (fd, _stream, signal) => {
+        runs += 1;
+        const name = Buffer.alloc(3);
+        const { readSync } = await import("node:fs");
+        const read = readSync(fd, name, 0, 3, 0);
+        const file = name.subarray(0, read).toString();
+        if (file === "bad") return null;
+        // b.mkv never finishes on its own, so only leaving stops it.
+        await Promise.race([file === "b" ? new Promise<void>(() => undefined) : gate, new Promise<void>((resolve) => signal.addEventListener("abort", () => { aborted += 1; resolve(); }, { once: true }))]);
+        return signal.aborted ? null : Buffer.from("WEBVTT\n\n00:00.000 --> 00:01.000\nok\n");
+      },
+    });
+    // Two requests for the same track share one run.
+    const first = subtitleTrack("a.mkv", "stream:2", "bob");
+    const second = subtitleTrack("a.mkv", "stream:2", "carol");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    // Bob can't queue another track while his first is still going.
+    await assert.rejects(subtitleTrack("b.mkv", "stream:2", "bob"), /still being prepared/);
+    release();
+    assert.match(await first, /ok/);
+    assert.match(await second, /ok/);
+    assert.equal(runs, 1);
+    // A track that can't be read isn't tried again straight away.
+    await assert.rejects(subtitleTrack("bad.mkv", "stream:2", "bob"), /couldn't be read/);
+    await assert.rejects(subtitleTrack("bad.mkv", "stream:2", "bob"), /couldn't be read/);
+    assert.equal(runs, 2);
+    // When the only person waiting leaves, the extraction stops.
+    const controller = new AbortController();
+    const leaving = subtitleTrack("b.mkv", "stream:2", "dave", controller.signal).catch((error) => error);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    controller.abort();
+    assert.match((await leaving).message, /cancelled/);
+    assert.equal(aborted, 1);
   });
 });
 
