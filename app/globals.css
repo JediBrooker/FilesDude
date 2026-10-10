@@ -706,6 +706,22 @@ kbd { padding: 3px 5px; border: 1px solid var(--line); border-bottom-width: 2px;
 
 .toast { position: fixed; z-index: 200; right: 22px; bottom: 22px; display: flex; max-width: min(390px, calc(100vw - 44px)); min-height: 44px; align-items: center; gap: 9px; padding: 10px 14px; border: 1px solid color-mix(in srgb, var(--brand) 30%, var(--line)); border-radius: 10px; background: var(--panel); color: var(--brand-strong); box-shadow: var(--shadow); font-size: 10px; font-weight: 700; animation: toast-in .2s ease both; }
 .shared-badge { display: inline-flex; flex: 0 0 auto; color: var(--brand); }
+/* Colour tags. */
+.tag-red { --tag: #e5484d; } .tag-orange { --tag: #f76b15; } .tag-yellow { --tag: #e2b203; } .tag-green { --tag: #30a46c; } .tag-blue { --tag: #0090ff; } .tag-purple { --tag: #8e4ec6; } .tag-gray { --tag: #8b8d98; }
+.tag-dots { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 3px; }
+.tag-dot { display: inline-block; width: 9px; height: 9px; flex: 0 0 auto; border-radius: 50%; background: var(--tag); box-shadow: 0 0 0 1.5px var(--panel); }
+.tag-dots .tag-dot + .tag-dot { margin-left: -6px; }
+.tag-dot-large { width: 16px; height: 16px; }
+.file-card .tag-dots { margin: 2px auto 0; }
+.menu-tags { display: flex; justify-content: space-between; gap: 4px; padding: 9px 12px; border-bottom: 1px solid var(--line); }
+.tag-swatch { display: grid; width: 20px; height: 20px; place-items: center; padding: 0; border: 0; border-radius: 50%; background: var(--tag); color: #fff; cursor: pointer; transition: transform .1s ease; }
+.tag-swatch:hover, .tag-swatch:focus-visible { transform: scale(1.15); }
+.tag-swatch.on { box-shadow: 0 0 0 2px var(--panel), 0 0 0 3.5px var(--tag); }
+.tag-chips { display: flex; flex-wrap: wrap; gap: 5px; }
+.tag-chip { display: inline-flex; align-items: center; gap: 5px; padding: 4px 9px 4px 7px; border: 1px solid var(--line); border-radius: 999px; background: var(--panel-soft); color: var(--ink-soft); cursor: pointer; font-family: inherit; font-size: 10px; font-weight: 700; }
+.tag-chip:hover { border-color: var(--tag); color: var(--ink); }
+.tag-chip .tag-dot { width: 9px; height: 9px; box-shadow: none; }
+.watching-play .tag-dots { margin-left: auto; }
 .watch-badge { display: inline-flex; flex: 0 0 auto; color: var(--brand); }
 .watch-progress { position: relative; display: inline-block; flex: 0 0 auto; width: 36px; height: 4px; overflow: hidden; border-radius: 4px; background: var(--line-strong); vertical-align: middle; }
 .watch-progress > span { position: absolute; inset: 0 auto 0 0; background: var(--brand); }

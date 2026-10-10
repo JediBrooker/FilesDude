@@ -4,11 +4,13 @@ import { rewriteFavoritePaths } from "./favorites";
 import { copyOrMove, type CopiedItems } from "./files";
 import { startJob } from "./jobs";
 import { rewriteSharePaths } from "./shares";
+import { rewriteTagPaths } from "./tags";
 
-/** Favourites and share links follow items that are renamed or moved, and drop deleted ones. */
+/** Favourites, tags, and share links follow items that are renamed or moved, and drop deleted ones. */
 export async function rewriteLinkedPaths(changes: Array<{ from: string; to?: string }>, username: string, copies?: CopiedItems) {
   if (!changes.length) return;
   await rewriteFavoritePaths(changes);
+  await rewriteTagPaths(changes);
   const revoked = await rewriteSharePaths(changes, copies);
   if (revoked.length) await audit("share.revoke", { username, ids: revoked, reason: "item deleted" });
 }
