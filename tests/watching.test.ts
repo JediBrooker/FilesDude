@@ -9,7 +9,7 @@ import { config } from "../lib/config";
 import { getCredentials } from "../lib/credentials";
 import { createUser } from "../lib/users";
 import { runInScope } from "../lib/scope";
-import { continueWatching, forgetAccountWatching, forgetWatching, saveWatchPosition, watchingIn, watchPosition } from "../lib/watching";
+import { continueWatching, flushWatching, forgetAccountWatching, forgetWatching, saveWatchPosition, watchingIn, watchPosition } from "../lib/watching";
 import { GET as watching, POST as watchingAction } from "../app/api/watching/route";
 import { POST as usersAction } from "../app/api/users/route";
 
@@ -59,7 +59,10 @@ test("positions are kept per video, a finished video is marked watched, and a ju
     assert.deepEqual((await watchingIn("owner", "")).map((item) => item.path), ["movie.mp4"]);
     // Another account has its own.
     assert.deepEqual(await continueWatching("someone-else"), []);
+    // Kept in memory, then written out.
+    await flushWatching();
     assert.equal((await fs.stat(path.join(state, "watching.json"))).mode & 0o777, 0o600);
+    assert.equal(JSON.parse(await fs.readFile(path.join(state, "watching.json"), "utf8")).owner.length, 3);
   });
 });
 
@@ -73,6 +76,13 @@ test("only videos, sensible positions, and places the account can reach are acce
       await assert.rejects(saveWatchPosition("owner", "movie.mp4", position, duration), /position is invalid/, `${position} ${duration}`);
     }
     await assert.rejects(saveWatchPosition("owner", "../outside.mp4", 100, 200));
+    // Only videos that are there (and missing folders are just "not there", not errors).
+    await assert.rejects(saveWatchPosition("owner", "tv/Show/e9.mkv", 100, 200), (error: Error & { status?: number }) => error.status === 404);
+    await assert.rejects(saveWatchPosition("owner", "tv/Nope/e1.mkv", 100, 200), (error: Error & { status?: number }) => error.status === 404);
+    await assert.rejects(saveWatchPosition("owner", `tv/${"n".repeat(300)}.mkv`, 100, 200), (error: Error & { status?: number }) => error.status === 404);
+    await assert.rejects(saveWatchPosition("owner", "tv/Show", 100, 200), /Only videos/);
+    assert.equal(await watchPosition("owner", "tv/Nope/e1.mkv").catch((error: Error & { status?: number }) => error.status), 404);
+    assert.equal(await watchPosition("owner", "tv/Show/e9.mkv"), null);
     await runInScope({ accountKey: "bob", username: "bob", role: "viewer", root: "home/bob" }, async () => {
       assert.ok(await saveWatchPosition("bob", "home/bob/clip.mp4", 100, 2000));
       await assert.rejects(saveWatchPosition("bob", "home/alice/clip.mp4", 100, 2000), /outside your folder/);
@@ -107,11 +117,44 @@ test("a video can be forgotten, or all of them, and the newest 300 are kept", as
     assert.deepEqual(await continueWatching("owner"), []);
 
     await fs.mkdir(path.join(root, "many"));
+    for (let index = 0; index < 305; index += 1) await fs.writeFile(path.join(root, "many", `v${index}.mp4`), "v");
     for (let index = 0; index < 305; index += 1) await saveWatchPosition("owner", `many/v${index}.mp4`, 100, 2000);
     const kept = await watchingIn("owner", "many");
     assert.equal(kept.length, 300);
     assert.ok(!kept.some((item) => item.path === "many/v0.mp4"));
     assert.ok(kept.some((item) => item.path === "many/v304.mp4"));
+  });
+});
+
+test("saves in quick succession are recorded once, and nothing is written until it's time", async () => {
+  await withRoot(async ({ state }) => {
+    await saveWatchPosition("owner", "movie.mp4", 100, 7200);
+    for (let second = 101; second < 200; second += 1) await saveWatchPosition("owner", "movie.mp4", second, 7200);
+    assert.equal((await watchPosition("owner", "movie.mp4"))?.position, 100);
+    await assert.rejects(fs.stat(path.join(state, "watching.json")));
+    // Finishing it is recorded straight away.
+    assert.equal((await saveWatchPosition("owner", "movie.mp4", 7190, 7200))?.watched, true);
+    await flushWatching();
+    assert.equal(JSON.parse(await fs.readFile(path.join(state, "watching.json"), "utf8")).owner[0].watched, true);
+  });
+});
+
+test("a damaged file is kept aside, odd entries are ignored, and removed accounts' history isn't written", async () => {
+  await withRoot(async ({ state }) => {
+    await fs.mkdir(state, { recursive: true });
+    await fs.writeFile(path.join(state, "watching.json"), JSON.stringify({ owner: [{ path: "movie.mp4", position: 100, duration: 7200, watched: false, updatedAt: "2026-01-01T00:00:00Z" }, { path: 5 }], gone: "not a list", ghost: [{ path: "movie.mp4", position: 100, duration: 7200, watched: false, updatedAt: "2026-01-01T00:00:00Z" }] }));
+    assert.deepEqual((await continueWatching("owner")).map((item) => item.path), ["movie.mp4"]);
+    assert.deepEqual(await continueWatching("gone"), []);
+    // "ghost" isn't an account, so its history goes when the file is next written.
+    await saveWatchPosition("owner", "tv/Show/e1.mkv", 100, 2000);
+    await flushWatching();
+    assert.deepEqual(Object.keys(JSON.parse(await fs.readFile(path.join(state, "watching.json"), "utf8"))), ["owner"]);
+  });
+  await withRoot(async ({ state }) => {
+    await fs.mkdir(state, { recursive: true });
+    await fs.writeFile(path.join(state, "watching.json"), "{\"owner\": [tor");
+    assert.deepEqual(await continueWatching("owner"), []);
+    assert.equal(await fs.readFile(path.join(state, "watching.json.bad"), "utf8"), "{\"owner\": [tor");
   });
 });
 
