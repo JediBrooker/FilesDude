@@ -4,6 +4,7 @@ FilesDude File Explorer is a secure, self-hosted web file manager designed for a
 
 ## What is included
 
+- Open folders in place in the list view, Finder-style: the arrow beside a folder (or → at the cursor) shows what's inside it indented underneath, as deep as you like, and ← closes it again; items shown this way can be selected (ranges and Select all too), dragged, right-clicked, and acted on like any other, and open folders are listed again when anything changes
 - Browse folders in list or grid view, sorted by name, size, owner, permissions, or modified time (folders stay first and the choice is remembered per browser), including an optional hidden-files view; the browser's own back/forward buttons and gestures step through folder history instead of leaving the app
 - Use a SharePoint-style row menu, also available by right-clicking any item (or empty space for folder actions), for preview, text editing, downloads, organization, administration, properties, and deletion; with several items selected it acts on all of them
 - Cut, copy, and paste items between folders, or drag them onto a folder, favourite, or breadcrumb to move them (hold Option/Alt to copy); copies into a folder that already has the name are saved as `name (copy)`
