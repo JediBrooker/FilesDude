@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { withAccess } from "@/lib/access";
-import { verifyPassword } from "@/lib/auth";
+import { verifyCurrentPassword } from "@/lib/auth";
 import { audit } from "@/lib/audit";
 import { assertMutationRequest, AppError, jsonError, readJsonBody } from "@/lib/http";
 import { beginRegistration, finishRegistration, listPasskeys, relyingParty, removePasskey, renamePasskey } from "@/lib/passkeys";
@@ -38,7 +38,7 @@ export async function POST(request: Request) {
       switch (body.action) {
         case "options": {
           const party = relyingParty(request);
-          if (typeof body.currentPassword !== "string" || !(await verifyPassword(body.currentPassword, account.passwordHash))) {
+          if (!(await verifyCurrentPassword(account.key, body.currentPassword, account.passwordHash))) {
             await audit("settings.passkey.failed", { username: session.username, reason: "INVALID_CURRENT_PASSWORD" });
             throw new AppError("Current password is incorrect", 401, "INVALID_CURRENT_PASSWORD");
           }
@@ -58,7 +58,8 @@ export async function POST(request: Request) {
           return NextResponse.json({ ok: true, passkey, passkeys: await listPasskeys(account.key) }, noStore);
         }
         case "rename": {
-          const passkey = await renamePasskey(account.key, body.id, body.name);
+          const { previousName, passkey } = await renamePasskey(account.key, body.id, body.name);
+          if (previousName !== passkey.name) await audit("settings.passkey.renamed", { username: session.username, from: previousName, passkey: passkey.name, rpId: passkey.rpId });
           return NextResponse.json({ ok: true, passkey, passkeys: await listPasskeys(account.key) }, noStore);
         }
         case "remove": {

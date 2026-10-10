@@ -49,8 +49,10 @@ export async function POST(request: Request) {
           if (!id) throw new AppError("Choose an account", 400, "INVALID_REQUEST");
           await resetTwoFactor(id);
           cancelAccountJobs(id);
+          // A synced passkey usually lives on the same lost phone, so it goes too.
+          const passkeysRemoved = await removeAccountPasskeys(id);
           user = (await listUsers()).find((item) => item.id === id);
-          await audit("users.two_factor_reset", { username: session.username, account: user?.username });
+          await audit("users.two_factor_reset", { username: session.username, account: user?.username, passkeysRemoved: passkeysRemoved || undefined });
           break;
         }
         case "delete":

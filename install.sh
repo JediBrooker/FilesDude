@@ -210,7 +210,8 @@ elif [[ ${MODE} == "reset" ]]; then
   INSTALL_USERNAME="${INSTALL_USERNAME:-$(prompt_value "Replacement username" "${EXISTING_USERNAME:-admin}")}"
   INSTALL_PASSWORD="$(prompt_password)"
   write_environment "${INSTALL_USERNAME}" "${INSTALL_PASSWORD}" "${ROOT_PATH}"
-  rm -f "${STATE_DIR}/credentials.json"
+  # Passkeys sign in without the password, so a reset for a lost or exposed login removes them too.
+  rm -f "${STATE_DIR}/credentials.json" "${STATE_DIR}/passkeys.json"
 else
   ROOT_PATH="${ROOT_PATH:-$(prompt_value "Folder FilesDude may manage" "/mnt/pve")}"
   [[ ${ROOT_PATH} == /* && ${ROOT_PATH} != "/" ]] || fail "The managed folder must be an absolute path and cannot be /."

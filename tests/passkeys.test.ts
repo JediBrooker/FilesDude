@@ -159,6 +159,45 @@ test("passkey sign-in refuses other keys, other accounts' handles, other address
   });
 });
 
+test("asking for many sign-in challenges doesn't stop anyone else's sign-in", async () => {
+  await withAccounts(async ({ owner }) => {
+    const authenticator = new SoftAuthenticator();
+    assert.equal((await addPasskey(owner, authenticator)).status, 200);
+    const mine = await json<{ challengeId: string; options: SignInOptions }>(call(passkeyLogin, "/api/auth/passkey-login", "", { action: "options" }));
+    for (let index = 0; index < 1_000; index += 1) await call(passkeyLogin, "/api/auth/passkey-login", "", { action: "options" });
+    const verified = await json(call(passkeyLogin, "/api/auth/passkey-login", "", { action: "verify", challengeId: mine.body.challengeId, response: authenticator.signIn(mine.body.options, ORIGIN) }));
+    assert.equal(verified.status, 200, JSON.stringify(verified.body));
+    // A challenge token can't be altered, or moved to another address.
+    const other = await json<{ challengeId: string; options: SignInOptions }>(call(passkeyLogin, "/api/auth/passkey-login", "", { action: "options" }));
+    const [body, signature] = other.body.challengeId.split(".");
+    const changed = Buffer.from(JSON.stringify({ ...JSON.parse(Buffer.from(body, "base64url").toString()), exp: Date.now() + 86_400_000 })).toString("base64url");
+    assert.equal((await json(call(passkeyLogin, "/api/auth/passkey-login", "", { action: "verify", challengeId: `${changed}.${signature}`, response: authenticator.signIn(other.body.options, ORIGIN) }))).body.code, "PASSKEY_EXPIRED");
+    assert.equal((await json(call(passkeyLogin, "/api/auth/passkey-login", "", { action: "verify", challengeId: other.body.challengeId, response: authenticator.signIn(other.body.options, "http://files.localhost:3000") }, "http://files.localhost:3000"))).body.code, "PASSKEY_EXPIRED");
+  });
+});
+
+test("checking the current password from a session is limited, and a registration can't outlive a change to the account", async () => {
+  await withAccounts(async ({ owner, bob, bobId }) => {
+    const options = await json<{ options: RegistrationOptions }>(call(passkeyAction, "/api/auth/passkeys", bob, { action: "options", currentPassword: USER_PASSWORD }));
+    assert.equal(options.status, 200);
+    // The owner changes the account while the browser is creating the passkey.
+    assert.equal((await json(call(usersAction, "/api/users", owner, { action: "update", id: bobId, role: "viewer" }))).status, 200);
+    const bobNow = `fd_session=${createSession("bob", 2, bobId)}`;
+    const late = await json(call(passkeyAction, "/api/auth/passkeys", bobNow, { action: "register", response: new SoftAuthenticator().register(options.body.options, ORIGIN) }));
+    assert.equal(late.status, 400);
+    assert.equal(late.body.code, "PASSKEY_EXPIRED");
+
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      assert.equal((await json(call(passkeyAction, "/api/auth/passkeys", bobNow, { action: "options", currentPassword: `wrong-${attempt}` }))).status, 401);
+    }
+    const locked = await json(call(passkeyAction, "/api/auth/passkeys", bobNow, { action: "options", currentPassword: USER_PASSWORD }));
+    assert.equal(locked.status, 429);
+    assert.equal(locked.body.code, "PASSWORD_LOCKED");
+    // Other accounts aren't affected.
+    assert.equal((await json(call(passkeyAction, "/api/auth/passkeys", owner, { action: "options", currentPassword: OWNER_PASSWORD }))).status, 200);
+  });
+});
+
 test("failed passkey sign-ins count towards the sign-in limit", async () => {
   await withAccounts(async () => {
     const stranger = new SoftAuthenticator();
@@ -216,8 +255,19 @@ test("an owner's password reset or deletion of an account removes its passkeys",
     assert.equal((await signIn(bobKey)).status, 401);
     clearLoginFailures("direct-client");
 
+    // So does resetting two-factor sign-in for a lost phone.
+    const phone = new SoftAuthenticator();
+    const bobAfterReset = `fd_session=${createSession("bob", 3, bobId)}`;
+    assert.equal((await addPasskey(bobAfterReset, phone, { password: "brand-new-password-long" })).status, 200);
+    const setup = await json<{ secret: string; setupToken: string }>(call(twoFactorAction, "/api/auth/two-factor", bobAfterReset, { action: "setup", currentPassword: "brand-new-password-long" }));
+    assert.equal((await json(call(twoFactorAction, "/api/auth/two-factor", bobAfterReset, { action: "enable", setupToken: setup.body.setupToken, code: totpAt(setup.body.secret, currentStep()) }))).status, 200);
+    assert.equal((await signIn(phone)).status, 200);
+    assert.equal((await json(call(usersAction, "/api/users", owner, { action: "resetTwoFactor", id: bobId }))).status, 200);
+    assert.equal((await signIn(phone)).status, 401);
+    clearLoginFailures("direct-client");
+
     const again = new SoftAuthenticator();
-    const bobSession = `fd_session=${createSession("bob", 3, bobId)}`;
+    const bobSession = `fd_session=${createSession("bob", 5, bobId)}`;
     assert.equal((await addPasskey(bobSession, again, { password: "brand-new-password-long" })).status, 200);
     assert.equal((await json(call(usersAction, "/api/users", owner, { action: "delete", id: bobId }))).status, 200);
     assert.equal((await signIn(again)).status, 401);

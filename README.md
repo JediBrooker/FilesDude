@@ -93,7 +93,7 @@ sudo GITHUB_TOKEN="$(gh auth token)" filesdude-update
 ```
 
 To recover a forgotten login, generate a new bootstrap login and invalidate all
-sessions:
+sessions and passkeys:
 
 ```bash
 sudo filesdude-update --reset-credentials
@@ -229,8 +229,12 @@ browser's prompt. Passwords keep working alongside them.
 - Only public keys are stored, in `passkeys.json` in the state directory; failed passkey
   sign-ins count towards the same sign-in limit as passwords, and appear in Activity.
 - Rename or remove passkeys from the same place; removing one needs only your session.
-- When the owner resets another account's password or removes the account, its passkeys
-  are removed too. To remove every passkey, delete `passkeys.json` as root and restart.
+- Changing your own password keeps your passkeys; if you change it because it may have
+  been exposed, also check the list and remove any you don't recognise (renames and
+  removals appear in Activity).
+- When the owner resets another account's password or two-factor sign-in, or removes the
+  account, its passkeys are removed too. `filesdude-update --reset-credentials` removes
+  every passkey, or delete `passkeys.json` as root and restart.
 
 ## Share links
 

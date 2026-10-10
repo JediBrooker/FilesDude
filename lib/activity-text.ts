@@ -146,7 +146,7 @@ function describe(entry: Entry): Omit<ActivityText, "text"> {
     case "users.create": return { parts: t`added ${str(entry.role) === "viewer" ? "viewer" : "editor"} ${v(str(entry.account))} with ${v(slash(entry.root))}` };
     case "users.update": return { parts: t`changed ${v(str(entry.account))} (${str(entry.role)}, ${v(slash(entry.root))})${entry.passwordReset ? " and reset their password" : ""}${entry.passkeysRemoved ? ", removing their passkeys" : ""}` };
     case "users.delete": return { parts: t`removed the account ${v(str(entry.account))}`, tone: "warning" };
-    case "users.two_factor_reset": return { parts: t`turned off two-factor for ${v(str(entry.account))}`, tone: "warning" };
+    case "users.two_factor_reset": return { parts: t`turned off two-factor for ${v(str(entry.account))}${entry.passkeysRemoved ? " and removed their passkeys" : ""}`, tone: "warning" };
     case "settings.password.changed": return { parts: ["changed their password"] };
     case "settings.credentials.failed": return { parts: ["entered a wrong current password in preferences"], tone: "danger" };
     case "settings.preferences.updated": return { parts: str(entry.previousUsername) && entry.previousUsername !== entry.username ? t`renamed their account from ${v(str(entry.previousUsername))}` : ["updated their preferences"] };
@@ -155,6 +155,7 @@ function describe(entry: Entry): Omit<ActivityText, "text"> {
     case "settings.two_factor.recovery_codes": return { parts: ["made new recovery codes"] };
     case "settings.two_factor.failed": return { parts: ["entered a wrong two-factor code in preferences"], tone: "danger" };
     case "settings.passkey.added": return { parts: str(entry.passkey) ? t`added the passkey ${v(str(entry.passkey))}` : ["added a passkey"] };
+    case "settings.passkey.renamed": return { parts: t`renamed the passkey ${v(str(entry.from))} to ${v(str(entry.passkey))}` };
     case "settings.passkey.removed": return { parts: str(entry.passkey) ? t`removed the passkey ${v(str(entry.passkey))}` : ["removed a passkey"] };
     case "settings.passkey.failed": return { parts: [entry.reason === "INVALID_CURRENT_PASSWORD" ? "entered a wrong current password while adding a passkey" : "entered a wrong two-factor code while adding a passkey"], tone: "danger" };
     case "snapshots.create": return { parts: t`took snapshot ${v(str(entry.name))}${entry.scheduled ? " (scheduled)" : ""}` };

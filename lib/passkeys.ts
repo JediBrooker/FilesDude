@@ -10,14 +10,13 @@ import {
 } from "@simplewebauthn/server";
 import { config } from "./config";
 import { AppError } from "./http";
-import type { Account } from "./two-factor";
+import { findAccount, type Account } from "./two-factor";
 
 // Passkeys: sign-in with a device's fingerprint, face, or PIN instead of a password. Each one belongs
 // to an account and to the address it was added on (its relying party), and is discoverable, so the
 // sign-in page needs no username. Only public keys are stored; the private key never leaves the device.
 const CHALLENGE_MS = 5 * 60_000;
 const MAX_PASSKEYS_PER_ACCOUNT = 20;
-const MAX_PENDING_SIGN_INS = 500;
 const MAX_NAME_LENGTH = 64;
 
 export type StoredPasskey = {
@@ -151,7 +150,11 @@ export async function finishRegistration(account: Account, party: RelyingParty, 
   if (!verification.verified || !verification.registrationInfo) throw new AppError("The passkey couldn't be verified. Try again.", 400, "PASSKEY_INVALID");
   const { credential, credentialBackedUp } = verification.registrationInfo;
   const handle = Buffer.from(userHandle(account.key)).toString("base64url");
-  return mutate((passkeys) => {
+  return mutate(async (passkeys) => {
+    // Checked again here, in turn with removals, so a password reset or deletion that lands while
+    // the browser was busy can't be outlived by the passkey it would have removed.
+    const current = await findAccount(account.key);
+    if (!current || current.version !== pending.version) throw new AppError("Adding the passkey took too long. Try again.", 400, "PASSKEY_EXPIRED");
     if (passkeys.some((passkey) => passkey.id === credential.id)) throw new AppError("That passkey has already been added", 409, "PASSKEY_EXISTS");
     if (passkeys.filter((passkey) => passkey.account === account.key).length >= MAX_PASSKEYS_PER_ACCOUNT) throw new AppError(`An account can have at most ${MAX_PASSKEYS_PER_ACCOUNT} passkeys`, 409, "PASSKEY_LIMIT");
     const stored: StoredPasskey = {
@@ -176,7 +179,7 @@ export async function renamePasskey(accountKey: string, id: unknown, name: unkno
     const found = passkeys.find((passkey) => passkey.id === id && passkey.account === accountKey);
     if (!found) throw new AppError("That passkey no longer exists", 404, "NOT_FOUND");
     const renamed = { ...found, name: cleanName(name) };
-    return { next: passkeys.map((passkey) => (passkey === found ? renamed : passkey)), result: summary(renamed) };
+    return { next: passkeys.map((passkey) => (passkey === found ? renamed : passkey)), result: { previousName: found.name, passkey: summary(renamed) } };
   });
 }
 
@@ -199,17 +202,50 @@ export async function removeAccountPasskeys(accountKey: string) {
 
 // --- Signing in (no session yet) ---
 
-// Each sign-in gets its own challenge, used once. Only so many can be pending; the oldest go first.
-const pendingSignIns = new Map<string, { challenge: string; origin: string; rpId: string; expiresAt: number }>();
+// Each sign-in gets its own challenge, handed to the browser in a signed token rather than kept here,
+// so asking for challenges can't crowd out anyone else's. A token works once: its nonce is remembered
+// when it is used, and verifying is limited per address, which keeps that list small.
+const usedSignIns = new Map<string, number>();
+
+function challengeKey() {
+  return Buffer.from(crypto.hkdfSync("sha256", config.sessionSecret, Buffer.alloc(0), "filesdude-passkey-challenge-v1", 32));
+}
+
+function signChallenge(payload: { c: string; o: string; r: string; n: string; exp: number }) {
+  const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  return `${body}.${crypto.createHmac("sha256", challengeKey()).update(body).digest("base64url")}`;
+}
+
+function readChallenge(token: unknown) {
+  if (typeof token !== "string" || token.length > 2048) return null;
+  const [body, supplied, extra] = token.split(".");
+  if (!body || !supplied || extra !== undefined) return null;
+  const expected = Buffer.from(crypto.createHmac("sha256", challengeKey()).update(body).digest("base64url"));
+  const actual = Buffer.from(supplied);
+  if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(body, "base64url").toString("utf8")) as Record<string, unknown>;
+    const { c, o, r, n, exp } = payload;
+    if (typeof c !== "string" || typeof o !== "string" || typeof r !== "string" || typeof n !== "string" || typeof exp !== "number" || exp <= Date.now()) return null;
+    return { challenge: c, origin: o, rpId: r, nonce: n, expiresAt: exp };
+  } catch {
+    return null;
+  }
+}
 
 export async function beginSignIn(party: RelyingParty) {
-  const now = Date.now();
-  for (const [id, pending] of pendingSignIns) if (pending.expiresAt <= now) pendingSignIns.delete(id);
-  while (pendingSignIns.size >= MAX_PENDING_SIGN_INS) pendingSignIns.delete(pendingSignIns.keys().next().value!);
   const options = await generateAuthenticationOptions({ rpID: party.rpId, userVerification: "required", timeout: CHALLENGE_MS });
-  const challengeId = crypto.randomBytes(18).toString("base64url");
-  pendingSignIns.set(challengeId, { challenge: options.challenge, origin: party.origin, rpId: party.rpId, expiresAt: now + CHALLENGE_MS });
+  const challengeId = signChallenge({ c: options.challenge, o: party.origin, r: party.rpId, n: crypto.randomBytes(16).toString("base64url"), exp: Date.now() + CHALLENGE_MS });
   return { challengeId, options };
+}
+
+/** Marks a sign-in challenge used; false if it already was. */
+function consumeChallenge(nonce: string, expiresAt: number) {
+  const now = Date.now();
+  for (const [used, until] of usedSignIns) if (until <= now) usedSignIns.delete(used);
+  if (usedSignIns.has(nonce)) return false;
+  usedSignIns.set(nonce, expiresAt);
+  return true;
 }
 
 const notRecognised = () => new AppError("That passkey wasn't recognised. It may have been removed, or added on a different address.", 401, "PASSKEY_INVALID");
@@ -219,9 +255,8 @@ const notRecognised = () => new AppError("That passkey wasn't recognised. It may
  * checks the account still exists and creates the session.
  */
 export async function finishSignIn(party: RelyingParty, challengeId: unknown, response: unknown) {
-  const pending = typeof challengeId === "string" ? pendingSignIns.get(challengeId) : undefined;
-  if (pending) pendingSignIns.delete(challengeId as string);
-  if (!pending || pending.expiresAt <= Date.now() || pending.origin !== party.origin) {
+  const pending = readChallenge(challengeId);
+  if (!pending || pending.origin !== party.origin || !consumeChallenge(pending.nonce, pending.expiresAt)) {
     throw new AppError("Signing in took too long. Try again.", 401, "PASSKEY_EXPIRED");
   }
   const body = response && typeof response === "object" ? response as { id?: unknown; response?: { userHandle?: unknown } } : null;
