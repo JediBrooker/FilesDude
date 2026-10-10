@@ -1,8 +1,8 @@
 import crypto from "node:crypto";
-import net from "node:net";
 import { config, configurationIssues, isValidPasswordHash } from "./config";
 import { getCredentials } from "./credentials";
 import { AppError } from "./http";
+import { connectionPeer, normalizeAddress } from "./peer";
 import type { Role } from "./scope";
 import { findUserById } from "./users";
 
@@ -79,13 +79,25 @@ export function createSession(username: string, credentialsVersion: number, acco
   return `${payload}.${signature(payload)}`;
 }
 
+/** Whether the request came through one of the configured proxies, judged by its real connection. */
+export function viaTrustedProxy(request: Request) {
+  const peer = connectionPeer(request);
+  return Boolean(peer) && config.trustedProxies.includes(peer);
+}
+
+/** Whether the browser reached FilesDude over HTTPS (directly, or through a trusted proxy). */
+export function reachedOverHttps(request: Request) {
+  if (new URL(request.url).protocol === "https:") return true;
+  return (viaTrustedProxy(request) || config.trustProxy) && request.headers.get("x-forwarded-proto") === "https";
+}
+
 export function sessionCookie(value: string, request: Request) {
-  const secure = new URL(request.url).protocol === "https:" || (config.trustProxy && request.headers.get("x-forwarded-proto") === "https");
+  const secure = reachedOverHttps(request);
   return `${COOKIE}=${value}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${config.sessionHours * 3600};${secure ? " Secure;" : ""}`;
 }
 
 export function clearSessionCookie(request: Request) {
-  const secure = new URL(request.url).protocol === "https:" || (config.trustProxy && request.headers.get("x-forwarded-proto") === "https");
+  const secure = reachedOverHttps(request);
   return `${COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0;${secure ? " Secure;" : ""}`;
 }
 
@@ -131,11 +143,26 @@ export async function requireSession(request: Request) {
   return session;
 }
 
+/**
+ * The address a request comes from, for sign-in limits and the audit log. A connection from a
+ * trusted proxy (FILEDUDE_TRUSTED_PROXIES) is believed about the client behind it: Cloudflare's
+ * CF-Connecting-IP, or else the nearest address the proxies added to X-Forwarded-For. Any other
+ * connection is its own address, whatever headers it sends, so nobody can claim to be someone else.
+ */
 export function clientAddress(request: Request) {
-  if (config.trustProxy) {
-    const forwarded = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "";
-    return net.isIP(forwarded) ? forwarded : "proxy-unknown";
+  const peer = connectionPeer(request);
+  const trusted = (address: string) => config.trustedProxies.includes(address);
+  const forwardedChain = () => (request.headers.get("x-forwarded-for") ?? "").split(",").map(normalizeAddress).filter(Boolean);
+  if (peer && trusted(peer)) {
+    const cloudflare = normalizeAddress(request.headers.get("cf-connecting-ip"));
+    if (cloudflare) return cloudflare;
+    const chain = forwardedChain();
+    for (let index = chain.length - 1; index >= 0; index -= 1) if (!trusted(chain[index])) return chain[index];
+    return peer;
   }
+  if (peer && !config.trustProxy) return peer;
+  // FILEDUDE_TRUST_PROXY: every connection is a proxy; the address it added is the last one.
+  if (config.trustProxy) return forwardedChain().at(-1) || (peer ? peer : "proxy-unknown");
   return "direct-client";
 }
 

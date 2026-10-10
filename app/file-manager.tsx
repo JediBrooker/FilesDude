@@ -1395,7 +1395,7 @@ export function FileManager() {
       <aside className={`sidebar ${sidebarOpen ? "sidebar-open" : ""}`}>
         <div className="brand-row">
           <div className="brand-mark"><FolderOpen size={21} /></div>
-          <div><strong>FilesDude</strong><span>Proxmox explorer</span></div>
+          <div><strong>FilesDude</strong><span>File explorer</span></div>
           <button className="icon-button sidebar-close" aria-label="Close navigation" onClick={() => setSidebarOpen(false)}><X size={18} /></button>
         </div>
 
@@ -1717,7 +1717,7 @@ function LoginScreen({ auth, onSuccess, theme, onToggleTheme }: { auth: AuthStat
       <button className="login-theme icon-button" aria-label="Toggle theme" onClick={onToggleTheme}>{theme === "light" ? <Moon size={18} /> : <Sun size={18} />}</button>
       <div className="login-orb orb-one" /><div className="login-orb orb-two" />
       <section className="login-card">
-        <div className="login-brand"><div className="brand-mark large"><FolderOpen size={26} /></div><div><strong>FilesDude</strong><span>Proxmox file manager</span></div></div>
+        <div className="login-brand"><div className="brand-mark large"><FolderOpen size={26} /></div><div><strong>FilesDude</strong><span>File explorer</span></div></div>
         <div className="login-copy"><p className="eyebrow"><ShieldCheck size={14} /> SECURE SERVER ACCESS</p><h1>Welcome back.</h1><p>Sign in to browse and manage your server files.</p></div>
         {!auth.configured ? (
           <div className="configuration-warning"><CircleAlert size={20} /><div><strong>Setup required</strong>{auth.configurationIssues.map((issue) => <p key={issue}>{issue}</p>)}</div></div>
