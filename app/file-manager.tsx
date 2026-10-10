@@ -1128,6 +1128,23 @@ export function FileManager() {
     }
   };
 
+  // The sidebar's folder tree, folded away unless opened (remembered per browser).
+  const [treeOpen, setTreeOpen] = useState(() => {
+    try {
+      return typeof window !== "undefined" && window.localStorage.getItem(TREE_OPEN_KEY) === "on";
+    } catch {
+      return false;
+    }
+  });
+  const toggleTree = () => {
+    setTreeOpen(!treeOpen);
+    try {
+      window.localStorage.setItem(TREE_OPEN_KEY, treeOpen ? "off" : "on");
+    } catch {
+      // Not remembered in this browser.
+    }
+  };
+
   const openSplit = useCallback((target: string) => {
     if (account === null) return;
     setSplit({ account, path: target });
@@ -1528,6 +1545,12 @@ export function FileManager() {
     // Whatever was playing or open belongs to this account: it goes (saving where it got to first).
     setNowPlaying(null);
     setDialog(null);
+    // So do the folders remembered for the tree and the split view, on a computer someone else may use next.
+    try {
+      for (const key of Object.keys(window.localStorage)) if (key.startsWith(TREE_STORAGE_PREFIX) || key.startsWith(SPLIT_STORAGE_PREFIX)) window.localStorage.removeItem(key);
+    } catch {
+      // Nothing was remembered.
+    }
     await new Promise((resolve) => window.setTimeout(resolve, 0));
     await requestJson("/api/auth/logout", { method: "POST", body: JSON.stringify({}) });
     setFavorites([]);
@@ -1599,6 +1622,24 @@ export function FileManager() {
             </div>}
           </> : snapshotsAvailable && <button className="nav-item" onClick={() => { setDialog({ kind: "snapshots" }); setSidebarOpen(false); }}><History size={18} /><span>Snapshots</span></button>}
         </nav>
+
+        <div className="sidebar-section folder-tree-section">
+          <button type="button" className="eyebrow sidebar-section-toggle" aria-expanded={treeOpen} onClick={toggleTree}><ChevronRight size={12} className={treeOpen ? "tree-open" : ""} /> FOLDERS</button>
+          {treeOpen && account !== null && (
+            <FolderTree
+              key={account}
+              account={account}
+              home={home}
+              currentPath={currentPath}
+              showHidden={showHidden}
+              canWrite={canWrite}
+              reloadSignal={entries}
+              dropTarget={dropTarget}
+              dropHandlers={dropHandlers}
+              onNavigate={(target) => { navigate(target); setSidebarOpen(false); }}
+            />
+          )}
+        </div>
 
         <div className="sidebar-section favorites-section">
           <p className="eyebrow">FAVOURITES</p>
@@ -2032,6 +2073,167 @@ function OtherPane({ path, reachable, home, showHidden, canWrite, reloadSignal, 
       </div>
     </aside>
   );
+}
+
+const TREE_OPEN_KEY = "filesdude-tree-open";
+const TREE_STORAGE_PREFIX = "filesdude-tree:";
+const MAX_REMEMBERED_FOLDERS = 200;
+type TreeListing = { folders: Array<{ name: string; path: string }>; truncated: boolean };
+
+/** The folders between `home` and `target`, not counting either. */
+function foldersAbove(target: string, home: string) {
+  const parts = target.slice(home ? home.length + 1 : 0).split("/").filter(Boolean);
+  return parts.slice(0, -1).map((_, index) => [home, ...parts.slice(0, index + 1)].filter(Boolean).join("/"));
+}
+
+/**
+ * The sidebar's folder tree, from the account's top folder: open a folder's arrow to see the folders
+ * inside (fetched when it's opened, folders only), click one to go there, or drop dragged items on it.
+ * The folder being shown is highlighted, with the folders above it opened; which folders are open is
+ * remembered per account in this browser.
+ */
+function FolderTree({ account, home, currentPath, showHidden, canWrite, reloadSignal, dropTarget, dropHandlers, onNavigate }: {
+  account: string;
+  home: string;
+  currentPath: string;
+  showHidden: boolean;
+  canWrite: boolean;
+  /** Changes whenever the main folder reloads (after anything changes), so open folders are listed again. */
+  reloadSignal: unknown;
+  dropTarget: string | null;
+  dropHandlers: DropHandlers;
+  onNavigate: (path: string) => void;
+}) {
+  const storageKey = `${TREE_STORAGE_PREFIX}${account}`;
+  const [expanded, setExpanded] = useState<Set<string>>(() => {
+    try {
+      const stored = JSON.parse(window.localStorage.getItem(storageKey) ?? "[]") as unknown;
+      return new Set([home, ...(Array.isArray(stored) ? stored.filter((item): item is string => typeof item === "string").slice(0, MAX_REMEMBERED_FOLDERS) : [])]);
+    } catch {
+      return new Set([home]);
+    }
+  });
+  const [listings, setListings] = useState<Map<string, TreeListing>>(() => new Map());
+  const [failed, setFailed] = useState<Set<string>>(() => new Set());
+  const loading = useRef(new Set<string>());
+
+  // Going to a folder opens the folders above it; anything changing lets failed folders be tried again.
+  const [shownPath, setShownPath] = useState<string | null>(null);
+  if (shownPath !== currentPath) {
+    setShownPath(currentPath);
+    const above = foldersAbove(currentPath, home);
+    if (above.some((item) => !expanded.has(item))) setExpanded(new Set([...expanded, ...above]));
+  }
+  const [seenSignal, setSeenSignal] = useState(reloadSignal);
+  if (seenSignal !== reloadSignal) {
+    setSeenSignal(reloadSignal);
+    if (failed.size) setFailed(new Set());
+  }
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(storageKey, JSON.stringify([...expanded].filter((item) => item !== home).slice(-MAX_REMEMBERED_FOLDERS)));
+    } catch {
+      // Not remembered in this browser.
+    }
+  }, [expanded, storageKey, home]);
+
+  const load = useCallback(async (target: string) => {
+    if (loading.current.has(target)) return;
+    loading.current.add(target);
+    try {
+      const result = await requestJson<TreeListing>(`/api/fs?path=${encodePath(target)}&folders=1&hidden=${showHidden}`);
+      setListings((current) => new Map(current).set(target, result));
+    } catch {
+      setFailed((current) => new Set(current).add(target));
+    } finally {
+      loading.current.delete(target);
+    }
+  }, [showHidden]);
+
+  // The folders open and showing (each inside an open one), whose contents are needed.
+  const openPaths: string[] = [];
+  const walk = (target: string) => {
+    openPaths.push(target);
+    for (const folder of listings.get(target)?.folders ?? []) if (expanded.has(folder.path)) walk(folder.path);
+  };
+  if (expanded.has(home)) walk(home);
+  // (A list, not names joined by a character: folder names can contain any character.)
+  const openKey = JSON.stringify(openPaths);
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      for (const target of JSON.parse(openKey) as string[]) if (!listings.has(target) && !failed.has(target)) void load(target);
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [openKey, listings, failed, load]);
+  // When the folder being shown reloads (something in it changed), it and the folder above it are
+  // listed again; going to another folder doesn't list anything again. Showing hidden folders or not
+  // lists every open folder again.
+  const openNow = useRef(openPaths);
+  const pathNow = useRef(currentPath);
+  useEffect(() => {
+    openNow.current = openPaths;
+    pathNow.current = currentPath;
+  });
+  const lastRefresh = useRef({ path: currentPath, hidden: showHidden });
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      const last = lastRefresh.current;
+      const here = pathNow.current;
+      const targets = last.hidden !== showHidden ? openNow.current : last.path === here ? openNow.current.filter((target) => target === here || target === parentOf(here)) : [];
+      lastRefresh.current = { path: here, hidden: showHidden };
+      for (const target of targets) void load(target);
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [reloadSignal, load, showHidden]);
+
+  // The folder being shown is scrolled into view in the tree once it's there (once per folder, so
+  // scrolling the tree by hand isn't undone).
+  const treeRef = useRef<HTMLUListElement>(null);
+  const scrolledTo = useRef<string | null>(null);
+  useEffect(() => {
+    if (scrolledTo.current === currentPath) return;
+    const row = treeRef.current?.querySelector<HTMLElement>(".tree-row.active");
+    if (!row) return;
+    scrolledTo.current = currentPath;
+    row.scrollIntoView({ block: "nearest" });
+  });
+
+  const toggle = (target: string) => {
+    const next = new Set(expanded);
+    if (next.has(target)) next.delete(target);
+    else next.add(target);
+    setExpanded(next);
+  };
+  const dropProps = (target: string) => (canWrite ? { "data-drop-path": target, ...dropHandlers } : {});
+
+  const renderChildren = (parent: string, depth: number): ReactNode => {
+    const indent = { paddingLeft: 26 + depth * 14 };
+    if (failed.has(parent)) return <p className="tree-note" style={indent}>Couldn&apos;t open this folder</p>;
+    const listing = listings.get(parent);
+    if (!listing) return <p className="tree-note" style={indent}><LoaderCircle className="spin" size={12} /></p>;
+    if (!listing.folders.length) return null;
+    return (
+      <ul role="group">
+        {listing.folders.map((folder) => renderFolder(folder, depth))}
+        {listing.truncated && <li className="tree-note" style={indent}>Only the first 2,000 folders are shown</li>}
+      </ul>
+    );
+  };
+  const renderFolder = (folder: { name: string; path: string }, depth: number): ReactNode => {
+    const listing = listings.get(folder.path);
+    const open = expanded.has(folder.path);
+    const empty = listing !== undefined && !listing.folders.length;
+    return (
+      <li key={folder.path} role="treeitem" aria-expanded={empty ? undefined : open} aria-selected={currentPath === folder.path}>
+        <div className={`tree-row ${currentPath === folder.path ? "active" : ""} ${dropTarget === folder.path ? "drop-target" : ""}`} style={{ paddingLeft: 2 + depth * 14 }} {...dropProps(folder.path)}>
+          <button type="button" className="tree-toggle" tabIndex={-1} disabled={empty} aria-label={open ? `Close ${folder.name}` : `Open ${folder.name}`} onClick={() => toggle(folder.path)}>{!empty && <ChevronRight size={13} className={open ? "tree-open" : ""} />}</button>
+          <button type="button" className="tree-name" title={`/${folder.path}`} onClick={() => onNavigate(folder.path)}>{open && !empty ? <FolderOpen size={15} /> : <Folder size={15} />}<span>{folder.name}</span></button>
+        </div>
+        {open && renderChildren(folder.path, depth + 1)}
+      </li>
+    );
+  };
+  return <ul ref={treeRef} className="folder-tree" role="tree" aria-label="Folders">{renderFolder({ name: home ? "My files" : "All files", path: home }, 0)}</ul>;
 }
 
 // Upload, with a menu for choosing a folder instead: a browser's picker chooses files or a folder,
