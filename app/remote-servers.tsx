@@ -3,6 +3,7 @@
 import { ArrowDownToLine, ChevronRight, CircleAlert, Copy, Download, Folder, FolderPlus, HardDriveDownload, KeyRound, LoaderCircle, Pencil, RefreshCw, Server, Settings2, ShieldAlert, ShieldCheck, Trash2, Upload, X } from "lucide-react";
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import type { FileEntry, JobState } from "@/lib/types";
+import { PIECES_ABOVE_BYTES, uploadInPieces } from "./upload-pieces";
 import { CheckBox, copyText, downloadFrom, fileIcon, folderLabel, formatBytes, formatDate, FormField, itemCount, Modal, PreviewDialog, requestJson, uploadFile, type PreviewUrls } from "./file-manager";
 
 // The owner's other servers (SFTP): setting them up, browsing them, and copying to and from them.
@@ -166,7 +167,7 @@ const remoteFileEntry = (entry: RemoteEntry): FileEntry => ({ name: entry.name, 
 const trail = (folder: string) => folder.split("/").filter(Boolean);
 
 /** Browses one of the owner's servers: open, preview, download, upload, organise, and copy into FilesDude. */
-export function RemoteBrowserDialog({ connection, localFolder, onClose, onEdit, onJob, notify }: { connection: ServerConnection; localFolder: string; onClose: () => void; onEdit: () => void; onJob: (job: JobState) => Promise<boolean>; notify: Notify }) {
+export function RemoteBrowserDialog({ connection, localFolder, inPieces, onClose, onEdit, onJob, notify }: { connection: ServerConnection; localFolder: string; inPieces: boolean; onClose: () => void; onEdit: () => void; onJob: (job: JobState) => Promise<boolean>; notify: Notify }) {
   const [folder, setFolder] = useState("");
   const [listing, setListing] = useState<Listing | null>(null);
   const [error, setError] = useState<{ message: string; fingerprint?: string } | null>(null);
@@ -231,8 +232,11 @@ export function RemoteBrowserDialog({ connection, localFolder, onClose, onEdit, 
     void act("Uploading…", async () => {
       const controller = new AbortController();
       for (const [index, file] of picked.entries()) {
-        setBusy(`Uploading ${index + 1} of ${picked.length}: ${file.name}`);
-        await uploadFile(`/api/remote/file?id=${q(connection.id)}&path=${q(folder)}`, file, () => undefined, controller.signal);
+        const label = `Uploading ${index + 1} of ${picked.length}: ${file.name}`;
+        setBusy(label);
+        // Large files go in pieces (unless the owner turned that off), so they get through proxies.
+        if (inPieces && file.size > PIECES_ABOVE_BYTES) await uploadInPieces({ base: "/api/remote/file/pieces", query: `id=${q(connection.id)}&path=${q(folder)}` }, file, (sent) => setBusy(`${label} · ${formatBytes(sent)} of ${formatBytes(file.size)}`), controller.signal);
+        else await uploadFile(`/api/remote/file?id=${q(connection.id)}&path=${q(folder)}`, file, () => undefined, controller.signal);
       }
       notify(`${itemCount(picked.length).replace("item", "file")} uploaded to ${connection.name}`);
       await load(folder);

@@ -1,7 +1,7 @@
 // Sending a large file in pieces, for the file manager and for upload-link pages. Files larger than
 // PIECES_ABOVE_BYTES are sent this way, so no request is bigger than a proxy such as Cloudflare
 // allows (100 MB), and a dropped connection only costs the piece in flight.
-export const PIECES_ABOVE_BYTES = 64 * 1024 * 1024;
+export const PIECES_ABOVE_BYTES = 16 * 1024 * 1024;
 
 type RequestError = Error & { status?: number; code?: string; received?: number };
 

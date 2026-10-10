@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { withAccess } from "@/lib/access";
 import { audit } from "@/lib/audit";
 import { createConnection, deleteConnection, listConnections, trustHostKey, updateConnection, type ConnectionInput } from "@/lib/connections";
+import { cancelConnectionUploads } from "@/lib/remote-pieces";
 import { assertMutationRequest, AppError, jsonError, readJsonBody } from "@/lib/http";
 import { closeSession, testConnection } from "@/lib/sftp";
 
@@ -32,12 +33,15 @@ export async function POST(request: Request) {
           return NextResponse.json({ connection });
         }
         case "update": {
+          // Uploads in progress to the server end first, so their temporary files are removed with the old settings.
+          cancelConnectionUploads(id);
           const connection = await updateConnection(id, body);
           await closeSession(id);
           await audit("connections.update", { username: session.username, name: connection.name, host: connection.host, port: connection.port, account: connection.username });
           return NextResponse.json({ connection });
         }
         case "delete": {
+          cancelConnectionUploads(id);
           const connection = await deleteConnection(id);
           await closeSession(id);
           await audit("connections.delete", { username: session.username, name: connection.name, host: connection.host });

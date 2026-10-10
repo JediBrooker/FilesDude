@@ -26,7 +26,7 @@ export function jsonError(error: unknown) {
   );
 }
 
-const JSON_BODY_TIMEOUT_MS = 30_000;
+const JSON_BODY_IDLE_MS = 30_000;
 
 export async function readJsonBody<T>(request: Request, maxBytes = 64 * 1024): Promise<T> {
   const contentType = request.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
@@ -43,17 +43,19 @@ export async function readJsonBody<T>(request: Request, maxBytes = 64 * 1024): P
   const reader = request.body.getReader();
   const chunks: Buffer[] = [];
   let total = 0;
-  // A small body has no reason to arrive slowly; one trickled in is given up on, so it can't hold
-  // the connection (and this request) open.
+  // A body that stops arriving is given up on, so a trickle can't hold this request open.
   let tooSlow = false;
-  const timer = setTimeout(() => {
+  const giveUp = () => {
     tooSlow = true;
     void reader.cancel().catch(() => undefined);
-  }, JSON_BODY_TIMEOUT_MS);
+  };
+  let timer = setTimeout(giveUp, JSON_BODY_IDLE_MS);
   try {
     while (true) {
       const { done, value } = await reader.read();
       if (tooSlow) throw new AppError("The request took too long to arrive", 408, "REQUEST_TIMEOUT");
+      clearTimeout(timer);
+      timer = setTimeout(giveUp, JSON_BODY_IDLE_MS);
       if (done) break;
       total += value.byteLength;
       if (total > maxBytes) {
