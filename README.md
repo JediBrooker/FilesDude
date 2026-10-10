@@ -298,21 +298,23 @@ name, and each file shows its progress as it uploads.
 - Like download links, upload links follow the folder when it's renamed or moved, and
   stop working if it's deleted or replaced.
 
-## Image thumbnails
+## Image thumbnails and details
 
 Images (JPEG, PNG, GIF, WebP, and AVIF, up to 64 MB and 100 megapixels) get thumbnails in
-grid view, made by sharp. Decoders parse files other people control, anyone with an upload
+grid view, made by sharp, and their details (dimensions, format, colour, frames, and the
+camera and date taken from EXIF) under **Image** in Properties, read by sharp too. Decoders parse files other people control, anyone with an upload
 link included, so FilesDude never decodes images itself: a separate Node.js process does,
-handed the already-opened file (never its path) and returning only the thumbnail. When the
+handed the already-opened file (never its path) and returning only the thumbnail, or the
+details as a small JSON object that FilesDude checks field by field. When the
 service runs as root, that process runs in the same throwaway sandbox as ffmpeg (below),
 with Node.js and FilesDude's `node_modules` shown to it read-only, so it needs Linux,
 systemd, and those readable by other users (the installer sees to that); without the
-sandbox, a server running as root shows no image thumbnails rather than decode them as
-root. Running as another account (a development machine, or `--service-user filesdude`),
+sandbox, a server running as root shows no image thumbnails or details rather than read
+images as root. Running as another account (a development machine, or `--service-user filesdude`),
 the process runs as that account with all of its access, so it only keeps a crash or
 runaway decode from taking FilesDude down. Either way only the decoders for those formats
 are enabled, the process is stopped after 15 seconds, and two images are decoded at a
-time. Next.js's built-in image optimizer, which would decode images inside FilesDude, is
+time (details included). Next.js's built-in image optimizer, which would decode images inside FilesDude, is
 turned off.
 
 ## Video thumbnails
@@ -333,8 +335,8 @@ off.
 
 The same sandbox runs ffprobe (`/usr/bin/ffprobe`, or set `FILEDUDE_FFPROBE_PATH`) for the
 length, resolution, codecs, and tags shown under **Video** or **Audio** in Properties; set
-`FILEDUDE_MEDIA_INFO=false` to turn that off. Image details are read by sharp from images
-up to 64 MB.
+`FILEDUDE_MEDIA_INFO=false` to turn that off. Image details are read like image
+thumbnails (above).
 
 ## Activity
 

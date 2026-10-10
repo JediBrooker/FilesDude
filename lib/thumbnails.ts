@@ -100,20 +100,6 @@ async function usableCacheDirectory() {
   return stat && stat.isDirectory() && stat.uid === ownUid && (stat.mode & 0o077) === 0 ? directory : null;
 }
 
-// Reads at most the size measured when the file was opened, refusing a file that has since grown,
-// so a sparse file enlarged mid-request can't force a huge allocation.
-export async function readExactly(handle: Awaited<ReturnType<typeof fs.open>>, size: number) {
-  const buffer = Buffer.alloc(size + 1);
-  let offset = 0;
-  while (offset < buffer.length) {
-    const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
-    if (!bytesRead) break;
-    offset += bytesRead;
-  }
-  if (offset > size) throw new AppError("This image changed while it was being read", 409, "IMAGE_CHANGED");
-  return buffer.subarray(0, offset);
-}
-
 // Keeps the cache bounded by removing the least recently written thumbnails.
 async function pruneCache(directory: string) {
   const names = (await fs.readdir(directory).catch(() => [] as string[])).filter((name) => name.endsWith(".webp"));
