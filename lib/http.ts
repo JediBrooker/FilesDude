@@ -26,6 +26,8 @@ export function jsonError(error: unknown) {
   );
 }
 
+const JSON_BODY_TIMEOUT_MS = 30_000;
+
 export async function readJsonBody<T>(request: Request, maxBytes = 64 * 1024): Promise<T> {
   const contentType = request.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
   if (contentType !== "application/json") {
@@ -41,9 +43,17 @@ export async function readJsonBody<T>(request: Request, maxBytes = 64 * 1024): P
   const reader = request.body.getReader();
   const chunks: Buffer[] = [];
   let total = 0;
+  // A small body has no reason to arrive slowly; one trickled in is given up on, so it can't hold
+  // the connection (and this request) open.
+  let tooSlow = false;
+  const timer = setTimeout(() => {
+    tooSlow = true;
+    void reader.cancel().catch(() => undefined);
+  }, JSON_BODY_TIMEOUT_MS);
   try {
     while (true) {
       const { done, value } = await reader.read();
+      if (tooSlow) throw new AppError("The request took too long to arrive", 408, "REQUEST_TIMEOUT");
       if (done) break;
       total += value.byteLength;
       if (total > maxBytes) {
@@ -53,6 +63,7 @@ export async function readJsonBody<T>(request: Request, maxBytes = 64 * 1024): P
       chunks.push(Buffer.from(value));
     }
   } finally {
+    clearTimeout(timer);
     reader.releaseLock();
   }
 

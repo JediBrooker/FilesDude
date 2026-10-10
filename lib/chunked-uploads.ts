@@ -9,7 +9,8 @@ import { forgetCopies, recordCopy } from "./copy-journal";
 import { audit } from "./audit";
 import { acquireFilesystemLock, identityOf, inside, isReservedLocation, placeEntry, relativeFromAbsolute, removeCreated, safeResolve, verifyFileHandleWithinRoot } from "./files";
 import { AppError } from "./http";
-import { openUploadFolder, reserveUpload, type UploadShare } from "./shares";
+import { claimLinkSlot } from "./link-slots";
+import { bytesInProgress as linkBytesInProgress, openUploadFolder, reserveUpload, type UploadShare } from "./shares";
 import type { UploadDestination } from "./upload-destination";
 import { addressGroup, applyOwnership, publicName, reservePublicTarget, reserveTarget, uploadName, withPublicNames } from "./upload-target";
 
@@ -27,9 +28,6 @@ const IDLE_MS = 30 * 60_000;
 // Uploads through upload links come from strangers, so they get less: a few at a time per link and
 // per address, a shorter idle time, a deadline (a minute plus the file at a slow 64 KB/s), and the
 // disk always keeps some space free.
-const MAX_LINK_UPLOADS = 8;
-const MAX_PER_LINK = 3;
-const MAX_PER_ADDRESS = 3;
 const LINK_IDLE_MS = 5 * 60_000;
 const SLOWEST_BYTES_PER_SECOND = 64 * 1024;
 const LINK_KEEP_FREE_BYTES = 2 * 1024 ** 3;
@@ -58,6 +56,10 @@ type ChunkedUpload = {
   from?: string;
   settle?: (saved?: number) => Promise<void>;
   deadline: number | null;
+  releaseSlot?: () => void;
+  startedAt: number;
+  /** Set the moment it's discarded, so a finish already under way doesn't place it. */
+  discarded: boolean;
   name: string;
   temporary: string;
   handle: FileHandle;
@@ -70,6 +72,8 @@ type ChunkedUpload = {
 };
 
 const uploads = new Map<string, ChunkedUpload>();
+// Uploads being started, counted towards the limit on uploads before anything is waited on.
+let starting = 0;
 let sweeper: NodeJS.Timeout | null = null;
 
 function startSweeper() {
@@ -93,8 +97,16 @@ function placeholderName(name: string) {
 }
 
 function expired(upload: ChunkedUpload, now = Date.now()) {
+  // A piece or a finish in progress is left to end first.
+  if (upload.busy) return false;
   if (upload.deadline !== null && now > upload.deadline) return true;
-  return !upload.busy && now - upload.lastActivity > (upload.owner.kind === "link" ? LINK_IDLE_MS : IDLE_MS);
+  if (upload.owner.kind === "link") {
+    // A stranger's upload has to keep up a slow but steady pace after its first two minutes, so it
+    // can't hold the link's room with a byte now and then.
+    const elapsed = now - upload.startedAt - 120_000;
+    if (elapsed > 0 && upload.received < (elapsed / 1000) * SLOWEST_BYTES_PER_SECOND) return true;
+  }
+  return now - upload.lastActivity > (upload.owner.kind === "link" ? LINK_IDLE_MS : IDLE_MS);
 }
 
 function find(owner: UploadOwner, id: unknown) {
@@ -107,10 +119,14 @@ function find(owner: UploadOwner, id: unknown) {
 
 async function discard(upload: ChunkedUpload, reason: "cancelled" | "abandoned" | "account changed" | "link revoked") {
   if (!uploads.delete(upload.id)) return;
-  await upload.settle?.().catch(() => undefined);
-  await upload.handle.close().catch(() => undefined);
+  upload.discarded = true;
+  upload.releaseSlot?.();
   const release = await acquireFilesystemLock();
   try {
+    // Under the lock, after any finish already placing the file: if it got there first, the room it
+    // used stays counted and there's no placeholder left to remove.
+    await upload.settle?.().catch(() => undefined);
+    await upload.handle.close().catch(() => undefined);
     await removeCreated(upload.destination.into, upload.temporary, upload.identity).catch(() => undefined);
   } finally {
     release();
@@ -122,7 +138,7 @@ async function discard(upload: ChunkedUpload, reason: "cancelled" | "abandoned" 
 }
 
 /** Creates the journaled placeholder and records the upload. */
-async function begin(owner: UploadOwner, destination: PieceDestination, name: string, size: number, extra: Pick<ChunkedUpload, "from" | "settle" | "deadline">) {
+async function begin(owner: UploadOwner, destination: PieceDestination, name: string, size: number, extra: Pick<ChunkedUpload, "from" | "settle" | "deadline" | "releaseSlot">) {
   const placeholder = owner.kind === "link"
     ? await reservePublicTarget(destination.into, placeholderName(name))
     : await reserveTarget(destination.into, destination.directory, placeholderName(name));
@@ -147,6 +163,8 @@ async function begin(owner: UploadOwner, destination: PieceDestination, name: st
       received: 0,
       busy: false,
       lastActivity: Date.now(),
+      startedAt: Date.now(),
+      discarded: false,
     };
     uploads.set(upload.id, upload);
     startSweeper();
@@ -165,13 +183,15 @@ function checkSize(rawSize: unknown) {
   return size;
 }
 
+// Free space on a folder's disk, less what uploads in progress have still to write: accounts' uploads
+// in pieces, and everything promised to uploads through links (in pieces or not).
 async function freeBytes(folder: PieceDestination["into"]) {
   const disk = await fsp.statfs(folder.base);
-  return Number(disk.bavail) * Number(disk.bsize) - bytesStillComing();
+  return Number(disk.bavail) * Number(disk.bsize) - accountBytesStillComing() - linkBytesInProgress();
 }
 
-// Space still to be written by the uploads in progress.
-const bytesStillComing = () => [...uploads.values()].reduce((total, upload) => total + upload.size - upload.received, 0);
+/** Space accounts' uploads in pieces have still to write. */
+export const accountBytesStillComing = () => [...uploads.values()].reduce((total, upload) => total + (upload.owner.kind === "account" ? upload.size - upload.received : 0), 0);
 
 /**
  * Starts uploading a file of `size` bytes into an opened destination, which this upload then owns
@@ -184,9 +204,14 @@ export async function startChunkedUpload(session: Session, destination: UploadDe
   await safeResolve([destination.directory, name].filter(Boolean).join("/"), { mustExist: false });
   const owner = accountOwner(session);
   if ([...uploads.values()].filter((upload) => upload.owner.kind === "account" && upload.owner.accountKey === session.accountKey).length >= MAX_PER_ACCOUNT) throw new AppError(`At most ${MAX_PER_ACCOUNT} large uploads can run at once`, 429, "TOO_MANY_UPLOADS");
-  if (uploads.size >= MAX_UPLOADS) throw new AppError("The server is busy with other uploads. Try again in a minute.", 503, "BUSY");
-  if ((await freeBytes(destination.into)) < size) throw new AppError("There isn't enough free space for this file", 507, "DISK_FULL");
-  return begin(owner, destination, name, size, { deadline: null });
+  if (uploads.size + starting >= MAX_UPLOADS) throw new AppError("The server is busy with other uploads. Try again in a minute.", 503, "BUSY");
+  starting += 1;
+  try {
+    if ((await freeBytes(destination.into)) < size) throw new AppError("There isn't enough free space for this file", 507, "DISK_FULL");
+    return await begin(owner, destination, name, size, { deadline: null });
+  } finally {
+    starting -= 1;
+  }
 }
 
 /**
@@ -199,14 +224,14 @@ export async function startLinkUpload(share: UploadShare, address: string, rawNa
   const name = publicName(rawName);
   const from = typeof rawFrom === "string" ? rawFrom.replace(/[\p{Cc}\p{Cf}]/gu, "").trim().slice(0, 64) : "";
   const owner: UploadOwner = { kind: "link", shareId: share.id, group: addressGroup(address) };
-  const linkUploads = [...uploads.values()].filter((upload) => upload.owner.kind === "link");
-  if (uploads.size >= MAX_UPLOADS || linkUploads.length >= MAX_LINK_UPLOADS) throw new AppError("The server is busy with other uploads. Try again in a minute.", 503, "BUSY");
-  if (linkUploads.filter((upload) => upload.owner.kind === "link" && upload.owner.shareId === share.id).length >= MAX_PER_LINK) throw new AppError("This link is busy with other uploads. Try again in a minute.", 503, "BUSY");
-  if (linkUploads.filter((upload) => upload.owner.kind === "link" && upload.owner.group === owner.group).length >= MAX_PER_ADDRESS) throw new AppError(`Upload at most ${MAX_PER_ADDRESS} files at a time`, 429, "TOO_MANY_UPLOADS");
-
-  const settle = await reserveUpload(share.id, Math.max(size, MIN_FILE_COST));
+  // Every limit is checked and claimed before anything is waited on.
+  if (uploads.size + starting >= MAX_UPLOADS) throw new AppError("The server is busy with other uploads. Try again in a minute.", 503, "BUSY");
+  const releaseSlot = claimLinkSlot(share.id, address);
+  starting += 1;
+  let settle: ((saved?: number) => Promise<void>) | null = null;
   let folder: PieceDestination["into"] | null = null;
   try {
+    settle = await reserveUpload(share.id, Math.max(size, MIN_FILE_COST));
     const release = await acquireFilesystemLock();
     try {
       folder = await openUploadFolder(share);
@@ -214,16 +239,20 @@ export async function startLinkUpload(share: UploadShare, address: string, rawNa
       release();
     }
     if (!folder) throw new AppError("This link is invalid, has expired, or the folder is no longer available.", 404, "NOT_FOUND");
-    if ((await freeBytes(folder)) - size < LINK_KEEP_FREE_BYTES) throw new AppError("The server doesn't have room for this file", 507, "DISK_FULL");
+    // This upload's own room is already counted among those in progress.
+    if ((await freeBytes(folder)) < LINK_KEEP_FREE_BYTES) throw new AppError("The server doesn't have room for this file", 507, "DISK_FULL");
     const opened = folder;
     // When running as root, a stranger's file belongs to the folder's owner, like other new items.
     const ownership = typeof process.getuid === "function" && process.getuid() === 0 ? { uid: opened.stat.uid, gid: opened.stat.gid } : null;
     const destination: PieceDestination = { into: opened, directory: share.path, ownership, batch: undefined, close: async () => { await opened.handle.close().catch(() => undefined); } };
-    return await begin(owner, destination, name, size, { from, settle, deadline: Date.now() + 60_000 + (size / SLOWEST_BYTES_PER_SECOND) * 1000 });
+    return await begin(owner, destination, name, size, { from, settle, releaseSlot, deadline: Date.now() + 60_000 + (size / SLOWEST_BYTES_PER_SECOND) * 1000 });
   } catch (error) {
     await folder?.handle.close().catch(() => undefined);
-    await settle();
+    await settle?.();
+    releaseSlot();
     throw error;
+  } finally {
+    starting -= 1;
   }
 }
 
@@ -279,6 +308,8 @@ export async function finishChunkedUpload(owner: UploadOwner, id: unknown) {
   const { into, directory, ownership } = upload.destination;
   const release = await acquireFilesystemLock();
   try {
+    // Discarded while this waited (cancelled, revoked, or out of time): it isn't placed.
+    if (upload.discarded || uploads.get(upload.id) !== upload) throw new AppError("That upload has expired or was cancelled. Start it again.", 404, "UPLOAD_NOT_FOUND");
     const current = await fsp.lstat(inside(into, upload.temporary)).catch(() => null);
     if (!current || identityOf(current) !== upload.identity) throw new AppError("The upload's placeholder was changed or removed", 409, "PATH_CHANGED");
     // The folder is used where it is now: it may have been moved or deleted since the upload began.
@@ -325,6 +356,7 @@ export async function finishChunkedUpload(owner: UploadOwner, id: unknown) {
       throw new AppError("The upload's placeholder was changed or removed", 409, "PATH_CHANGED");
     }
     uploads.delete(upload.id);
+    upload.releaseSlot?.();
     await upload.settle?.(Math.max(upload.size, MIN_FILE_COST)).catch((error: unknown) => console.error("Could not record an upload on its link", error));
     await upload.handle.close().catch(() => undefined);
     await forgetCopies([upload.journalId]).catch((error: unknown) => console.error("Could not update the copy journal", error));

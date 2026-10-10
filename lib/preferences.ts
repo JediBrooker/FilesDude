@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { config } from "./config";
 import { AppError } from "./http";
+import { allowLongRequests } from "./peer";
 import type { UploadOwnershipPreference } from "./types";
 
 export interface StoredPreferences {
@@ -64,6 +65,12 @@ export function parseUploadOwnershipPreference(value: unknown): UploadOwnershipP
 }
 
 export async function getPreferences(): Promise<StoredPreferences> {
+  const preferences = await readPreferences();
+  allowLongRequests(!preferences.uploadInPieces);
+  return preferences;
+}
+
+async function readPreferences(): Promise<StoredPreferences> {
   try {
     const value = JSON.parse(await fs.readFile(preferencesFile(), "utf8")) as Partial<StoredPreferences>;
     return {
@@ -86,4 +93,5 @@ export async function savePreferences(preferences: StoredPreferences) {
   const temporary = path.join(config.stateDir, `preferences-${crypto.randomUUID()}.tmp`);
   await fs.writeFile(temporary, `${JSON.stringify(preferences, null, 2)}\n`, { mode: 0o600 });
   await fs.rename(temporary, preferencesFile());
+  allowLongRequests(!preferences.uploadInPieces);
 }
