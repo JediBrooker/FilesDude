@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { config } from "./config";
 import { AppError } from "./http";
+import { addressGroup } from "./address-group";
 
 // Messages to the owner's phone or chat when something worth knowing happens: files arriving through
 // upload links, signs of someone trying to get in, changes to sign-in security, sign-ins (if wanted),
@@ -19,8 +20,12 @@ export type NotificationSettings = Omit<StoredSettings, "token"> & { hasToken: b
 
 const DEFAULT_TOPICS: Record<NotificationTopic, boolean> = { uploads: true, security: true, signIns: false, storage: true };
 const defaults: StoredSettings = { kind: null, url: "", token: "", topics: DEFAULT_TOPICS };
-// No more than this many messages an hour, so a flood of events can't flood the owner's phone.
-const MAX_PER_HOUR = 30;
+// No more than so many messages an hour, so a flood of events can't flood the owner's phone. What
+// strangers can set off (failed sign-ins, wrong link passwords, files through upload links) has its
+// own smaller allowance, so it can never use up the room for changes made by signed-in accounts,
+// sign-ins, and storage alerts.
+const MAX_PER_HOUR = { public: 10, account: 30 };
+type Budget = keyof typeof MAX_PER_HOUR;
 const SEND_TIMEOUT_MS = 10_000;
 
 const settingsFile = () => path.join(config.stateDir, "notifications.json");
@@ -61,6 +66,7 @@ function checkUrl(value: unknown) {
     throw new AppError("That isn't a valid address", 400, "INVALID_URL");
   }
   if (url.protocol !== "https:" && url.protocol !== "http:") throw new AppError("Notifications go to an http:// or https:// address", 400, "INVALID_URL");
+  if (url.username || url.password) throw new AppError("Leave the user name and password out of the address; for ntfy, use an access token", 400, "INVALID_URL");
   return url.toString();
 }
 
@@ -71,7 +77,9 @@ export async function saveNotificationSettings(input: { kind?: unknown; url?: un
   if (kind !== null && kind !== "ntfy" && kind !== "discord" && kind !== "slack" && kind !== "webhook") throw new AppError("Choose where to send notifications", 400, "INVALID_KIND");
   const url = kind === null ? "" : checkUrl(input.url);
   if (input.token !== undefined && (typeof input.token !== "string" || input.token.length > 512)) throw new AppError("The access token is invalid", 400, "INVALID_TOKEN");
-  const token = kind === "ntfy" ? (input.token === undefined ? current.token : String(input.token).trim()) : "";
+  // A saved token is only kept for the same server, so it's never sent somewhere new.
+  const sameServer = Boolean(current.url) && kind === current.kind && new URL(url).origin === new URL(current.url).origin;
+  const token = kind === "ntfy" ? (input.token === undefined ? (sameServer ? current.token : "") : String(input.token).trim()) : "";
   const requested = input.topics && typeof input.topics === "object" ? input.topics as Record<string, unknown> : {};
   const topics = Object.fromEntries(NOTIFICATION_TOPICS.map((topic) => [topic, typeof requested[topic] === "boolean" ? requested[topic] : current.topics[topic]])) as Record<NotificationTopic, boolean>;
   const settings: StoredSettings = { kind, url, token, topics };
@@ -85,10 +93,13 @@ export async function saveNotificationSettings(input: { kind?: unknown; url?: un
 
 // --- Sending ---
 
-export type Notification = { topic: NotificationTopic; title: string; message: string; urgent?: boolean };
+export type Notification = { topic: NotificationTopic; title: string; message: string; urgent?: boolean; budget?: Budget };
 
-const sentTimes: number[] = [];
-let droppedSinceLimit = 0;
+const sentTimes: Record<Budget, number[]> = { public: [], account: [] };
+const droppedSinceLimit: Record<Budget, number> = { public: 0, account: 0 };
+const scrubAddresses = (text: string) => text.replace(/https?:\/\/\S+/g, "the address");
+// Text from strangers may hold web addresses; they're broken up so chat apps don't make them links.
+const unlink = (text: string) => text.replace(/:\/\//g, ":​//").replace(/\bwww\./gi, (match) => `${match.slice(0, 3)}​.`);
 
 // Names and other text from users are shown as text, not formatting or mentions, in chat apps.
 const escapeSlack = (text: string) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -109,9 +120,10 @@ function request(settings: StoredSettings, note: Notification): { body: string; 
         },
       };
     case "discord":
-      return { body: JSON.stringify({ content: `**${escapeDiscord(note.title)}**\n${escapeDiscord(note.message)}`.slice(0, 2000), allowed_mentions: { parse: [] } }), headers: { "Content-Type": "application/json" } };
+      // flags 4: no link previews.
+      return { body: JSON.stringify({ content: `**${escapeDiscord(unlink(note.title))}**\n${escapeDiscord(unlink(note.message))}`.slice(0, 2000), allowed_mentions: { parse: [] }, flags: 4 }), headers: { "Content-Type": "application/json" } };
     case "slack":
-      return { body: JSON.stringify({ text: `*${escapeSlack(note.title)}*\n${escapeSlack(note.message)}` }), headers: { "Content-Type": "application/json" } };
+      return { body: JSON.stringify({ text: `*${escapeSlack(unlink(note.title))}*\n${escapeSlack(unlink(note.message))}`, unfurl_links: false, unfurl_media: false }), headers: { "Content-Type": "application/json" } };
     default:
       return { body: JSON.stringify({ source: "filesdude", topic: note.topic, title: note.title, message: note.message, urgent: Boolean(note.urgent), at: new Date().toISOString() }), headers: { "Content-Type": "application/json" } };
   }
@@ -129,21 +141,23 @@ export async function notify(note: Notification) {
   try {
     const settings = await readSettings();
     if (!settings.kind || !settings.url || !settings.topics[note.topic]) return;
+    const budget = note.budget ?? "account";
+    const times = sentTimes[budget];
     const now = Date.now();
-    while (sentTimes.length && now - sentTimes[0] > 3_600_000) sentTimes.shift();
-    if (sentTimes.length >= MAX_PER_HOUR) {
-      droppedSinceLimit += 1;
+    while (times.length && now - times[0] > 3_600_000) times.shift();
+    if (times.length >= MAX_PER_HOUR[budget]) {
+      droppedSinceLimit[budget] += 1;
       return;
     }
-    sentTimes.push(now);
-    if (droppedSinceLimit) {
-      const dropped = droppedSinceLimit;
-      droppedSinceLimit = 0;
-      note = { ...note, message: `${note.message}\n\n(${dropped} earlier ${dropped === 1 ? "notification wasn't" : "notifications weren't"} sent: more than ${MAX_PER_HOUR} in an hour. See Activity.)` };
+    times.push(now);
+    if (droppedSinceLimit[budget]) {
+      const dropped = droppedSinceLimit[budget];
+      droppedSinceLimit[budget] = 0;
+      note = { ...note, message: `${note.message}\n\n(${dropped} earlier ${dropped === 1 ? "notification like this wasn't" : "notifications like this weren't"} sent: too many in an hour. See Activity.)` };
     }
     await deliver(settings, note);
   } catch (error) {
-    console.error("A notification could not be sent:", (error as Error).message);
+    console.error("A notification could not be sent:", scrubAddresses((error as Error).message));
   }
 }
 
@@ -154,7 +168,7 @@ export async function sendTestNotification() {
   try {
     await deliver(settings, { topic: "security", title: "FilesDude test", message: "Notifications from FilesDude are working." });
   } catch (error) {
-    const message = (error as Error).name === "TimeoutError" ? "The notification service didn't answer in time" : (error as Error).message.replace(/https?:\/\/\S+/g, "the address");
+    const message = (error as Error).name === "TimeoutError" ? "The notification service didn't answer in time" : scrubAddresses((error as Error).message);
     throw new AppError(`The test notification wasn't delivered: ${message}`, 502, "NOTIFICATION_FAILED");
   }
 }
@@ -169,15 +183,19 @@ const formatBytes = (bytes: number) => {
   return `${(bytes / 1024 ** index).toFixed(index ? 1 : 0)} ${units[index]}`;
 };
 
-// Files arriving through one link close together are told as one message.
+// Files arriving through one link close together are told as one message: within two minutes, or
+// fifteen if the link was told about in the last half hour, so one link can't send many messages.
 const UPLOAD_GATHER_MS = 2 * 60_000;
+const BUSY_LINK_GATHER_MS = 15 * 60_000;
 const arriving = new Map<string, { path: string; files: string[]; bytes: number; from: Set<string>; timer: NodeJS.Timeout }>();
+const lastUploadNote = new Map<string, number>();
 
 function gatherUpload(details: Record<string, unknown>) {
   const id = str(details.id);
   let batch = arriving.get(id);
   if (!batch) {
-    batch = { path: str(details.path), files: [], bytes: 0, from: new Set(), timer: setTimeout(() => sendUploads(id), UPLOAD_GATHER_MS) };
+    const recently = Date.now() - (lastUploadNote.get(id) ?? 0) < 30 * 60_000;
+    batch = { path: str(details.path), files: [], bytes: 0, from: new Set(), timer: setTimeout(() => sendUploads(id), recently ? BUSY_LINK_GATHER_MS : UPLOAD_GATHER_MS) };
     batch.timer.unref?.();
     arriving.set(id, batch);
   }
@@ -190,29 +208,53 @@ function sendUploads(id: string) {
   const batch = arriving.get(id);
   arriving.delete(id);
   if (!batch) return;
+  if (lastUploadNote.size > 1_000) lastUploadNote.clear();
+  lastUploadNote.set(id, Date.now());
   const count = batch.files.length;
   const who = batch.from.size ? ` from ${[...batch.from].join(", ")}` : "";
   const names = batch.files.slice(0, 5).join(", ") + (count > 5 ? `, and ${count - 5} more` : "");
-  void notify({ topic: "uploads", title: `${count} ${count === 1 ? "file" : "files"} received`, message: `${names} (${formatBytes(batch.bytes)}) arrived in /${batch.path} through an upload link${who}.` });
+  void notify({ topic: "uploads", budget: "public", title: `${count} ${count === 1 ? "file" : "files"} received`, message: `${names} (${formatBytes(batch.bytes)}) arrived in /${batch.path} through an upload link${who}.` });
 }
 
-// Failed sign-ins are told once an address has failed five times in 15 minutes.
+// Failed sign-ins are told once an address (an IPv6 /64 counts as one) has failed five times in 15
+// minutes: the first straight away, and any more in the next 15 minutes as one summary.
 const FAILURE_WINDOW_MS = 15 * 60_000;
 const failures = new Map<string, { count: number; resetAt: number; told: boolean }>();
+const failureSummary: { until: number; addresses: Set<string>; timer: NodeJS.Timeout | null } = { until: 0, addresses: new Set(), timer: null };
+
+function sendFailureSummary() {
+  failureSummary.timer = null;
+  const addresses = [...failureSummary.addresses];
+  failureSummary.addresses.clear();
+  if (!addresses.length) return;
+  failureSummary.until = Date.now() + FAILURE_WINDOW_MS;
+  failureSummary.timer = setTimeout(sendFailureSummary, FAILURE_WINDOW_MS);
+  failureSummary.timer.unref?.();
+  void notify({ topic: "security", budget: "public", urgent: true, title: "More failed sign-ins", message: `${addresses.length} more ${addresses.length === 1 ? "address has" : "addresses have"} failed to sign in 5 times in 15 minutes: ${addresses.slice(0, 5).join(", ")}${addresses.length > 5 ? `, and ${addresses.length - 5} more` : ""}. See Activity.` });
+}
 
 function countFailure(address: string, what: string) {
   const now = Date.now();
+  const group = address ? addressGroup(address) : "an unknown address";
   if (failures.size > 5_000) for (const [key, entry] of failures) if (entry.resetAt <= now) failures.delete(key);
-  let entry = failures.get(address);
+  let entry = failures.get(group);
   if (!entry || entry.resetAt <= now) {
     entry = { count: 0, resetAt: now + FAILURE_WINDOW_MS, told: false };
-    failures.set(address, entry);
+    failures.set(group, entry);
   }
   entry.count += 1;
-  if (entry.count >= 5 && !entry.told) {
-    entry.told = true;
-    void notify({ topic: "security", urgent: true, title: "Repeated failed sign-ins", message: `${address || "An unknown address"} has ${what} 5 times in 15 minutes. Sign-ins from it are now paused for a while.` });
+  if (entry.count < 5 || entry.told) return;
+  entry.told = true;
+  if (now < failureSummary.until) {
+    if (failureSummary.addresses.size < 1_000) failureSummary.addresses.add(group);
+    return;
   }
+  failureSummary.until = now + FAILURE_WINDOW_MS;
+  if (!failureSummary.timer) {
+    failureSummary.timer = setTimeout(sendFailureSummary, FAILURE_WINDOW_MS);
+    failureSummary.timer.unref?.();
+  }
+  void notify({ topic: "security", budget: "public", urgent: true, title: "Repeated failed sign-ins", message: `${group} has ${what} 5 times in 15 minutes. Sign-ins from it are now paused for a while.` });
 }
 
 /** Turns what the audit log records into notifications. Called for every entry written. */
@@ -223,7 +265,7 @@ export function notifyFromAudit(event: string, details: Record<string, unknown>)
       gatherUpload(details);
       return;
     case "share.unlock_locked":
-      void notify({ topic: "security", urgent: true, title: "A link was closed", message: `So many wrong passwords were tried for the link to /${str(details.path)} that it's closed for 15 minutes (last from ${str(details.address) || "an unknown address"}).` });
+      void notify({ topic: "security", budget: "public", urgent: true, title: "A link was closed", message: `So many wrong passwords were tried for the link to /${str(details.path)} that it's closed for 15 minutes (last from ${str(details.address) || "an unknown address"}).` });
       return;
     case "login.failed":
       countFailure(str(details.client), "failed to sign in");
@@ -290,8 +332,14 @@ export function flushNotificationsForTests() {
     sendUploads(id);
   }
   failures.clear();
-  sentTimes.length = 0;
-  droppedSinceLimit = 0;
+  if (failureSummary.timer) clearTimeout(failureSummary.timer);
+  Object.assign(failureSummary, { until: 0, timer: null });
+  failureSummary.addresses.clear();
+  lastUploadNote.clear();
+  sentTimes.public.length = 0;
+  sentTimes.account.length = 0;
+  droppedSinceLimit.public = 0;
+  droppedSinceLimit.account = 0;
   lowSpaceTold = false;
   cache = null;
 }

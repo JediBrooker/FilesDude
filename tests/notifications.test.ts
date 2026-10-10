@@ -56,6 +56,11 @@ test("settings are checked and saved, and the ntfy token is never shown", async 
     // Leaving the token out keeps it; an empty one removes it.
     assert.equal((await saveNotificationSettings({ kind: "ntfy", url })).hasToken, true);
     assert.equal((await saveNotificationSettings({ kind: "ntfy", url, token: "" })).hasToken, false);
+    // A token isn't carried over to a different server.
+    await saveNotificationSettings({ kind: "ntfy", url, token: "tk_private" });
+    assert.equal((await saveNotificationSettings({ kind: "ntfy", url: "https://ntfy.sh/other-topic" })).hasToken, false);
+    // Credentials in the address are refused (they'd only end up in logs).
+    await assert.rejects(saveNotificationSettings({ kind: "ntfy", url: "https://user:secret@ntfy.example.com/topic" }), /user name and password/);
     assert.equal((await fs.stat(path.join(config.stateDir, "notifications.json"))).mode & 0o777, 0o600);
     assert.equal((await saveNotificationSettings({ kind: "off" })).kind, null);
   });
@@ -74,11 +79,14 @@ test("each service gets its own format, with names shown as text", async () => {
     await notify({ topic: "uploads", title: "1 file received", message: "@everyone **bold** <@123>" });
     const discord = JSON.parse(received[1].body);
     assert.deepEqual(discord.allowed_mentions, { parse: [] });
+    assert.equal(discord.flags, 4);
     assert.match(discord.content, /\\@everyone \\\*\\\*bold\\\*\\\*/);
 
     await saveNotificationSettings({ kind: "slack", url });
-    await notify({ topic: "uploads", title: "x", message: "<!channel> & <script>" });
-    assert.equal(JSON.parse(received[2].body).text, "*x*\n&lt;!channel&gt; &amp; &lt;script&gt;");
+    await notify({ topic: "uploads", title: "x", message: "<!channel> & <script> https://evil.example/login" });
+    const slack = JSON.parse(received[2].body);
+    assert.equal(slack.text, "*x*\n&lt;!channel&gt; &amp; &lt;script&gt; https:​//evil.example/login");
+    assert.equal(slack.unfurl_links, false);
 
     await saveNotificationSettings({ kind: "webhook", url });
     await notify({ topic: "storage", title: "t", message: "m" });
@@ -121,9 +129,37 @@ test("what the audit log records becomes notifications, gathered and limited", a
     await new Promise((resolve) => setTimeout(resolve, 50));
     assert.equal(received.length, 3);
 
-    // At most 30 an hour; the next one that gets through says how many were held back.
+    // At most 30 an hour for account events (the sign-in above was one); the two messages
+    // strangers set off came from their own allowance.
     for (let index = 0; index < 40; index += 1) await notify({ topic: "security", title: `n${index}`, message: "m" });
-    assert.equal(received.length, 30);
+    assert.equal(received.length, 32);
+  });
+});
+
+test("strangers can't use up the room for alerts about account changes", async () => {
+  await withReceiver(async ({ url, received }) => {
+    await saveNotificationSettings({ kind: "webhook", url });
+    // Failed sign-ins from many addresses: the first is told at once, the rest held for a summary.
+    for (let address = 1; address <= 30; address += 1) for (let attempt = 0; attempt < 5; attempt += 1) await audit("login.failed", { username: "admin", client: `203.0.113.${address}` });
+    await until(() => received.length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(received.length, 1);
+    // Upload links can't flood it either: their own allowance runs out first.
+    for (let index = 0; index < 20; index += 1) await notify({ topic: "uploads", budget: "public", title: "u", message: "m" });
+    assert.equal(received.length, 10);
+    // An account change is still told.
+    await audit("settings.two_factor.disabled", { username: "cbrooker" });
+    await until(() => received.length === 11);
+    assert.equal(JSON.parse(received[10].body).title, "Two-factor sign-in turned off");
+  });
+});
+
+test("an IPv6 /64 counts as one address for failed sign-ins", async () => {
+  await withReceiver(async ({ url, received }) => {
+    await saveNotificationSettings({ kind: "webhook", url });
+    for (let host = 1; host <= 5; host += 1) await audit("login.failed", { username: "admin", client: `2001:db8:1:2::${host}` });
+    await until(() => received.length === 1);
+    assert.match(JSON.parse(received[0].body).message, /2001:db8:1:2::\/64 has failed to sign in 5 times/);
   });
 });
 

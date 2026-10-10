@@ -110,6 +110,14 @@ async function write(event: string, details: Record<string, unknown>) {
   }
 }
 
+function notifySafely(event: string, details: Record<string, unknown>) {
+  try {
+    notifyFromAudit(event, details);
+  } catch (error) {
+    console.error("Unable to send a notification", error);
+  }
+}
+
 /**
  * Records an event. Writes happen one at a time (so rotation never races an append); if thousands
  * are waiting, new ones are counted and the count recorded instead, so a flood can't hold up
@@ -118,6 +126,7 @@ async function write(event: string, details: Record<string, unknown>) {
 export async function audit(event: string, details: Record<string, unknown> = {}) {
   if (pending >= MAX_PENDING) {
     dropped += 1;
+    notifySafely(event, details);
     return;
   }
   pending += 1;
@@ -125,15 +134,12 @@ export async function audit(event: string, details: Record<string, unknown> = {}
   queue = run.catch(() => undefined);
   try {
     await run;
-    // What's worth telling the owner about straight away is sent as a notification (if they're on).
-    try {
-      notifyFromAudit(event, details);
-    } catch (error) {
-      console.error("Unable to send a notification", error);
-    }
   } catch (error) {
     console.error("Unable to write audit event", error);
   } finally {
+    // What's worth telling the owner about straight away is sent as a notification (if they're on),
+    // even if the entry couldn't be written.
+    notifySafely(event, details);
     pending -= 1;
   }
 }

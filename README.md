@@ -376,9 +376,16 @@ hear about, and use **Save and send a test**.
   - *Every sign-in* (off unless chosen): who, how, and from where.
   - *Storage*: the managed disk falling below 10% free (checked hourly, told once until it
     recovers), and scheduled snapshots failing.
-- At most 30 messages are sent an hour; anything beyond is held back and the next message
-  says how many. File names and other text from users are shown as text, never as
-  formatting or mentions, in Discord and Slack.
+- What strangers can set off (failed sign-ins, wrong link passwords, files through upload
+  links) has its own allowance of 10 messages an hour, so it can never use up the 30 an hour
+  for changes made by accounts, sign-ins, and storage; anything beyond is held back and the
+  next message says how many. Failed sign-ins from more addresses within 15 minutes of an
+  alert come as one summary, an IPv6 /64 counts as one address, and a busy upload link is
+  told about every 15 minutes rather than every two.
+- File names and other text from users are shown as text, never as formatting, mentions,
+  links, or link previews, in Discord and Slack.
+- A saved ntfy token is only sent to the server it was saved for: changing to another server
+  needs it entered again.
 - The settings, including the address (which for Discord and Slack is itself a secret), are in
   `notifications.json` in the state directory, readable only by the service; the ntfy token
   is never sent to the browser.
