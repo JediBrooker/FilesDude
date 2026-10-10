@@ -1668,6 +1668,8 @@ export function FileManager() {
     setLoadedPath(null);
     setTags(new Map());
     setTagCounts(null);
+    setExpanded(new Set());
+    setChildListings(new Map());
     setAuth(initialAuth);
     await refreshAuth();
   };
