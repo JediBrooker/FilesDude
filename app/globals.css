@@ -786,6 +786,13 @@ button.snapshot-entry-name { cursor: pointer; font-weight: 700; }
 .login-divider { display: flex; align-items: center; gap: 10px; margin: -4px 0 -8px; color: var(--ink-faint); font-size: 10px; }
 .login-divider::before, .login-divider::after { content: ""; flex: 1; border-top: 1px solid var(--line); }
 .login-form > .login-divider + .login-button { margin-top: 0; }
+.notifications-form { padding-top: 16px !important; }
+.notification-topics { display: grid; gap: 6px; margin-top: 14px; }
+.notification-topic { display: flex; align-items: flex-start; gap: 9px; padding: 9px 10px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel-soft); cursor: pointer; }
+.notification-topic input { margin-top: 2px; }
+.notification-topic span { display: flex; flex-direction: column; gap: 2px; }
+.notification-topic strong { font-size: 11px; }
+.notification-topic small { color: var(--ink-faint); font-size: 10px; }
 .passkey-list { display: grid; gap: 6px; margin: 16px 0 0; padding: 0; list-style: none; }
 .passkey-list > li { display: flex; align-items: center; gap: 10px; padding: 9px 10px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel-soft); }
 .passkey-icon { display: grid; flex: 0 0 auto; width: 30px; height: 30px; place-items: center; border-radius: 8px; background: var(--brand-soft); color: var(--brand); }
@@ -795,7 +802,7 @@ button.snapshot-entry-name { cursor: pointer; font-weight: 700; }
 .passkey-actions { display: flex; flex: 0 0 auto; gap: 4px; }
 .passkey-rename { display: flex; min-width: 0; flex: 1; gap: 6px; }
 .passkey-rename input { min-width: 0; flex: 1; }
-.settings-section-title > .button { margin-left: auto; }
+.settings-section-title > .button { flex: 0 0 auto; margin-left: auto; white-space: nowrap; }
 .preferences-form .modal-actions { flex-wrap: wrap; }
 @media (max-width: 560px) { .two-factor-qr { flex-direction: column; align-items: flex-start; } .recovery-codes { grid-template-columns: 1fr; } }
 .trash-expiry { display: block; margin-top: 2px; color: var(--ink-soft); font-size: 9px; }

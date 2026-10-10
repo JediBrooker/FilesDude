@@ -2,6 +2,7 @@ import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { config } from "./config";
+import { notifyFromAudit } from "./notifications";
 
 // The audit log: one JSON object per line in audit.jsonl in the state directory. At 8 MB the file is
 // set aside as a dated archive (audit-<time>.jsonl) and a new one started. Archives are kept for at
@@ -109,6 +110,14 @@ async function write(event: string, details: Record<string, unknown>) {
   }
 }
 
+function notifySafely(event: string, details: Record<string, unknown>) {
+  try {
+    notifyFromAudit(event, details);
+  } catch (error) {
+    console.error("Unable to send a notification", error);
+  }
+}
+
 /**
  * Records an event. Writes happen one at a time (so rotation never races an append); if thousands
  * are waiting, new ones are counted and the count recorded instead, so a flood can't hold up
@@ -117,6 +126,7 @@ async function write(event: string, details: Record<string, unknown>) {
 export async function audit(event: string, details: Record<string, unknown> = {}) {
   if (pending >= MAX_PENDING) {
     dropped += 1;
+    notifySafely(event, details);
     return;
   }
   pending += 1;
@@ -127,6 +137,9 @@ export async function audit(event: string, details: Record<string, unknown> = {}
   } catch (error) {
     console.error("Unable to write audit event", error);
   } finally {
+    // What's worth telling the owner about straight away is sent as a notification (if they're on),
+    // even if the entry couldn't be written.
+    notifySafely(event, details);
     pending -= 1;
   }
 }

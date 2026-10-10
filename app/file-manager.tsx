@@ -7,6 +7,7 @@ import {
   ArrowLeft,
   ArrowRight,
   ArrowUpNarrowWide,
+  Bell,
   Camera,
   Check,
   ChevronDown,
@@ -58,6 +59,7 @@ import {
   RotateCcw,
   Scissors,
   Search,
+  Send,
   Server,
   Settings2,
   ShieldCheck,
@@ -134,6 +136,7 @@ type DialogState =
   | { kind: "preferences" }
   | { kind: "twoFactor" }
   | { kind: "passkeys" }
+  | { kind: "notifications" }
   | { kind: "snapshots" }
   | { kind: "duplicates" }
   | { kind: "versions"; entry: FileEntry }
@@ -1627,6 +1630,7 @@ export function FileManager() {
           onCredentialsUpdated={async () => { setDialog(null); await refreshAuth(); notify("Account preferences updated"); }}
           onTwoFactor={() => setDialog({ kind: "twoFactor" })}
           onPasskeys={() => setDialog({ kind: "passkeys" })}
+          onNotifications={() => setDialog({ kind: "notifications" })}
           uploadInPieces={auth.features?.uploadInPieces ?? true}
           onReveal={(entry) => { setDialog(null); navigate(entry.path.split("/").slice(0, -1).join("/")); }}
           onPreview={showPreview}
@@ -2034,7 +2038,7 @@ function JobPanel({ job, onCancel }: { job: JobState; onCancel: () => void }) {
   );
 }
 
-function DialogHost({ dialog, selected, currentPath, username, role, home, onClose, onRun, notify, onRefresh, onStartJob, onTransfer, onJob, canWrite, onSharesChanged, onCredentialsUpdated, onTwoFactor, onPasskeys, onReveal, onPreview, uploadInPieces }: {
+function DialogHost({ dialog, selected, currentPath, username, role, home, onClose, onRun, notify, onRefresh, onStartJob, onTransfer, onJob, canWrite, onSharesChanged, onCredentialsUpdated, onTwoFactor, onPasskeys, onNotifications, onReveal, onPreview, uploadInPieces }: {
   dialog: NonNullable<DialogState>;
   selected: FileEntry[];
   currentPath: string;
@@ -2053,6 +2057,7 @@ function DialogHost({ dialog, selected, currentPath, username, role, home, onClo
   onCredentialsUpdated: () => Promise<void>;
   onTwoFactor: () => void;
   onPasskeys: () => void;
+  onNotifications: () => void;
   uploadInPieces: boolean;
   onReveal: (entry: FileEntry) => void;
   onPreview: (entry: FileEntry, siblings?: FileEntry[]) => void;
@@ -2082,10 +2087,11 @@ function DialogHost({ dialog, selected, currentPath, username, role, home, onClo
   if (dialog.kind === "edit") return <EditDialog entry={dialog.entry} onClose={onClose} onRun={onRun} />;
   if (dialog.kind === "twoFactor") return <TwoFactorDialog onClose={onClose} notify={notify} />;
   if (dialog.kind === "passkeys") return <PasskeysDialog onClose={onClose} notify={notify} />;
+  if (dialog.kind === "notifications") return <NotificationsDialog onClose={onClose} notify={notify} />;
   if (dialog.kind === "snapshots") return <SnapshotsDialog isOwner={role === "owner"} canWrite={canWrite} home={home} onClose={onClose} notify={notify} onJob={onJob} />;
   if (dialog.kind === "versions") return <VersionsDialog entry={dialog.entry} canWrite={canWrite} isOwner={role === "owner"} onClose={onClose} notify={notify} onJob={onJob} />;
   if (dialog.kind === "preferences") return role === "owner"
-    ? <PreferencesDialog username={username} onClose={onClose} onUpdated={onCredentialsUpdated} onTwoFactor={onTwoFactor} onPasskeys={onPasskeys} />
+    ? <PreferencesDialog username={username} onClose={onClose} onUpdated={onCredentialsUpdated} onTwoFactor={onTwoFactor} onPasskeys={onPasskeys} onNotifications={onNotifications} />
     : <AccountPasswordDialog username={username} role={role} home={home} onClose={onClose} onUpdated={onCredentialsUpdated} onTwoFactor={onTwoFactor} onPasskeys={onPasskeys} />;
   return <DetailsDialog entry={dialog.entry} onClose={onClose} />;
 }
@@ -3504,6 +3510,110 @@ function PasskeysDialog({ onClose, notify }: { onClose: () => void; notify: (mes
   return <Modal title="Passkeys" subtitle="Sign in with your fingerprint, face, or device PIN" icon={<Fingerprint size={19} />} onClose={onClose}>{body}</Modal>;
 }
 
+type NotificationSettings = { kind: "ntfy" | "discord" | "slack" | "webhook" | null; url: string; hasToken: boolean; topics: Record<"uploads" | "security" | "signIns" | "storage", boolean> };
+
+const NOTIFICATION_KINDS = [
+  { value: "ntfy", label: "ntfy", placeholder: "https://ntfy.sh/your-private-topic" },
+  { value: "discord", label: "Discord", placeholder: "https://discord.com/api/webhooks/…" },
+  { value: "slack", label: "Slack", placeholder: "https://hooks.slack.com/services/…" },
+  { value: "webhook", label: "Another service (JSON webhook)", placeholder: "https://example.com/webhook" },
+] as const;
+
+const NOTIFICATION_TOPIC_LABELS = [
+  { topic: "uploads", label: "Files received through upload links", hint: "Gathered into one message per link every couple of minutes" },
+  { topic: "security", label: "Security", hint: "Repeated failed sign-ins, links closed after wrong passwords, and changes to passwords, two-factor sign-in, passkeys, and accounts" },
+  { topic: "signIns", label: "Every sign-in", hint: "Who signed in, how, and from where" },
+  { topic: "storage", label: "Storage", hint: "The disk falling below 10% free, and scheduled snapshots failing" },
+] as const;
+
+function NotificationsSummary({ onOpen }: { onOpen: () => void }) {
+  const [settings, setSettings] = useState<NotificationSettings | null>(null);
+  useEffect(() => {
+    const controller = new AbortController();
+    requestJson<NotificationSettings>("/api/notifications", { signal: controller.signal }).then(setSettings).catch(() => undefined);
+    return () => controller.abort();
+  }, []);
+  const kind = NOTIFICATION_KINDS.find((item) => item.value === settings?.kind);
+  return <div className="settings-section"><div className="settings-section-title"><span><Bell size={16} /></span><div><strong>Notifications</strong><small>{settings === null ? "Checking…" : kind ? `On · sent to ${kind.value === "webhook" ? "a webhook" : kind.label}` : "Off · get a message on your phone or in chat when something needs your attention"}</small></div><button type="button" className="button secondary" onClick={onOpen}>{kind ? "Manage" : "Set up"}</button></div></div>;
+}
+
+function NotificationsDialog({ onClose, notify }: { onClose: () => void; notify: (message: string, tone?: "error") => void }) {
+  const [loaded, setLoaded] = useState<NotificationSettings | null>(null);
+  const [kind, setKind] = useState<NotificationSettings["kind"]>(null);
+  const [url, setUrl] = useState("");
+  const [token, setToken] = useState("");
+  const [removeToken, setRemoveToken] = useState(false);
+  const [topics, setTopics] = useState<NotificationSettings["topics"]>({ uploads: true, security: true, signIns: false, storage: true });
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    requestJson<NotificationSettings>("/api/notifications", { signal: controller.signal })
+      .then((result) => {
+        setLoaded(result);
+        setKind(result.kind);
+        setUrl(result.url);
+        setTopics(result.topics);
+      })
+      .catch((caught) => { if ((caught as Error).name !== "AbortError") setError((caught as Error).message); });
+    return () => controller.abort();
+  }, []);
+
+  const save = async () => {
+    const result = await requestJson<NotificationSettings>("/api/notifications", { method: "POST", body: JSON.stringify({ action: "save", kind: kind ?? "off", url, topics, token: kind === "ntfy" ? (removeToken ? "" : token || undefined) : undefined }) });
+    setLoaded(result);
+    setToken("");
+    setRemoveToken(false);
+    return result;
+  };
+  const run = async (work: () => Promise<void>) => {
+    setBusy(true);
+    setError("");
+    try {
+      await work();
+    } catch (caught) {
+      setError((caught as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    void run(async () => {
+      const result = await save();
+      notify(result.kind ? "Notifications saved" : "Notifications turned off");
+      onClose();
+    });
+  };
+  const test = () => void run(async () => {
+    await save();
+    await requestJson("/api/notifications", { method: "POST", body: JSON.stringify({ action: "test" }) });
+    notify("Test notification sent · check your phone or chat");
+  });
+
+  const chosen = NOTIFICATION_KINDS.find((item) => item.value === kind);
+  return (
+    <Modal title="Notifications" subtitle="A message on your phone or in chat when something needs your attention" icon={<Bell size={19} />} onClose={onClose}>
+      {!loaded && !error ? <div className="ownership-loading"><LoaderCircle className="spin" size={18} /> Loading…</div> : (
+        <form className="preferences-form notifications-form" onSubmit={submit}>
+          <FormField label="Send notifications to"><select value={kind ?? "off"} onChange={(event) => setKind(event.target.value === "off" ? null : event.target.value as NotificationSettings["kind"])}><option value="off">Nowhere (off)</option>{NOTIFICATION_KINDS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select></FormField>
+          {chosen && <>
+            <FormField label={chosen.value === "ntfy" ? "Topic address" : "Webhook address"} hint={chosen.value === "ntfy" ? "Use a long, hard-to-guess topic name on ntfy.sh, or your own ntfy server" : chosen.value === "webhook" ? "Each notification is sent as JSON: source, topic, title, message, urgent, at" : "Create an incoming webhook in the channel's settings and paste its address"}><input value={url} onChange={(event) => setUrl(event.target.value)} placeholder={chosen.placeholder} required maxLength={2048} autoComplete="off" spellCheck={false} /></FormField>
+            {chosen.value === "ntfy" && <FormField label="Access token (optional)" hint={loaded?.hasToken && !removeToken ? "A token is saved; leave this empty to keep it" : "Only needed for a protected topic"}><input type="password" value={token} onChange={(event) => setToken(event.target.value)} placeholder={loaded?.hasToken && !removeToken ? "••••••••" : "tk_…"} maxLength={512} autoComplete="off" /></FormField>}
+            {chosen.value === "ntfy" && loaded?.hasToken && <label className="show-passwords"><input type="checkbox" checked={removeToken} onChange={(event) => setRemoveToken(event.target.checked)} /> Remove the saved token</label>}
+            <div className="notification-topics">
+              {NOTIFICATION_TOPIC_LABELS.map((item) => <label key={item.topic} className="notification-topic"><input type="checkbox" checked={topics[item.topic]} onChange={(event) => setTopics({ ...topics, [item.topic]: event.target.checked })} /><span><strong>{item.label}</strong><small>{item.hint}</small></span></label>)}
+            </div>
+          </>}
+          {error && <div className="form-error"><CircleAlert size={16} />{error}</div>}
+          <div className="modal-actions">{chosen && <button type="button" className="button secondary" disabled={busy || !url} onClick={test}><Send size={15} /> Save and send a test</button>}<button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy}>{busy ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}Save</button></div>
+        </form>
+      )}
+    </Modal>
+  );
+}
+
 function TwoFactorDialog({ onClose, notify }: { onClose: () => void; notify: (message: string, tone?: "error") => void }) {
   const [status, setStatus] = useState<TwoFactorStatus | null>(null);
   const [step, setStep] = useState<"overview" | "scan" | "codes">("overview");
@@ -3609,7 +3719,7 @@ function TwoFactorDialog({ onClose, notify }: { onClose: () => void; notify: (me
   return <Modal title="Two-factor sign-in" subtitle="A code from your phone as well as your password" icon={<Smartphone size={19} />} onClose={onClose}>{body}</Modal>;
 }
 
-function PreferencesDialog({ username: initialUsername, onClose, onUpdated, onTwoFactor, onPasskeys }: { username: string; onClose: () => void; onUpdated: () => Promise<void>; onTwoFactor: () => void; onPasskeys: () => void }) {
+function PreferencesDialog({ username: initialUsername, onClose, onUpdated, onTwoFactor, onPasskeys, onNotifications }: { username: string; onClose: () => void; onUpdated: () => Promise<void>; onTwoFactor: () => void; onPasskeys: () => void; onNotifications: () => void }) {
   const [username, setUsername] = useState(initialUsername);
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
@@ -3679,7 +3789,7 @@ function PreferencesDialog({ username: initialUsername, onClose, onUpdated, onTw
     }
   };
 
-  return <Modal title="Preferences" subtitle="Account, sign-in security, and upload defaults" icon={<Settings2 size={19} />} onClose={onClose}><form className="preferences-form" onSubmit={submit}><div className="preferences-intro"><div className="avatar large-avatar">{initialUsername.slice(0, 1).toUpperCase()}</div><div><strong>Administrator account</strong><span>Account changes invalidate other signed-in sessions.</span></div></div><div className="settings-section"><div className="settings-section-title"><span><Upload size={16} /></span><div><strong>Default upload ownership</strong><small>This choice is preselected for confirmation before every upload</small></div></div><FormField label="Default owner and group"><select value={uploadMode} onChange={(event) => setUploadMode(event.target.value as UploadOwnershipPreference["mode"])} disabled={!loaded}><option value="destination">Match the destination folder</option><option value="service">Keep FilesDude service ownership</option><option value="fixed">Use a fixed owner and group</option></select></FormField>{uploadMode === "fixed" && <div className="field-pair preference-identity-pair"><FormField label="Owner"><select value={fixedUid} onChange={(event) => setFixedUid(event.target.value)} required>{!users.some((user) => String(user.id) === fixedUid) && <option value={fixedUid}>UID {fixedUid}</option>}{users.map((user) => <option key={user.id} value={user.id}>{user.name} ({user.id})</option>)}</select></FormField><FormField label="Group"><select value={fixedGid} onChange={(event) => setFixedGid(event.target.value)} required>{!groups.some((group) => String(group.id) === fixedGid) && <option value={fixedGid}>GID {fixedGid}</option>}{groups.map((group) => <option key={group.id} value={group.id}>{group.name} ({group.id})</option>)}</select></FormField></div>}<div className="info-box"><Info size={17} /> FilesDude still shows the detected owner/group choices each time, so unusual folders can be handled safely.</div></div><div className="settings-section"><div className="settings-section-title"><span><Server size={16} /></span><div><strong>Large uploads</strong><small>How files over 16 MB are sent, for every account and upload link</small></div></div><FormField label="Send files over 16 MB" hint={uploadInPieces ? "Each file goes in 16 MB pieces, so it gets through Cloudflare (which refuses requests over 100 MB) and other proxies, and a dropped connection carries on where it stopped" : "Each file goes in one request, which must finish within an hour; uploads over 100 MB will fail through Cloudflare"}><select value={uploadInPieces ? "pieces" : "whole"} onChange={(event) => setUploadInPieces(event.target.value === "pieces")} disabled={!loaded}><option value="pieces">In pieces (needed behind Cloudflare)</option><option value="whole">In one request</option></select></FormField></div><div className="settings-section"><div className="settings-section-title"><span><Trash2 size={16} /></span><div><strong>Trash</strong><small>How long deleted items can be restored before they are removed for good</small></div></div><FormField label="Keep deleted items" hint={retentionDays ? `Items deleted more than ${retentionDays} ${retentionDays === 1 ? "day" : "days"} ago are removed automatically, for every account` : "Items stay until someone restores them, deletes them forever, or empties the trash"}><select value={retentionDays ?? ""} onChange={(event) => setRetentionDays(event.target.value ? Number(event.target.value) : null)} disabled={!loaded}><option value="">Until removed by hand</option>{retentionDays !== null && !RETENTION_CHOICES.includes(retentionDays) && <option value={retentionDays}>{retentionDays} days</option>}{RETENTION_CHOICES.map((days) => <option key={days} value={days}>{days === 365 ? "1 year" : `${days} days`}</option>)}</select></FormField></div><div className="settings-section"><div className="settings-section-title"><span><UserRoundCog size={16} /></span><div><strong>Username</strong><small>Used on the FilesDude sign-in screen</small></div></div><FormField label="Username"><input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" minLength={3} maxLength={64} pattern="[A-Za-z0-9._-]+" required /></FormField></div><div className="settings-section"><div className="settings-section-title"><span><LockKeyhole size={16} /></span><div><strong>Password</strong><small>Only required when changing the username or password</small></div></div><FormField label="Current password" hint={credentialsChanged ? "Required to save account changes" : "Not needed for upload preferences"}><div className="password-field"><input type={showPasswords ? "text" : "password"} value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} autoComplete="current-password" required={credentialsChanged} /><LockKeyhole size={15} /></div></FormField><div className="field-pair preferences-passwords"><FormField label="New password"><input type={showPasswords ? "text" : "password"} value={newPassword} onChange={(event) => setNewPassword(event.target.value)} autoComplete="new-password" minLength={newPassword ? 12 : undefined} placeholder="At least 12 characters" /></FormField><FormField label="Confirm new password"><input type={showPasswords ? "text" : "password"} value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} autoComplete="new-password" placeholder="Repeat new password" /></FormField></div><label className="show-passwords"><input type="checkbox" checked={showPasswords} onChange={(event) => setShowPasswords(event.target.checked)} />{showPasswords ? <EyeOff size={15} /> : <Eye size={15} />} Show passwords</label></div><TwoFactorSummary onOpen={onTwoFactor} /><PasskeySummary onOpen={onPasskeys} />{error && <div className="form-error"><CircleAlert size={16} />{error}</div>}<div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy || !loaded}>{busy ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}Save preferences</button></div></form></Modal>;
+  return <Modal title="Preferences" subtitle="Account, sign-in security, and upload defaults" icon={<Settings2 size={19} />} onClose={onClose}><form className="preferences-form" onSubmit={submit}><div className="preferences-intro"><div className="avatar large-avatar">{initialUsername.slice(0, 1).toUpperCase()}</div><div><strong>Administrator account</strong><span>Account changes invalidate other signed-in sessions.</span></div></div><div className="settings-section"><div className="settings-section-title"><span><Upload size={16} /></span><div><strong>Default upload ownership</strong><small>This choice is preselected for confirmation before every upload</small></div></div><FormField label="Default owner and group"><select value={uploadMode} onChange={(event) => setUploadMode(event.target.value as UploadOwnershipPreference["mode"])} disabled={!loaded}><option value="destination">Match the destination folder</option><option value="service">Keep FilesDude service ownership</option><option value="fixed">Use a fixed owner and group</option></select></FormField>{uploadMode === "fixed" && <div className="field-pair preference-identity-pair"><FormField label="Owner"><select value={fixedUid} onChange={(event) => setFixedUid(event.target.value)} required>{!users.some((user) => String(user.id) === fixedUid) && <option value={fixedUid}>UID {fixedUid}</option>}{users.map((user) => <option key={user.id} value={user.id}>{user.name} ({user.id})</option>)}</select></FormField><FormField label="Group"><select value={fixedGid} onChange={(event) => setFixedGid(event.target.value)} required>{!groups.some((group) => String(group.id) === fixedGid) && <option value={fixedGid}>GID {fixedGid}</option>}{groups.map((group) => <option key={group.id} value={group.id}>{group.name} ({group.id})</option>)}</select></FormField></div>}<div className="info-box"><Info size={17} /> FilesDude still shows the detected owner/group choices each time, so unusual folders can be handled safely.</div></div><div className="settings-section"><div className="settings-section-title"><span><Server size={16} /></span><div><strong>Large uploads</strong><small>How files over 16 MB are sent, for every account and upload link</small></div></div><FormField label="Send files over 16 MB" hint={uploadInPieces ? "Each file goes in 16 MB pieces, so it gets through Cloudflare (which refuses requests over 100 MB) and other proxies, and a dropped connection carries on where it stopped" : "Each file goes in one request, which must finish within an hour; uploads over 100 MB will fail through Cloudflare"}><select value={uploadInPieces ? "pieces" : "whole"} onChange={(event) => setUploadInPieces(event.target.value === "pieces")} disabled={!loaded}><option value="pieces">In pieces (needed behind Cloudflare)</option><option value="whole">In one request</option></select></FormField></div><NotificationsSummary onOpen={onNotifications} /><div className="settings-section"><div className="settings-section-title"><span><Trash2 size={16} /></span><div><strong>Trash</strong><small>How long deleted items can be restored before they are removed for good</small></div></div><FormField label="Keep deleted items" hint={retentionDays ? `Items deleted more than ${retentionDays} ${retentionDays === 1 ? "day" : "days"} ago are removed automatically, for every account` : "Items stay until someone restores them, deletes them forever, or empties the trash"}><select value={retentionDays ?? ""} onChange={(event) => setRetentionDays(event.target.value ? Number(event.target.value) : null)} disabled={!loaded}><option value="">Until removed by hand</option>{retentionDays !== null && !RETENTION_CHOICES.includes(retentionDays) && <option value={retentionDays}>{retentionDays} days</option>}{RETENTION_CHOICES.map((days) => <option key={days} value={days}>{days === 365 ? "1 year" : `${days} days`}</option>)}</select></FormField></div><div className="settings-section"><div className="settings-section-title"><span><UserRoundCog size={16} /></span><div><strong>Username</strong><small>Used on the FilesDude sign-in screen</small></div></div><FormField label="Username"><input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" minLength={3} maxLength={64} pattern="[A-Za-z0-9._-]+" required /></FormField></div><div className="settings-section"><div className="settings-section-title"><span><LockKeyhole size={16} /></span><div><strong>Password</strong><small>Only required when changing the username or password</small></div></div><FormField label="Current password" hint={credentialsChanged ? "Required to save account changes" : "Not needed for upload preferences"}><div className="password-field"><input type={showPasswords ? "text" : "password"} value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} autoComplete="current-password" required={credentialsChanged} /><LockKeyhole size={15} /></div></FormField><div className="field-pair preferences-passwords"><FormField label="New password"><input type={showPasswords ? "text" : "password"} value={newPassword} onChange={(event) => setNewPassword(event.target.value)} autoComplete="new-password" minLength={newPassword ? 12 : undefined} placeholder="At least 12 characters" /></FormField><FormField label="Confirm new password"><input type={showPasswords ? "text" : "password"} value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} autoComplete="new-password" placeholder="Repeat new password" /></FormField></div><label className="show-passwords"><input type="checkbox" checked={showPasswords} onChange={(event) => setShowPasswords(event.target.checked)} />{showPasswords ? <EyeOff size={15} /> : <Eye size={15} />} Show passwords</label></div><TwoFactorSummary onOpen={onTwoFactor} /><PasskeySummary onOpen={onPasskeys} />{error && <div className="form-error"><CircleAlert size={16} />{error}</div>}<div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy || !loaded}>{busy ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}Save preferences</button></div></form></Modal>;
 }
 
 function AccountPasswordDialog({ username, role, home, onClose, onUpdated, onTwoFactor, onPasskeys }: { username: string; role: Role; home: string; onClose: () => void; onUpdated: () => Promise<void>; onTwoFactor: () => void; onPasskeys: () => void }) {

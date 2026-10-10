@@ -1,4 +1,5 @@
 import { audit } from "./audit";
+import { notify } from "./notifications";
 import { getPreferences } from "./preferences";
 import { createSnapshot, deleteSnapshot, listSnapshots, snapshotSupport, type Snapshot } from "./snapshots";
 
@@ -41,7 +42,10 @@ export function runSnapshotSchedule(now = Date.now()) {
 }
 
 function scheduledRun() {
-  void runSnapshotSchedule().catch((error: unknown) => console.error("Scheduled snapshot failed", error));
+  void runSnapshotSchedule().catch((error: unknown) => {
+    console.error("Scheduled snapshot failed", error);
+    void notify({ topic: "storage", urgent: true, title: "A scheduled snapshot failed", message: `FilesDude couldn't take its scheduled snapshot: ${String((error as Error)?.message ?? error).slice(0, 300)}` });
+  });
 }
 
 export function startSnapshotSchedule() {

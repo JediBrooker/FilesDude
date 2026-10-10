@@ -32,6 +32,7 @@ FilesDude File Explorer is a secure, self-hosted web file manager designed for a
 - Disk usage, owner/group display, symlink escape warnings, and a cached whole-tree largest-files view from the clickable Storage card
 - Filter largest files by a minimum size, load 100, 250, or 500 more at a time, export the currently loaded results to CSV, and move one or many selected files to protected trash (or permanently delete them after confirmation)
 - Protected trash by default with a Trash view for restoring items to their original folders, deleting them forever, or emptying the trash, plus optional automatic removal of items after 7, 30, or 90 days or a year; persistent favourites; and a JSON Lines audit log inside the protected state directory
+- Notifications (owner): a message to ntfy, Discord, Slack, or any webhook when files arrive through upload links, someone keeps failing to sign in or guessing a link's password, sign-in security changes, the disk is nearly full, or a scheduled snapshot fails (and, if wanted, on every sign-in)
 - Activity (owner): who did what and when, newest first, in plain sentences, filtered by kind (files, downloads, sign-ins, sharing, accounts, snapshots), account, or text
 - Signed, expiring, HTTP-only, SameSite login sessions; scrypt password hashes; login throttling; same-origin mutation checks; and hardened response headers
 - Account preferences for changing the username and password; credential changes invalidate other sessions
@@ -356,6 +357,38 @@ flooding the log, and beyond that while history stays under 256 MB; only past 1 
 are recent ones removed, to protect the disk. Every entry is kept small, rotations and
 removals are recorded in the log, and downloads through a share link are recorded once per
 link and address every ten minutes rather than for each range request.
+
+## Notifications
+
+The owner can have FilesDude send a message when something needs attention: open
+**Preferences → Notifications**, choose where to send them, paste the address, pick what to
+hear about, and use **Save and send a test**.
+
+- **Where:** [ntfy](https://ntfy.sh) (a topic on ntfy.sh or your own server, with an optional
+  access token for protected topics), a Discord or Slack incoming webhook, or any other
+  service that accepts a JSON POST (`source`, `topic`, `title`, `message`, `urgent`, `at`).
+- **What:**
+  - *Files received through upload links*, gathered into one message per link every couple
+    of minutes, with the names, total size, and who sent them.
+  - *Security*: an address failing to sign in (or entering wrong two-factor codes) 5 times
+    in 15 minutes; a link closed after too many wrong passwords; passwords changed,
+    two-factor sign-in turned off, passkeys added, and accounts added or removed.
+  - *Every sign-in* (off unless chosen): who, how, and from where.
+  - *Storage*: the managed disk falling below 10% free (checked hourly, told once until it
+    recovers), and scheduled snapshots failing.
+- What strangers can set off (failed sign-ins, wrong link passwords, files through upload
+  links) has its own allowance of 10 messages an hour, so it can never use up the 30 an hour
+  for changes made by accounts, sign-ins, and storage; anything beyond is held back and the
+  next message says how many. Failed sign-ins from more addresses within 15 minutes of an
+  alert come as one summary, an IPv6 /64 counts as one address, and a busy upload link is
+  told about every 15 minutes rather than every two.
+- File names and other text from users are shown as text, never as formatting, mentions,
+  links, or link previews, in Discord and Slack.
+- A saved ntfy token is only sent to the server it was saved for: changing to another server
+  needs it entered again.
+- The settings, including the address (which for Discord and Slack is itself a secret), are in
+  `notifications.json` in the state directory, readable only by the service; the ntfy token
+  is never sent to the browser.
 
 ## Other servers (SFTP)
 
