@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { config } from "../lib/config";
-import { createShare, createUploadLink, recordShareDownload, resolveShareToken, updateShare } from "../lib/shares";
+import { createShare, createUploadLink, recordShareDownload, reserveUpload, resolveShareToken, updateShare } from "../lib/shares";
 import { GET as download } from "../app/s/[token]/download/route";
 import { POST as unlock } from "../app/s/[token]/unlock/route";
 
@@ -57,6 +57,11 @@ test("an upload link's limits can be changed, not below what it has received", a
     assert.equal(changed.maxBytes, 1024 ** 3);
     assert.equal(changed.maxFiles, null);
     assert.equal(changed.kind, "upload");
+    // Room promised to uploads under way counts as received.
+    const settle = await reserveUpload(link.id, 80 * 1024 * 1024);
+    await assert.rejects(updateShare(link.id, { maxBytes: 10 * 1024 * 1024 }), /receiving/);
+    await settle();
+    assert.equal((await updateShare(link.id, { maxBytes: 10 * 1024 * 1024 })).link.maxBytes, 10 * 1024 * 1024);
   });
 });
 

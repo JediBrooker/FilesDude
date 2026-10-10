@@ -198,9 +198,23 @@ async function readShareFile(file: string): Promise<StoredShare[]> {
   }
 }
 
-async function writeShares(shares: StoredShare[]) {
-  await writeShareFile(protectedSharesFile(), shares.filter((share) => share.passwordHash));
-  await writeShareFile(sharesFile(), shares.filter((share) => !share.passwordHash));
+/**
+ * Saves links to their two files. A link moving between them is taken out of the one it leaves before
+ * it's put in the other, so a crash in between only loses it, never leaves it open (or with a
+ * password it no longer has).
+ */
+async function writeShares(shares: StoredShare[], before: StoredShare[]) {
+  const wasOpen = new Set(before.filter((share) => !share.passwordHash).map((share) => share.id));
+  const gainsPassword = shares.some((share) => share.passwordHash && wasOpen.has(share.id));
+  const writeProtected = () => writeShareFile(protectedSharesFile(), shares.filter((share) => share.passwordHash));
+  const writeOpen = () => writeShareFile(sharesFile(), shares.filter((share) => !share.passwordHash));
+  if (gainsPassword) {
+    await writeOpen();
+    await writeProtected();
+  } else {
+    await writeProtected();
+    await writeOpen();
+  }
 }
 
 async function writeShareFile(file: string, shares: StoredShare[]) {
@@ -214,6 +228,13 @@ async function writeShareFile(file: string, shares: StoredShare[]) {
     await handle.close();
   }
   await fs.rename(temporary, file);
+  // The rename itself is made durable, so a power cut can't bring back the previous file.
+  const folder = await fs.open(config.stateDir, "r");
+  try {
+    await folder.sync();
+  } finally {
+    await folder.close();
+  }
 }
 
 // Serializes read-modify-write cycles; expired and used-up links are dropped on every write.
@@ -222,7 +243,7 @@ function mutate<T>(operation: (shares: StoredShare[]) => Promise<{ shares: Store
     const current = await readShares();
     const { shares, result } = await operation(current.filter((share) => isActive(share)));
     // Most rewrites (one per moved item) change nothing, so they skip the fsynced write.
-    if (JSON.stringify(shares) !== JSON.stringify(current)) await writeShares(shares);
+    if (JSON.stringify(shares) !== JSON.stringify(current)) await writeShares(shares, current);
     return result;
   };
   const result = mutationQueue.then(run, run);
@@ -402,14 +423,17 @@ export async function updateShare(id: string, changes: ShareChanges) {
       if (changes.maxBytes !== undefined) {
         const maxBytes = Number(changes.maxBytes);
         if (!Number.isInteger(maxBytes) || maxBytes < 1024 * 1024 || maxBytes > MAX_UPLOAD_LINK_BYTES) throw new AppError("Choose a total upload size between 1 MB and 1 TB", 400, "INVALID_LIMIT");
-        if (maxBytes < share.uploadedBytes) throw new AppError("This link has already received more than that", 400, "INVALID_LIMIT");
+        // What uploads under way have been promised counts as received.
+        const pending = uploadsInProgress.get(share.id) ?? { bytes: 0, files: 0 };
+        if (maxBytes < share.uploadedBytes + pending.bytes) throw new AppError(pending.bytes ? "This link has received, or is receiving, more than that" : "This link has already received more than that", 400, "INVALID_LIMIT");
         (next as UploadShare).maxBytes = maxBytes;
         changed.push("size limit");
       }
       if (changes.maxFiles !== undefined) {
         const maxFiles = limit(changes.maxFiles);
         if (maxFiles !== null && (!Number.isInteger(maxFiles) || maxFiles < 1 || maxFiles > MAX_UPLOAD_LINK_FILES)) throw new AppError("Choose a file limit between 1 and 10,000, or no limit", 400, "INVALID_LIMIT");
-        if (maxFiles !== null && maxFiles < share.uploadedFiles) throw new AppError(`This link has already received ${share.uploadedFiles} files; choose a higher limit`, 400, "INVALID_LIMIT");
+        const pendingFiles = uploadsInProgress.get(share.id)?.files ?? 0;
+        if (maxFiles !== null && maxFiles < share.uploadedFiles + pendingFiles) throw new AppError(`This link has received${pendingFiles ? ", or is receiving," : ""} ${share.uploadedFiles + pendingFiles} files; choose a higher limit`, 400, "INVALID_LIMIT");
         (next as UploadShare).maxFiles = maxFiles;
         changed.push("file limit");
       }
