@@ -106,6 +106,9 @@ const call = <T>(run: (done: (error: Error | null | undefined, value?: T) => voi
     });
   });
 
+const MAX_NAME_BYTES = 1_024;
+const MAX_LISTING_BYTES = 16 * 1024 * 1024;
+
 /**
  * A folder's entries, read a batch at a time so a server that keeps sending entries can't use up
  * memory: past `max` it stops (and says so), and it stops when `signal` does.
@@ -114,6 +117,9 @@ export async function readDirectory(sftp: SFTPWrapper, absolute: string, max: nu
   const handle = await call<Buffer>((done) => sftp.opendir(absolute, done));
   const entries: FileEntryWithStats[] = [];
   let truncated = false;
+  // A hostile server could send few entries with huge names: names too long to exist on a disk are
+  // skipped, the long listing line isn't kept, and the listing stops at a total size too.
+  let bytes = 0;
   try {
     for (;;) {
       if (signal?.aborted) throw new AppError("Cancelled", 409, "JOB_CANCELLED");
@@ -125,11 +131,13 @@ export async function readDirectory(sftp: SFTPWrapper, absolute: string, max: nu
       if (!batch) break;
       for (const entry of batch) {
         if (entry.filename === "." || entry.filename === ".." || entry.filename.includes("/")) continue;
-        if (entries.length >= max) {
+        if (Buffer.byteLength(entry.filename) > MAX_NAME_BYTES) continue;
+        if (entries.length >= max || bytes > MAX_LISTING_BYTES) {
           truncated = true;
           break;
         }
-        entries.push(entry);
+        bytes += entry.filename.length * 2 + 200;
+        entries.push({ filename: entry.filename, longname: "", attrs: entry.attrs });
       }
       if (truncated) break;
     }

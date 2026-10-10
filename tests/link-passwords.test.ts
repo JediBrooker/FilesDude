@@ -86,7 +86,9 @@ test("wrong passwords are limited and recorded", async () => {
     // Guesses sent together can't get past the limit either.
     const second = await createShare("report.pdf", 24, null, "another long password");
     const results = await Promise.all(Array.from({ length: 30 }, () => tryPassword(tokenOf(second.url), "nope nope nope")));
-    assert.equal(results.filter((response) => response.status === 401).length, 10);
+    // No more than ten are checked (fewer when the cap on password checks at once turns some away).
+    assert.ok(results.filter((response) => response.status === 401).length <= 10);
+    assert.equal(results.filter((response) => response.status === 401 || response.status === 429).length, 30);
   });
 });
 

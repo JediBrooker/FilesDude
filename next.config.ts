@@ -39,8 +39,17 @@ const nextConfig: NextConfig = {
           { key: "Referrer-Policy", value: "no-referrer" },
           { key: "Permissions-Policy", value: "camera=(), microphone=(), geolocation=(), payment=(), usb=()" },
           { key: "Cross-Origin-Opener-Policy", value: "same-origin" },
+          // Other sites (sibling subdomains included) can't embed FilesDude's files or responses.
+          { key: "Cross-Origin-Resource-Policy", value: "same-origin" },
           { key: "Strict-Transport-Security", value: "max-age=31536000; includeSubDomains" },
         ],
+      },
+      // The pages (not API routes or share downloads, which set their own stricter sandbox policy,
+      // and which a header here would replace): no plugins, no changing the base address, no framing,
+      // and forms only send here.
+      {
+        source: "/:path((?!api/|s/[^/]+/download).*)",
+        headers: [{ key: "Content-Security-Policy", value: "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'" }],
       },
     ];
   },

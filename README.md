@@ -100,12 +100,18 @@ GitHub CLI login:
 sudo GITHUB_TOKEN="$(gh auth token)" filesdude-update
 ```
 
-To recover a forgotten login, generate a new bootstrap login and invalidate all
-sessions and passkeys:
+To recover a forgotten login, generate a new bootstrap login, sign everyone out, and
+remove saved credentials and passkeys. Every other setting (trusted proxies, limits, the
+listener) is kept, and the previous configuration is backed up beside it:
 
 ```bash
 sudo filesdude-update --reset-credentials
 ```
+
+Add `--rotate-secret` to also replace the session secret, for example if the configuration
+file itself may have been read; that also ends every share link and saved server credential.
+After restoring the state directory from a backup, rotate the secret too, since a backup
+brings back revoked links, removed passkeys, and old passwords.
 
 Re-running the updater preserves the managed root, favourites, account settings,
 audit log, and other state in `/var/lib/filesdude`.
@@ -420,10 +426,12 @@ file name can't read as part of the sentence around it.
 
 The log is set aside as a dated archive (`audit-<time>.jsonl`) at 8 MB. Archives are kept
 for at least 30 days however much is written, so nobody can push recent history out by
-flooding the log, and beyond that while history stays under 256 MB; only past 1 GB in total
-are recent ones removed, to protect the disk. Every entry is kept small, rotations and
-removals are recorded in the log, and downloads through a share link are recorded once per
-link and address every ten minutes rather than for each range request.
+flooding the log, and beyond that while history stays under 256 MB. Events anyone can repeat
+cheaply (downloads, looking at Properties, favourites) are recorded once a minute per account
+and item, and downloads through an unlimited share link once per link and address every ten
+minutes; if recent history passes 1 GB all the same, only those cheap events are set aside
+(and counted), so sign-ins, changes, and account events are always kept. Every entry is kept
+small, and rotations and removals are recorded in the log.
 
 ## Notifications
 
@@ -612,7 +620,9 @@ The container runs as UID/GID `1001:1001` by default. Give that account access t
 - Use HTTPS even on a LAN. For remote access, prefer WireGuard or Tailscale over directly exposing the login page to the internet.
 - Behind a reverse proxy or tunnel (such as a Cloudflare Tunnel's `cloudflared`), set `FILEDUDE_TRUSTED_PROXIES` in `/etc/filesdude/filesdude.env` to its address, for example `FILEDUDE_TRUSTED_PROXIES=192.168.0.3`, and restart. Only connections that really come from that address (FilesDude checks the connection itself, not a header) have their client address (Cloudflare's `CF-Connecting-IP`, or `X-Forwarded-For`) and HTTPS believed, so sign-in limits apply per real visitor, Activity shows real addresses, and session cookies are marked secure. Anyone else is taken as their own address, whatever headers they send. `FILEDUDE_TRUST_PROXY=true` (believing every connection is a proxy) remains only for setups where FilesDude can't be reached except through one.
 - Back up the underlying data independently. Protected trash helps with mistakes but is not a backup.
-- Keep Proxmox, the container image, and reverse proxy patched. Rotate the session secret to invalidate all sessions.
+- Keep Proxmox, the container image, and reverse proxy patched. `filesdude-update --reset-credentials` signs everyone out; rotating the session secret also does, and ends every share link.
+- Behind a tunnel, consider letting only the tunnel reach FilesDude's port (a firewall rule allowing it from the tunnel's address alone), so nobody on the LAN signs in over plain HTTP.
+- When the service runs as root (as it must for the media sandbox and ownership changes), anyone who could run code inside FilesDude could act as root on the host: keep it patched, and run updates only from the repository you trust.
 
 ## Useful keyboard shortcuts
 

@@ -1,13 +1,15 @@
 import { Readable } from "node:stream";
 import { withAccess } from "@/lib/access";
 import { acquireFilesystemLock, getMime, openVerifiedFile } from "@/lib/files";
-import { AppError, jsonError } from "@/lib/http";
+import { AppError, assertSameOriginFetch, jsonError } from "@/lib/http";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function GET(request: Request) {
   try {
+    // Only FilesDude's own pages (or the address typed in) may load files, never another site.
+    assertSameOriginFetch(request);
     return await withAccess(request, "read", async () => {
     const relativePath = new URL(request.url).searchParams.get("path") || "";
     const releaseFilesystem = await acquireFilesystemLock();

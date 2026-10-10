@@ -32,15 +32,16 @@ function unavailable() {
   return new Response("This link is invalid, has expired, or the item is no longer available.\n", { status: 404, headers: { ...baseHeaders, "Content-Type": "text/plain; charset=utf-8" } });
 }
 
-// Downloads through a link are recorded once per link and address every ten minutes, not for each
-// of the many range requests a video player or download manager makes.
+// Downloads through an unlimited link are counted and recorded once per link and address every ten
+// minutes, not for each of the many requests a video player or download manager makes (nor for each
+// of a stream of requests meant to flood the activity log). A limited link counts every download.
 const RECORD_EVERY_MS = 10 * 60 * 1000;
 const recentlyRecorded = new Map<string, number>();
 
-function shouldRecord(key: string, startsDownload: boolean) {
+function shouldRecord(key: string, always: boolean) {
   const now = Date.now();
   const last = recentlyRecorded.get(key);
-  if (!startsDownload && last !== undefined && now - last < RECORD_EVERY_MS) return false;
+  if (!always && last !== undefined && now - last < RECORD_EVERY_MS) return false;
   recentlyRecorded.delete(key);
   recentlyRecorded.set(key, now);
   if (recentlyRecorded.size > 5_000) recentlyRecorded.delete(recentlyRecorded.keys().next().value!);
@@ -73,6 +74,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ toke
   if (!opened) return unavailable();
   const { handle, openedPath, stat } = opened;
   let streaming = false;
+  let zipSlot = false;
   try {
     // A limited link always sends the whole file and counts it, so ranges can't stretch the limit.
     // Unlimited links honour ranges for resuming, counting only requests that start at byte 0.
@@ -82,13 +84,17 @@ export async function GET(request: Request, { params }: { params: Promise<{ toke
     if (rangeHeader && !range) {
       return new Response(null, { status: 416, headers: { ...baseHeaders, "Content-Range": `bytes */${stat.size}` } });
     }
-    if (stat.isDirectory() && activePublicZips >= MAX_PUBLIC_ZIPS) {
-      return new Response("The server is busy preparing other downloads. Try again in a minute.\n", { status: 503, headers: { ...baseHeaders, "Content-Type": "text/plain; charset=utf-8", "Retry-After": "60" } });
+    // A ZIP's slot is taken here, before anything is awaited, so requests arriving together can't all
+    // get past the limit; it's given back when the ZIP ends (or below, if it never starts).
+    if (stat.isDirectory()) {
+      if (activePublicZips >= MAX_PUBLIC_ZIPS) return new Response("The server is busy preparing other downloads. Try again in a minute.\n", { status: 503, headers: { ...baseHeaders, "Content-Type": "text/plain; charset=utf-8", "Retry-After": "60" } });
+      activePublicZips += 1;
+      zipSlot = true;
     }
-    const counts = request.method === "GET" && (!range || range.start === 0);
-    if (counts && !(await recordShareDownload(share.id))) return unavailable();
+    const limited = share.maxDownloads !== null;
     const address = clientAddress(request);
-    if (request.method === "GET" && shouldRecord(`${share.id}|${address}`, counts)) {
+    if (request.method === "GET" && (!range || range.start === 0) && shouldRecord(`${share.id}|${address}`, limited)) {
+      if (!(await recordShareDownload(share.id))) return unavailable();
       await audit("share.download", { id: share.id, path: share.path, address, range: range ? `${range.start}-${range.end}` : undefined });
     }
 
@@ -109,7 +115,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ toke
       request.signal.addEventListener("abort", stop, { once: true });
       archive.on("error", (error) => output.destroy(error));
       archive.pipe(output);
-      activePublicZips += 1;
+      zipSlot = false;
       output.once("close", () => {
         activePublicZips -= 1;
         request.signal.removeEventListener("abort", stop);
@@ -148,6 +154,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ toke
   } catch {
     return unavailable();
   } finally {
+    if (zipSlot) activePublicZips -= 1;
     if (!streaming) await handle.close().catch(() => undefined);
   }
 }

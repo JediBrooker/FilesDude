@@ -19,7 +19,9 @@ export async function applyOwnership(handle: FileHandle, ownership: { uid: numbe
 }
 
 export function uploadName(raw: string) {
-  const name = path.basename(raw).trim();
+  // Invisible and direction-changing characters are replaced, so a name can't pass itself off as
+  // something else ("invoice\u202efdp.exe" showing as "invoiceexe.pdf").
+  const name = path.basename(raw).replace(/[\p{Cc}\p{Cf}]/gu, "_").trim();
   if (!name || name === "." || name === ".." || name.includes("\0") || name.includes("/") || name.includes("\\") || Buffer.byteLength(name, "utf8") > 255) {
     throw new AppError("An uploaded file has an invalid name", 400, "INVALID_NAME");
   }
@@ -117,11 +119,12 @@ export async function withPublicNames(folder: AnchoredDirectory, name: string, t
 
 // Names come from strangers and are shown in the owner's file list: invisible and direction-changing
 // characters are replaced so a name reads as what it is, lookalike spacing is collapsed, and a leading
-// dot (a hidden file other software may act on, such as .htaccess) becomes an underscore.
+// dot (a hidden file other software may act on, such as .htaccess) or dash (which a command run with
+// "*" in that folder would take as an option, such as tar's --checkpoint-action) becomes an underscore.
 export function publicName(raw: string) {
   const cleaned = raw.normalize("NFC").replace(/[\p{Cc}\p{Cf}]/gu, "_").replace(/\s+/g, " ").trim();
   const name = uploadName(cleaned);
-  return name.startsWith(".") ? `_${name.slice(1)}` : name;
+  return /^[-.]/.test(name) ? `_${name.slice(1)}` : name;
 }
 
 export { addressGroup } from "./address-group";

@@ -6,6 +6,7 @@ import crypto from "node:crypto";
 import { config } from "./config";
 import { AppError } from "./http";
 import { forgetCopies, readCopyJournal, recordCopy } from "./copy-journal";
+import { replaceWithPattern } from "./safe-regex";
 import { currentScope, runUnscoped, scopeRoot, withinScope } from "./scope";
 
 // An account confined to a folder can't rename, move, or delete that folder itself.
@@ -160,6 +161,9 @@ export async function verifyFileHandleWithinRoot(handle: FileHandle, absolute: s
 // callers then refuse anything that is not a regular file or folder.
 export async function openVerifiedFile(relativePath: string, access: "read" | "write" = "read") {
   const absolute = await safeResolve(relativePath);
+  // Only files and folders are opened: opening a device or pipe can itself do something.
+  const kind = await fs.stat(absolute).catch(() => null);
+  if (kind && !kind.isFile() && !kind.isDirectory()) throw new AppError("Only files and folders can be opened", 400, "NOT_A_FILE");
   const handle = await fs.open(absolute, (access === "write" ? constants.O_RDWR : constants.O_RDONLY) | constants.O_NONBLOCK | constants.O_NOCTTY);
   try {
     const { openedPath, stat } = await verifyFileHandleWithinRoot(handle, absolute);
@@ -693,9 +697,20 @@ export async function diskInfo(): Promise<DiskInfo> {
   return { total, available, used: total - available };
 }
 
+/**
+ * A folder's items. The filesystem lock is only held to open the folder, which is then read through
+ * its handle, so listing a folder of many thousands of items doesn't hold up everyone's changes.
+ */
 export async function listDirectory(relativePath = "", showHidden = false) {
   const relative = cleanRelative(relativePath);
-  const entries = await withOpen(openDirectory(relative), async (directory) => {
+  const release = await acquireFilesystemLock();
+  let opened: AnchoredDirectory;
+  try {
+    opened = await openDirectory(relative);
+  } finally {
+    release();
+  }
+  const entries = await withOpen(Promise.resolve(opened), async (directory) => {
     const names = await fs.readdir(directory.base);
     const visible = names.filter((name) => !INTERNAL_NAMES.has(name) && (showHidden || !name.startsWith(".")));
     // A few at a time, so a folder of hundreds of thousands of items doesn't look at them all at once.
@@ -759,11 +774,13 @@ export async function listFolders(relativePath = "", showHidden = false) {
 }
 
 export function validateName(name: string) {
-  const trimmed = name.trim();
+  // Invisible and direction-changing characters are replaced (see uploadName).
+  const trimmed = name.replace(/[\p{Cc}\p{Cf}]/gu, "_").trim();
   if (!trimmed || trimmed === "." || trimmed === ".." || trimmed.includes("/") || trimmed.includes("\\") || trimmed.includes("\0")) {
     throw new AppError("Enter a valid name without slashes", 400, "INVALID_NAME");
   }
   if (INTERNAL_NAMES.has(trimmed)) throw new AppError("That name is reserved", 400, "RESERVED_NAME");
+  if (Buffer.byteLength(trimmed) > 255) throw new AppError("That name is too long", 400, "NAME_TOO_LONG");
   return trimmed;
 }
 
@@ -1686,7 +1703,9 @@ function startRecovery() {
 
 export async function changeMode(paths: string[], mode: string) {
   if (!/^[0-7]{3,4}$/.test(mode)) throw new AppError("Permissions must be an octal value such as 755", 400);
-  for (const relativePath of paths) await fs.chmod(await safeResolve(relativePath), Number.parseInt(mode, 8));
+  // Set-user-id and set-group-id bits are never set from here (copies drop them too); the sticky bit is.
+  const bits = Number.parseInt(mode, 8) & 0o1777;
+  for (const relativePath of paths) await fs.chmod(await safeResolve(relativePath), bits);
 }
 
 export async function changeOwner(paths: string[], uid: number, gid: number) {
@@ -1715,18 +1734,42 @@ export async function writeTextFile(relativePath: string, content: string) {
   return details(relativePath);
 }
 
-function renamedName(original: string, index: number, rule: BulkRenameRule) {
+const stemOf = (name: string) => {
+  const extension = path.extname(name);
+  return extension ? name.slice(0, -extension.length) : name;
+};
+
+/** A bulk rename's rule, checked so no part of it can make huge names or take long. */
+function checkRule(rule: unknown): BulkRenameRule {
+  if (!rule || typeof rule !== "object" || Array.isArray(rule)) throw new AppError("Bulk rename rules are required", 400, "INVALID_REQUEST");
+  const value = rule as Record<string, unknown>;
+  const text = (key: string, max: number) => {
+    if (value[key] === undefined) return;
+    if (typeof value[key] !== "string" || (value[key] as string).length > max) throw new AppError("A bulk rename rule is too long", 400, "INVALID_RULE");
+  };
+  text("find", 256);
+  text("replace", 255);
+  text("prefix", 255);
+  text("suffix", 255);
+  for (const flag of ["regex", "caseSensitive", "numbering"]) if (value[flag] !== undefined && typeof value[flag] !== "boolean") throw new AppError("A bulk rename rule is invalid", 400, "INVALID_RULE");
+  if (value.pad !== undefined && (!Number.isInteger(value.pad) || (value.pad as number) < 0 || (value.pad as number) > 10)) throw new AppError("Numbers can be padded to at most 10 digits", 400, "INVALID_RULE");
+  if (value.start !== undefined && (!Number.isInteger(value.start) || (value.start as number) < 0 || (value.start as number) > 1e9)) throw new AppError("Numbering must start between 0 and 1,000,000,000", 400, "INVALID_RULE");
+  return value as BulkRenameRule;
+}
+
+/** With a regular expression, every name's new stem, worked out away from the main thread. */
+async function patternStems(names: string[], rule: BulkRenameRule) {
+  if (!rule.find || !rule.regex) return null;
+  return replaceWithPattern(names.map(stemOf), rule.find, rule.caseSensitive ? "g" : "gi", rule.replace || "");
+}
+
+function renamedName(original: string, index: number, rule: BulkRenameRule, patternStem?: string) {
   const extension = path.extname(original);
-  const stem = extension ? original.slice(0, -extension.length) : original;
+  const stem = stemOf(original);
   let next = stem;
-  if (rule.find) {
-    if (rule.regex) {
-      try {
-        next = next.replace(new RegExp(rule.find, rule.caseSensitive ? "g" : "gi"), rule.replace || "");
-      } catch {
-        throw new AppError("The bulk rename regular expression is invalid", 400, "INVALID_REGEX");
-      }
-    } else if (rule.caseSensitive) {
+  if (patternStem !== undefined) next = patternStem;
+  else if (rule.find) {
+    if (rule.caseSensitive) {
       next = next.split(rule.find).join(rule.replace || "");
     } else {
       next = next.replace(new RegExp(rule.find.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"), rule.replace || "");
@@ -1739,27 +1782,32 @@ function renamedName(original: string, index: number, rule: BulkRenameRule) {
   return validateName(`${rule.prefix || ""}${next}${rule.suffix || ""}${extension}`);
 }
 
-export async function previewBulkRename(paths: string[], rule: BulkRenameRule): Promise<RenamePreview[]> {
+export async function previewBulkRename(paths: string[], rawRule: unknown): Promise<RenamePreview[]> {
+  const rule = checkRule(rawRule);
+  const relatives = paths.map(cleanRelative);
+  const stems = await patternStems(relatives.map((relative) => path.posix.basename(relative)), rule);
   const previews: RenamePreview[] = [];
   const destinations = new Set<string>();
   for (let index = 0; index < paths.length; index += 1) {
-    const relative = cleanRelative(paths[index]);
+    const relative = relatives[index];
     await safeResolve(relative);
     const from = path.posix.basename(relative);
-    const to = renamedName(from, index, rule);
-    const destination = childOf(parentOf(relative), to);
+    const to = renamedName(from, index, rule, stems?.[index]);
     let error: string | undefined;
-    if (destinations.has(destination)) error = "Duplicate destination";
-    destinations.add(destination);
-    if (destination !== relative && (await withParent(relative, (parent) => fs.lstat(inside(parent, to)).catch(missingAsNull)))) {
-      error = "Name already exists";
-    }
+    // Two items end up with the same name in the same real folder (even through a link to it).
+    const existing = await withParent(relative, async (parent) => {
+      const destination = `${parent.real}\u0000${to}`;
+      if (destinations.has(destination)) error = "Duplicate destination";
+      destinations.add(destination);
+      return to === from ? null : fs.lstat(inside(parent, to)).catch(missingAsNull);
+    });
+    if (existing) error = "Name already exists";
     previews.push({ source: paths[index], from, to, changed: from !== to, error });
   }
   return previews;
 }
 
-export async function applyBulkRename(paths: string[], rule: BulkRenameRule) {
+export async function applyBulkRename(paths: string[], rule: unknown) {
   for (const item of paths) assertNotHome(normalizeRelative(item));
   const previews = await previewBulkRename(paths, rule);
   if (previews.some((item) => item.error)) throw new AppError("Resolve bulk rename conflicts before applying", 409, "RENAME_CONFLICT");
@@ -1782,7 +1830,11 @@ export async function applyBulkRename(paths: string[], rule: BulkRenameRule) {
       await fs.rename(inside(parent, name), temporary);
       staged.push({ original: inside(parent, name), temporary, destination: inside(parent, preview.to) });
     }
-    for (const item of staged) await fs.rename(item.temporary, item.destination);
+    // Never over something: a name that's been taken since stops (and undoes) the whole rename.
+    for (const item of staged) {
+      if (await fs.lstat(item.destination).catch(missingAsNull)) throw new AppError("Something with one of the new names appeared while renaming", 409, "RENAME_CONFLICT");
+      await fs.rename(item.temporary, item.destination);
+    }
   } catch (error) {
     for (const item of [...staged].reverse()) {
       try {

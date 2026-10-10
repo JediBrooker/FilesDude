@@ -63,7 +63,7 @@ const clean = (value: unknown) => (typeof value === "string" ? value.replace(/[\
 /** Text of a subtitle file: UTF-8, or Windows-1252 for older files that aren't. */
 function decode(data: Buffer) {
   try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(data).replace(/^﻿/, "");
+    return new TextDecoder("utf-8", { fatal: true }).decode(data).replace(/^\ufeff/, "");
   } catch {
     return new TextDecoder("windows-1252").decode(data);
   }

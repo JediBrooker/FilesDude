@@ -104,8 +104,12 @@ export type Notification = { topic: NotificationTopic; title: string; message: s
 const sentTimes: Record<Budget, number[]> = { public: [], account: [] };
 const droppedSinceLimit: Record<Budget, number> = { public: 0, account: 0 };
 const scrubAddresses = (text: string) => text.replace(/https?:\/\/\S+/g, "the address");
-// Text from strangers may hold web addresses; they're broken up so chat apps don't make them links.
-const unlink = (text: string) => text.replace(/:\/\//g, ":​//").replace(/\bwww\./gi, (match) => `${match.slice(0, 3)}​.`);
+// Text from strangers may hold web addresses; they're broken up (with an invisible space) so chat and
+// notification apps don't make them links: "://", "www.", and bare domains like example.com.
+const unlink = (text: string) => text
+  .replace(/:\/\//g, ":\u200b//")
+  .replace(/\bwww\./gi, (match) => `${match.slice(0, 3)}\u200b.`)
+  .replace(/\b([a-z0-9-]+)\.([a-z]{2,})\b/gi, "$1.\u200b$2");
 
 // Names and other text from users are shown as text, not formatting or mentions, in chat apps.
 const escapeSlack = (text: string) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -115,7 +119,7 @@ function request(settings: StoredSettings, note: Notification): { body: string; 
   switch (settings.kind) {
     case "ntfy":
       return {
-        body: note.message,
+        body: unlink(note.message),
         headers: {
           "Content-Type": "text/plain; charset=utf-8",
           // ntfy takes the title from a header, which must be plain ASCII.

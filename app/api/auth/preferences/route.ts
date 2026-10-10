@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 import { withAccess } from "@/lib/access";
-import { createSession, sessionCookie, verifyPassword } from "@/lib/auth";
+import { createSession, sessionCookie, verifyCurrentPassword } from "@/lib/auth";
+import { removeAccountPasskeys } from "@/lib/passkeys";
+import { confirmWithCode } from "@/lib/two-factor";
 import { audit } from "@/lib/audit";
 import { getCredentials, hashPassword, updateCredentials, validateNewPassword, validateUsername } from "@/lib/credentials";
 import { identityCatalog, isKnownIdentityPair } from "@/lib/files";
@@ -40,7 +42,22 @@ export async function POST(request: Request) {
     return await withAccess(request, "read", async (session) => {
     const parsed = await readJsonBody<unknown>(request, 16 * 1024);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new AppError("Request body is invalid", 400, "INVALID_REQUEST");
-    const body = parsed as { currentPassword?: unknown; username?: unknown; newPassword?: unknown; uploadOwnership?: UploadOwnershipPreference; trashRetentionDays?: unknown; uploadInPieces?: unknown };
+    const body = parsed as { currentPassword?: unknown; code?: unknown; keepPasskeys?: unknown; username?: unknown; newPassword?: unknown; uploadOwnership?: UploadOwnershipPreference; trashRetentionDays?: unknown; uploadInPieces?: unknown };
+    if (body.keepPasskeys !== undefined && typeof body.keepPasskeys !== "boolean") throw new AppError("Request body is invalid", 400, "INVALID_REQUEST");
+    // Changing sign-in details needs the current password (its checks limited, like other
+    // confirmations) and, with two-factor sign-in on, a code: a session left open isn't enough. A new
+    // password also removes the account's passkeys unless asked not to, since one may have been added
+    // by whoever knew the old password.
+    const confirmIdentity = async (accountKey: string, passwordHash: string, twoFactor: unknown) => {
+      if (!body.currentPassword || !(await verifyCurrentPassword(accountKey, body.currentPassword, passwordHash))) {
+        await audit("settings.credentials.failed", { username: session.username });
+        throw new AppError("Current password is incorrect", 401, "INVALID_CURRENT_PASSWORD");
+      }
+      if (twoFactor) {
+        if (body.code === undefined || body.code === "") throw new AppError("Enter a code from your authenticator app to change your sign-in details", 400, "CODE_REQUIRED");
+        await confirmWithCode(accountKey, body.code);
+      }
+    };
     if (body.currentPassword !== undefined && typeof body.currentPassword !== "string") throw new AppError("Current password is invalid", 400, "INVALID_REQUEST");
     if (body.username !== undefined && typeof body.username !== "string") throw new AppError("Username is invalid", 400, "INVALID_REQUEST");
     if (body.newPassword !== undefined && typeof body.newPassword !== "string") throw new AppError("New password is invalid", 400, "INVALID_REQUEST");
@@ -51,12 +68,10 @@ export async function POST(request: Request) {
       if (!body.newPassword) throw new AppError("No preference changes to save", 400, "NO_CHANGES");
       const user = await findUserById(session.accountKey);
       if (!user) throw new AppError("Sign in required", 401, "UNAUTHORIZED");
-      if (!body.currentPassword || !(await verifyPassword(body.currentPassword as string, user.passwordHash))) {
-        await audit("settings.credentials.failed", { username: session.username });
-        throw new AppError("Current password is incorrect", 401, "INVALID_CURRENT_PASSWORD");
-      }
+      await confirmIdentity(user.id, user.passwordHash, user.twoFactor);
       const version = await changeOwnPassword(user.id, body.newPassword as string);
-      await audit("settings.password.changed", { username: session.username });
+      const passkeysRemoved = body.keepPasskeys === true ? 0 : await removeAccountPasskeys(user.id);
+      await audit("settings.password.changed", { username: session.username, passkeysRemoved: passkeysRemoved || undefined });
       const response = NextResponse.json({ ok: true, username: user.username });
       response.headers.set("Set-Cookie", sessionCookie(createSession(user.username, version, user.id), request));
       response.headers.set("Cache-Control", "no-store");
@@ -80,11 +95,8 @@ export async function POST(request: Request) {
 
     if (credentialsChanged) {
       if (!body.currentPassword) throw new AppError("Current password is required to change sign-in details", 400, "CURRENT_PASSWORD_REQUIRED");
-      if (!(await verifyPassword(body.currentPassword as string, current.passwordHash))) {
-        await audit("settings.credentials.failed", { username: session.username });
-        throw new AppError("Current password is incorrect", 401, "INVALID_CURRENT_PASSWORD");
-      }
       if (body.newPassword) validateNewPassword(body.newPassword as string);
+      await confirmIdentity("owner", current.passwordHash, current.twoFactor);
     }
 
     if (ownershipChanged && uploadOwnership.mode === "fixed" && !(await isKnownIdentityPair(uploadOwnership.uid, uploadOwnership.gid))) {
@@ -103,11 +115,13 @@ export async function POST(request: Request) {
         return { next, result: next.version };
       });
     }
+    const passkeysRemoved = passwordChanged && body.keepPasskeys !== true ? await removeAccountPasskeys("owner") : 0;
     if (ownershipChanged || retentionChanged || piecesChanged) await savePreferences({ ...storedPreferences, uploadOwnership, trashRetentionDays, uploadInPieces, updatedAt });
     await audit("settings.preferences.updated", {
       previousUsername: current.username,
       username,
       passwordChanged,
+      passkeysRemoved: passkeysRemoved || undefined,
       uploadOwnership: ownershipChanged ? uploadOwnership : undefined,
       trashRetentionDays: retentionChanged ? trashRetentionDays : undefined,
       uploadInPieces: piecesChanged ? uploadInPieces : undefined,

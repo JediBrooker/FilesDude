@@ -127,10 +127,9 @@ test("flooding the log can't push out recent history, and no entry can be large"
     await again.write(`${"x".repeat(1000)}\n`.repeat(Math.ceil(MAX_AUDIT_BYTES / 1001)));
     await again.close();
     await audit("fs.create", { username: "alice", n: 3 });
-    // Past 1 GB the oldest go, however recent.
+    // Even past 1 GB, recent history is kept (cheap repeatable events are set aside instead).
     const left = await fs.readdir(state);
-    assert.ok(left.includes("audit-20260101T000000000Z.jsonl"));
-    assert.ok(!left.includes("audit-20260102T000000000Z.jsonl") && !left.includes("audit-20260103T000000000Z.jsonl"));
+    for (const kept of ["audit-20260101T000000000Z.jsonl", "audit-20260102T000000000Z.jsonl", "audit-20260103T000000000Z.jsonl", "audit-20260104T000000000Z.jsonl"]) assert.ok(left.includes(kept), kept);
   });
 });
 
@@ -227,6 +226,6 @@ test("events read as plain sentences", () => {
   // invisible or direction-changing characters are shown.
   const spoof = describeActivity({ event: "fs.rename", path: "notes.txt", name: "x” and permanently deleted /Photos “y" });
   assert.deepEqual(spoof.parts, ["renamed ", { value: "/notes.txt" }, " to ", { value: "x” and permanently deleted /Photos “y" }]);
-  assert.equal(visibleText("evil‮txt.exe"), "evil⟨U+202E⟩txt.exe");
+  assert.equal(visibleText("evil\u202etxt.exe"), "evil⟨U+202E⟩txt.exe");
   assert.equal(visibleText("plain name.txt"), "plain name.txt");
 });

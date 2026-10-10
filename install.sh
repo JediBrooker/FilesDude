@@ -15,6 +15,7 @@ MODE="install"
 ROOT_PATH=""
 INSTALL_USERNAME=""
 SERVICE_ACCOUNT=""
+ROTATE_SECRET="false"
 
 say() { printf '\n\033[1;36mFilesDude\033[0m  %s\n' "$*"; }
 fail() { printf '\n\033[1;31mFilesDude error:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -30,7 +31,10 @@ Options:
   --port NUMBER           Listening port (default: 3000)
   --service-user USER     'filesdude' (safer) or 'root' (full chown access)
   --update                Update the application and keep all settings
-  --reset-credentials     Replace the bootstrap login and clear saved credentials
+  --reset-credentials     Replace the bootstrap login, clear saved credentials and passkeys,
+                          and sign everyone out (other settings are kept)
+  --rotate-secret         With --reset-credentials, also replace the session secret (this
+                          also ends every share link and saved server credential)
   --help                  Show this help
 
 For unattended first installs, set FILEDUDE_INSTALL_PASSWORD in the environment.
@@ -47,6 +51,7 @@ while (($#)); do
     --service-user) SERVICE_ACCOUNT="${2:?Missing user}"; shift 2 ;;
     --update) MODE="update"; shift ;;
     --reset-credentials) MODE="reset"; shift ;;
+    --rotate-secret) ROTATE_SECRET="true"; shift ;;
     --help|-h) usage; exit 0 ;;
     *) fail "Unknown option: $1" ;;
   esac
@@ -116,6 +121,11 @@ if ! curl -fsSL --retry 3 --header 'Accept: application/vnd.github+json' \
   "${CURL_AUTH[@]}" "${SOURCE_URL}" -o "${ARCHIVE}"; then
   fail "Could not download ${GITHUB_REPOSITORY}. If it is private, pass a read-only GITHUB_TOKEN."
 fi
+# The token is only for the download: nothing run by the build (package install scripts, the build
+# itself) gets to see it.
+rm -f "${TOKEN_CONFIG:-}"
+HAD_GITHUB_TOKEN="${GITHUB_TOKEN:+true}"
+unset GITHUB_TOKEN
 mkdir -p "${BUILD_ROOT}/source"
 tar -xzf "${ARCHIVE}" --strip-components=1 -C "${BUILD_ROOT}/source"
 # GitHub names the tarball's top folder <owner>-<repo>-<short commit>; the app shows that commit.
@@ -191,6 +201,37 @@ write_environment() {
 # Reads KEY=value from the existing environment file without executing it.
 env_value() { sed -n "s/^$1=//p" "${ENV_FILE}" | head -n 1; }
 
+# Sets KEY=value in the environment file in place, keeping every other line (added if missing).
+set_env_value() {
+  local key="$1" value="$2" temporary
+  temporary="$(mktemp "${ENV_FILE}.XXXXXX")"
+  { grep -v "^${key}=" "${ENV_FILE}" || true; printf '%s=%s\n' "${key}" "${value}"; } >"${temporary}"
+  chmod 600 "${temporary}"
+  mv -f "${temporary}" "${ENV_FILE}"
+}
+
+# A credentials reset replaces only the login, and signs everyone out by moving the sessions on a
+# generation; every other setting (trusted proxies, limits, the listener) is kept. The secret, which
+# share links and saved server credentials depend on, is only replaced with --rotate-secret.
+reset_environment() {
+  local username="$1" password="$2" hash_line hash epoch
+  [[ ${username} =~ ^[A-Za-z0-9._-]{3,64}$ ]] || fail "Username must be 3–64 letters, numbers, dots, dashes, or underscores."
+  hash_line="$(FILEDUDE_PASSWORD="${password}" node scripts/hash-password.mjs)"
+  hash="${hash_line#FILEDUDE_PASSWORD_HASH=\'}"
+  hash="${hash%\'}"
+  umask 077
+  cp -p "${ENV_FILE}" "${ENV_FILE}.bak-$(date +%Y%m%d%H%M%S)"
+  set_env_value FILEDUDE_USERNAME "${username}"
+  set_env_value FILEDUDE_PASSWORD_HASH "${hash}"
+  epoch="$(env_value FILEDUDE_SESSION_EPOCH)"
+  [[ ${epoch} =~ ^[0-9]+$ ]] || epoch=0
+  set_env_value FILEDUDE_SESSION_EPOCH "$((epoch + 1))"
+  if [[ ${ROTATE_SECRET} == "true" ]]; then
+    set_env_value FILEDUDE_SESSION_SECRET "$(openssl rand -base64 48 | tr -d '\n')"
+    printf '\nThe session secret was replaced: every share link and saved server credential has stopped working.\n' >&2
+  fi
+}
+
 # Updates and resets keep the configured listener; the server binds 0.0.0.0:3000 when unset.
 load_listen_address() {
   if [[ ${LISTEN_REQUESTED} == "true" ]]; then
@@ -212,7 +253,7 @@ elif [[ ${MODE} == "reset" ]]; then
   EXISTING_USERNAME="$(env_value FILEDUDE_USERNAME)"
   INSTALL_USERNAME="${INSTALL_USERNAME:-$(prompt_value "Replacement username" "${EXISTING_USERNAME:-admin}")}"
   INSTALL_PASSWORD="$(prompt_password)"
-  write_environment "${INSTALL_USERNAME}" "${INSTALL_PASSWORD}" "${ROOT_PATH}"
+  reset_environment "${INSTALL_USERNAME}" "${INSTALL_PASSWORD}"
   # Passkeys sign in without the password, so a reset for a lost or exposed login removes them too.
   rm -f "${STATE_DIR}/credentials.json" "${STATE_DIR}/passkeys.json"
 else
@@ -317,6 +358,19 @@ ${ZFS_UNIT}
 WantedBy=multi-user.target
 EOF
 
+# Every media sandbox run (ffmpeg, ffprobe, image decoding) goes in this slice, so together they can
+# never take more than this of the host, however many are running.
+cat >/etc/systemd/system/filesdude-media.slice <<'EOF'
+[Unit]
+Description=FilesDude media sandbox runs
+
+[Slice]
+MemoryMax=2G
+MemorySwapMax=0
+CPUQuota=400%
+TasksMax=256
+EOF
+
 cat >/usr/local/sbin/filesdude-update <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -339,7 +393,7 @@ printf 'Listening on: http://%s:%s\n' "${LISTEN_HOST}" "${PORT}"
 printf 'Status: systemctl status filesdude\n'
 printf 'Logs: journalctl -u filesdude -f\n'
 printf 'Update later: sudo filesdude-update\n'
-if [[ -n ${GITHUB_TOKEN:-} ]]; then
+if [[ -n ${HAD_GITHUB_TOKEN:-} ]]; then
   printf 'Private-repo update: sudo GITHUB_TOKEN="$(gh auth token)" filesdude-update\n'
 fi
 printf '\nFor remote access, place an HTTPS reverse proxy or VPN in front of FilesDude.\n'

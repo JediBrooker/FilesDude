@@ -90,7 +90,7 @@ test("each service gets its own format, with names shown as text", async () => {
     await saveNotificationSettings({ kind: "slack", url });
     await notify({ topic: "uploads", title: "x", message: "<!channel> & <script> https://evil.example/login" });
     const slack = JSON.parse(received[2].body);
-    assert.equal(slack.text, "*x*\n&lt;!channel&gt; &amp; &lt;script&gt; https:​//evil.example/login");
+    assert.equal(slack.text, "*x*\n&lt;!channel&gt; &amp; &lt;script&gt; https:\u200b//evil.\u200bexample/login");
     assert.equal(slack.unfurl_links, false);
 
     await saveNotificationSettings({ kind: "webhook", url });
