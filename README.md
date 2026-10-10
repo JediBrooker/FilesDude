@@ -358,11 +358,29 @@ repackaged; other picture formats can't, and HEVC still needs a browser that sho
 
 - ffmpeg runs in the same locked-down sandbox as video thumbnails, reading the already-opened
   video and writing straight into a file FilesDude opened for it, never by path; it's
-  stopped if its output grows past one and a half times the video, and runs at low disk and
-  CPU priority. One video is prepared at a time (each account one), with a few waiting.
+  stopped if its output grows past one and a half times the video (the kernel enforces that
+  too, and it can't reserve disk space without writing), and runs at low disk and CPU
+  priority. One video is prepared at a time (each account one), with a few waiting. Runs
+  stop when FilesDude's service stops or restarts.
 - Copies are kept in `playback/` in the state directory, up to 50 GB in total (set
-  `FILEDUDE_PLAYBACK_CACHE_GB` to change it), the least recently watched going first. A
-  changed video gets a new copy. Set `FILEDUDE_PLAYBACK=false` to turn this off.
+  `FILEDUDE_PLAYBACK_CACHE_GB` to change it), the least recently watched going first; room
+  is made before a copy starts, for the most it may grow to. A copy is only made while the
+  disk keeps 10 GB (or 5%, if that's more) free, since the state directory is often on the
+  system disk. A changed video gets a new copy. Set `FILEDUDE_PLAYBACK=false` to turn this
+  off.
+
+## Continue watching
+
+FilesDude remembers how far each account got in each video, so a video carries on where it
+was left off, on any device (with **Start over** to go back to the beginning). Videos
+watched to within two minutes of the end (or 95%) are marked watched with a tick in the
+list; part-watched ones show how far through they are. **Continue watching** in the sidebar
+lists the videos you're part-way through, newest first, with how long is left.
+
+- Positions are saved every 10 seconds while a video plays, and when it's paused or closed.
+  Less than 30 seconds in isn't remembered.
+- Each account's last 300 videos are kept in `watching.json` in the state directory, and
+  only for videos the account can reach; an account's history goes when it's removed.
 
 ## Activity
 

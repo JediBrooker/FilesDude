@@ -16,6 +16,7 @@ import {
   ChevronsUpDown,
   ChevronUp,
   CircleAlert,
+  CircleCheck,
   ClipboardCopy,
   ClipboardPaste,
   Copy,
@@ -51,6 +52,7 @@ import {
   Maximize2,
   Menu,
   Minimize2,
+  MonitorPlay,
   Moon,
   MoreHorizontal,
   PackageOpen,
@@ -141,6 +143,7 @@ type DialogState =
   | { kind: "twoFactor" }
   | { kind: "passkeys" }
   | { kind: "notifications" }
+  | { kind: "watching" }
   | { kind: "snapshots" }
   | { kind: "duplicates" }
   | { kind: "versions"; entry: FileEntry }
@@ -238,6 +241,8 @@ type EntryInteractions = {
   onContextMenu: (entry: FileEntry, event: React.MouseEvent) => void;
   onDragStart: (entry: FileEntry, event: React.DragEvent<HTMLElement>) => void;
   onDragEnd: () => void;
+  /** How far the account got in the videos shown, by path. */
+  watching: Map<string, WatchEntry>;
 };
 
 const DRAG_TYPE = "application/x-filesdude-paths";
@@ -531,6 +536,7 @@ export function FileManager() {
   const [sort, setSort] = useState<SortState>(() => (typeof window !== "undefined" ? storedSort() : parseSort(null)));
   const [loading, setLoading] = useState(false);
   const [dialog, setDialog] = useState<DialogState>(null);
+  const [watching, setWatching] = useState<Map<string, WatchEntry>>(() => new Map());
   const [toast, setToast] = useState<{ message: string; tone?: "error"; undo?: UndoAction } | null>(null);
   // A newer build the server runs than this page, and one the user chose not to reload for yet.
   const [serverBuild, setServerBuild] = useState<ServerBuild | null>(null);
@@ -691,6 +697,19 @@ export function FileManager() {
     return () => controller.abort();
     // Counted again whenever the listing reloads, so changes show up.
   }, [auth.authenticated, showFolderSizes, currentPath, entries, nameSearching, searchMode, activeSearch]);
+
+  // Videos in this folder the account has watched or is part-way through, marked in the list (and
+  // looked at again when a preview closes, as it may have moved on).
+  const previewOpen = dialog?.kind === "preview";
+  const hasVideos = entries.some((entry) => entry.mime.startsWith("video/"));
+  useEffect(() => {
+    if (!auth.authenticated || previewOpen || !hasVideos) return;
+    const controller = new AbortController();
+    requestJson<{ entries: WatchEntry[] }>(`/api/watching?folder=${encodePath(currentPath)}`, { signal: controller.signal })
+      .then((result) => setWatching(new Map(result.entries.map((item) => [item.path, item]))))
+      .catch(() => undefined);
+    return () => controller.abort();
+  }, [auth.authenticated, currentPath, entries, previewOpen, hasVideos]);
 
   const toggleFolderSizes = () => {
     const next = !showFolderSizes;
@@ -1171,6 +1190,7 @@ export function FileManager() {
     },
     onDragStart: startDrag,
     onDragEnd: endDrag,
+    watching,
   };
 
   const queueUpload = ({ items, folders }: { items: UploadItem[]; folders: string[] }) => {
@@ -1413,6 +1433,7 @@ export function FileManager() {
         <nav className="primary-nav" aria-label="File locations">
           <button className={`nav-item ${currentPath === home ? "active" : ""} ${dropTarget === home ? "drop-target" : ""}`} data-drop-path={home} {...(canWrite ? dropHandlers : {})} onClick={() => { navigate(home); setSidebarOpen(false); }}><Home size={18} /><span>{home ? "My files" : "All files"}</span><ChevronRight size={15} /></button>
           <button className="nav-item" onClick={() => { setShowHidden(true); navigate(home); setSidebarOpen(false); }}><Eye size={18} /><span>Hidden files</span></button>
+          <button className="nav-item" onClick={() => { setDialog({ kind: "watching" }); setSidebarOpen(false); }}><MonitorPlay size={18} /><span>Continue watching</span></button>
           {canWrite && <button className="nav-item" onClick={() => { setDialog({ kind: "trash" }); setSidebarOpen(false); }}><Trash2 size={18} /><span>Trash</span></button>}
           {isOwner && <button className="nav-item" onClick={() => { setDialog({ kind: "shares" }); setSidebarOpen(false); }}><Link2 size={18} /><span>Shared links</span>{sharedPaths.size > 0 && <em className="nav-count">{sharedPaths.size}</em>}</button>}
           {snapshotsAvailable && <button className="nav-item" onClick={() => { setDialog({ kind: "snapshots" }); setSidebarOpen(false); }}><History size={18} /><span>Snapshots</span></button>}
@@ -1832,7 +1853,7 @@ function FileTable({ entries, sort, onSort, selected, cursor, interactions, allS
         return (
           <div key={entry.path} data-path={entry.path} aria-selected={isSelected} className={`file-row ${isSelected ? "selected" : ""} ${cursor === entry.path ? "cursor" : ""} ${entryStateClasses(entry, interactions)}`} role="row" {...entryItemProps(entry, interactions)} onMouseDown={(event) => { if (event.shiftKey) event.preventDefault(); }} onDoubleClick={(event) => { if (!(event.target as HTMLElement).closest("button,input,label")) onOpen(entry); }} onClick={(event) => { if ((event.target as HTMLElement).closest("button,input,label")) return; onToggle(entry, { additive: event.metaKey || event.ctrlKey, range: event.shiftKey }); }}>
             <div role="cell"><CheckBox checked={isSelected} onChange={(event) => onToggle(entry, { additive: true, range: event.shiftKey })} label={`Select ${entry.name}`} /></div>
-            <div className="file-name-cell" role="cell"><span className={`file-icon ${entry.type}`}>{fileIcon(entry)}</span>{folder !== undefined && parentOf(entry.path) !== folder ? <div className="file-name-stack"><button className="file-name" onClick={() => onOpen(entry)}>{entry.name}</button><small title={`/${entry.path}`}>{folderLabel(parentOf(entry.path))}</small></div> : <button className="file-name" onClick={() => onOpen(entry)}>{entry.name}</button>}{interactions.sharedPaths.has(entry.path) && <span className="shared-badge" title="Shared by link"><Link2 size={13} /></span>}{entry.symlinkBlocked && <span className="warning-badge" title="This link points outside the allowed root"><CircleAlert size={13} /></span>}</div>
+            <div className="file-name-cell" role="cell"><span className={`file-icon ${entry.type}`}>{fileIcon(entry)}</span>{folder !== undefined && parentOf(entry.path) !== folder ? <div className="file-name-stack"><button className="file-name" onClick={() => onOpen(entry)}>{entry.name}</button><small title={`/${entry.path}`}>{folderLabel(parentOf(entry.path))}</small></div> : <button className="file-name" onClick={() => onOpen(entry)}>{entry.name}</button>}{interactions.sharedPaths.has(entry.path) && <span className="shared-badge" title="Shared by link"><Link2 size={13} /></span>}<WatchMark entry={entry} watching={interactions.watching} />{entry.symlinkBlocked && <span className="warning-badge" title="This link points outside the allowed root"><CircleAlert size={13} /></span>}</div>
             <div className="muted" role="cell">{entry.type !== "directory" ? formatBytes(entry.size) : folderSizes === "counting" ? <LoaderCircle className="spin" size={12} aria-label="Counting" /> : folderSizes?.has(entry.path) ? formatBytes(folderSizes.get(entry.path)!) : "—"}</div>
             <div className="owner-cell" role="cell"><span className="mini-avatar">{entry.owner.slice(0, 1).toUpperCase()}</span><span>{entry.owner}:{entry.group}</span></div>
             <div role="cell"><code className="mode-chip">{entry.mode}</code></div>
@@ -1931,7 +1952,7 @@ function BackgroundMenu({ canWrite, position, menuRef, folder, clipboardCount, c
 }
 
 function FileGrid({ entries, selected, cursor, interactions, onToggle, onOpen, videoThumbnails }: { entries: FileEntry[]; selected: Set<string>; cursor: string | null; interactions: EntryInteractions; onToggle: (entry: FileEntry, options?: SelectOptions) => void; onOpen: (entry: FileEntry) => void; videoThumbnails: boolean }) {
-  return <div className="file-grid">{entries.map((entry) => <article key={entry.path} data-path={entry.path} className={`file-card ${selected.has(entry.path) ? "selected" : ""} ${cursor === entry.path ? "cursor" : ""} ${entryStateClasses(entry, interactions)}`} {...entryItemProps(entry, interactions)} onMouseDown={(event) => { if (event.shiftKey) event.preventDefault(); }} onClick={(event) => { if ((event.target as HTMLElement).closest("button,input,label")) return; onToggle(entry, { additive: event.metaKey || event.ctrlKey, range: event.shiftKey }); }} onDoubleClick={() => onOpen(entry)}><CheckBox checked={selected.has(entry.path)} onChange={(event) => onToggle(entry, { additive: true, range: event.shiftKey })} label={`Select ${entry.name}`} /><GridPreview entry={entry} onOpen={onOpen} videoThumbnails={videoThumbnails} /><button className="grid-name" onClick={() => onOpen(entry)}>{entry.name}</button><span>{entry.type === "directory" ? "Folder" : `${extension(entry.name)} · ${formatBytes(entry.size)}`}</span></article>)}</div>;
+  return <div className="file-grid">{entries.map((entry) => <article key={entry.path} data-path={entry.path} className={`file-card ${selected.has(entry.path) ? "selected" : ""} ${cursor === entry.path ? "cursor" : ""} ${entryStateClasses(entry, interactions)}`} {...entryItemProps(entry, interactions)} onMouseDown={(event) => { if (event.shiftKey) event.preventDefault(); }} onClick={(event) => { if ((event.target as HTMLElement).closest("button,input,label")) return; onToggle(entry, { additive: event.metaKey || event.ctrlKey, range: event.shiftKey }); }} onDoubleClick={() => onOpen(entry)}><CheckBox checked={selected.has(entry.path)} onChange={(event) => onToggle(entry, { additive: true, range: event.shiftKey })} label={`Select ${entry.name}`} /><GridPreview entry={entry} onOpen={onOpen} videoThumbnails={videoThumbnails} /><button className="grid-name" onClick={() => onOpen(entry)}>{entry.name}</button><WatchMark entry={entry} watching={interactions.watching} /><span>{entry.type === "directory" ? "Folder" : `${extension(entry.name)} · ${formatBytes(entry.size)}`}</span></article>)}</div>;
 }
 
 // A thumbnail for images (and videos, when the server can) it can preview, falling back to the type
@@ -1955,6 +1976,16 @@ function GridPreview({ entry, onOpen, videoThumbnails }: { entry: FileEntry; onO
 export function CheckBox({ checked, onChange, label }: { checked: boolean; onChange: (event: { shiftKey: boolean }) => void; label: string }) {
   // React fires a checkbox's change from its click event, which carries the shift key.
   return <label className="checkbox"><input type="checkbox" checked={checked} onChange={(event) => onChange({ shiftKey: (event.nativeEvent as MouseEvent).shiftKey === true })} aria-label={label} /><span>{checked && <Check size={12} strokeWidth={3} />}</span></label>;
+}
+
+/** A tick for a video watched to the end, or how far through one the account is. */
+function WatchMark({ entry, watching }: { entry: FileEntry; watching: Map<string, WatchEntry> }) {
+  const item = watching.get(entry.path);
+  if (!item || entry.type !== "file") return null;
+  if (item.watched) return <span className="watch-badge" title="Watched" aria-label="Watched"><CircleCheck size={13} /></span>;
+  if (item.position < 30 || !item.duration) return null;
+  const label = `Watched ${formatDuration(item.position)} of ${formatDuration(item.duration)}`;
+  return <span className="watch-progress" title={label} role="img" aria-label={label}><span style={{ width: `${Math.round(Math.min(1, item.position / item.duration) * 100)}%` }} /></span>;
 }
 
 // Enough of a FileEntry for the preview and editor dialogs.
@@ -2093,6 +2124,7 @@ function DialogHost({ dialog, selected, currentPath, username, role, home, onClo
   if (dialog.kind === "twoFactor") return <TwoFactorDialog onClose={onClose} notify={notify} />;
   if (dialog.kind === "passkeys") return <PasskeysDialog onClose={onClose} notify={notify} />;
   if (dialog.kind === "notifications") return <NotificationsDialog onClose={onClose} notify={notify} />;
+  if (dialog.kind === "watching") return <ContinueWatchingDialog onClose={onClose} onPreview={onPreview} onReveal={onReveal} notify={notify} />;
   if (dialog.kind === "snapshots") return <SnapshotsDialog isOwner={role === "owner"} canWrite={canWrite} home={home} onClose={onClose} notify={notify} onJob={onJob} />;
   if (dialog.kind === "versions") return <VersionsDialog entry={dialog.entry} canWrite={canWrite} isOwner={role === "owner"} onClose={onClose} notify={notify} onJob={onJob} />;
   if (dialog.kind === "preferences") return role === "owner"
@@ -3976,6 +4008,65 @@ const localPreviewUrls: PreviewUrls = (entry) => ({ stream: `/api/fs/stream?path
 
 type PlaybackCodecs = { container: string; video?: string; audio?: string };
 type PlaybackStatus = { state: "ready" | "preparing" | "none" | "unsupported" | "failed" | "unavailable"; progress?: number; codecs?: PlaybackCodecs };
+type WatchEntry = { path: string; position: number; duration: number; watched: boolean; updatedAt: string };
+type ContinueEntry = WatchEntry & { name: string; size: number; modified: string; mime: string };
+
+/** Played less than this isn't carried on from (as on the server). */
+const RESUME_MIN_SECONDS = 30;
+const SAVE_EVERY_MS = 10_000;
+
+/** Tells the server where the account is in a video; sent even as the page closes. */
+function saveWatchPosition(pathValue: string, position: number, duration: number) {
+  void fetch("/api/watching", {
+    method: "POST",
+    keepalive: true,
+    credentials: "same-origin",
+    headers: { "x-filedude-request": "1", "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "save", path: pathValue, position, duration }),
+  }).catch(() => undefined);
+}
+
+function ContinueWatchingDialog({ onClose, onPreview, onReveal, notify }: { onClose: () => void; onPreview: (entry: FileEntry) => void; onReveal: (entry: FileEntry) => void; notify: (message: string, tone?: "error") => void }) {
+  const [entries, setEntries] = useState<ContinueEntry[] | null>(null);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    const controller = new AbortController();
+    requestJson<{ entries: ContinueEntry[] }>("/api/watching", { signal: controller.signal })
+      .then((result) => setEntries(result.entries))
+      .catch((caught: Error) => { if (caught.name !== "AbortError") setError(caught.message); });
+    return () => controller.abort();
+  }, []);
+  const remove = async (item: ContinueEntry) => {
+    try {
+      await requestJson("/api/watching", { method: "POST", body: JSON.stringify({ action: "forget", path: item.path }) });
+      setEntries((current) => current?.filter((entry) => entry.path !== item.path) ?? null);
+    } catch (caught) {
+      notify((caught as Error).message, "error");
+    }
+  };
+  const asEntry = (item: ContinueEntry): FileEntry => ({ name: item.name, path: item.path, type: "file", size: item.size, modified: item.modified, created: item.modified, mode: "", uid: 0, gid: 0, owner: "", group: "", mime: item.mime, hidden: item.name.startsWith(".") });
+  return (
+    <Modal title="Continue watching" subtitle="Videos you stopped part-way through, on any device" icon={<MonitorPlay size={19} />} onClose={onClose}>
+      {error ? <div className="watching-empty"><CircleAlert size={24} /><strong>Couldn&apos;t load the list</strong><span>{error}</span></div>
+        : !entries ? <div className="watching-empty"><LoaderCircle className="spin" size={22} /></div>
+        : !entries.length ? <div className="watching-empty"><MonitorPlay size={26} /><strong>Nothing to carry on with</strong><span>Videos you stop part-way through show up here.</span></div>
+        : <ul className="watching-list">{entries.map((item) => (
+          <li key={item.path}>
+            <button type="button" className="watching-play" onClick={() => onPreview(asEntry(item))}>
+              <span className="watching-icon"><Play size={15} /></span>
+              <span className="watching-text">
+                <strong>{item.name}</strong>
+                <small title={`/${item.path}`}>{folderLabel(parentOf(item.path))} · {formatDuration(Math.max(0, item.duration - item.position))} left</small>
+                <span className="watch-progress"><span style={{ width: `${Math.round(Math.min(1, item.position / Math.max(1, item.duration)) * 100)}%` }} /></span>
+              </span>
+            </button>
+            <button type="button" className="icon-button" aria-label={`Show ${item.name} in its folder`} title="Show in its folder" onClick={() => onReveal(asEntry(item))}><FolderOpen size={16} /></button>
+            <button type="button" className="icon-button" aria-label={`Remove ${item.name} from this list`} title="Remove from this list" onClick={() => void remove(item)}><X size={16} /></button>
+          </li>
+        ))}</ul>}
+    </Modal>
+  );
+}
 
 const AUDIO_LABELS: Record<string, string> = { ac3: "Dolby Digital (AC-3)", eac3: "Dolby Digital Plus (E-AC-3)", dts: "DTS", truehd: "Dolby TrueHD" };
 
@@ -4007,6 +4098,10 @@ function VideoPreview({ entry, url, children }: { entry: FileEntry; url: string;
   const [error, setError] = useState("");
   const videoRef = useRef<HTMLVideoElement>(null);
   const resumeAt = useRef(0);
+  // Where this account got to last time (carried on from once it's known and the video has
+  // loaded), and where it is now, saved every few seconds, on pausing, and on leaving.
+  const [resumedFrom, setResumedFrom] = useState<number | null>(null);
+  const watch = useRef({ known: false, target: 0, applied: false, savedAt: 0, saved: -1, position: 0, duration: 0 });
   const statusUrl = `/api/fs/playback?path=${encodePath(entry.path)}&status=1`;
   const sound = unplayableSound(status?.codecs);
   const needsCopy = failed || Boolean(sound);
@@ -4016,6 +4111,64 @@ function VideoPreview({ entry, url, children }: { entry: FileEntry; url: string;
     requestJson<PlaybackStatus>(statusUrl, { signal: controller.signal }).then(setStatus).catch(() => undefined);
     return () => controller.abort();
   }, [statusUrl]);
+  const resume = useCallback(() => {
+    const state = watch.current;
+    const video = videoRef.current;
+    if (!state.known || state.applied || !video || video.readyState < 1) return;
+    state.applied = true;
+    if (state.target && (!Number.isFinite(video.duration) || state.target < video.duration - 5)) {
+      video.currentTime = state.target;
+      setResumedFrom(state.target);
+    }
+  }, []);
+  const save = useCallback((ended = false) => {
+    const state = watch.current;
+    // Nothing is saved until it's known where to carry on from, so that isn't overwritten.
+    if (!state.applied || !state.duration) return;
+    const position = Math.round(ended ? state.duration : state.position);
+    if (position === state.saved) return;
+    state.saved = position;
+    state.savedAt = Date.now();
+    saveWatchPosition(entry.path, position, Math.round(state.duration));
+  }, [entry.path]);
+  useEffect(() => {
+    const controller = new AbortController();
+    requestJson<{ entry: WatchEntry | null }>(`/api/watching?path=${encodePath(entry.path)}`, { signal: controller.signal })
+      .then((result) => {
+        const item = result.entry;
+        watch.current.target = item && !item.watched && item.position >= RESUME_MIN_SECONDS ? item.position : 0;
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (controller.signal.aborted) return;
+        watch.current.known = true;
+        resume();
+      });
+    const leave = () => save();
+    window.addEventListener("pagehide", leave);
+    return () => {
+      controller.abort();
+      window.removeEventListener("pagehide", leave);
+      save();
+    };
+  }, [entry.path, resume, save]);
+  useEffect(() => {
+    if (resumedFrom === null) return;
+    const timer = window.setTimeout(() => setResumedFrom(null), 12_000);
+    return () => window.clearTimeout(timer);
+  }, [resumedFrom]);
+  const startOver = () => {
+    if (videoRef.current) videoRef.current.currentTime = 0;
+    setResumedFrom(null);
+    watch.current.saved = -1;
+    void requestJson("/api/watching", { method: "POST", body: JSON.stringify({ action: "forget", path: entry.path }) }).catch(() => undefined);
+  };
+  const track = (video: HTMLVideoElement) => {
+    if (!watch.current.applied || video.seeking) return;
+    watch.current.position = video.currentTime;
+    if (Number.isFinite(video.duration)) watch.current.duration = video.duration;
+  };
+
   // A copy that's ready is used straight away when it's needed.
   useEffect(() => {
     if (status?.state === "ready" && needsCopy && !useCopy) {
@@ -4055,7 +4208,15 @@ function VideoPreview({ entry, url, children }: { entry: FileEntry; url: string;
   }
   return (
     <div className="video-preview">
-      <video key={src} ref={videoRef} src={src} controls autoPlay onError={() => { if (!useCopy) setFailed(true); }} onLoadedMetadata={(event) => { if (useCopy && resumeAt.current) event.currentTarget.currentTime = resumeAt.current; }}>{children}</video>
+      <video
+        key={src} ref={videoRef} src={src} controls autoPlay
+        onError={() => { if (!useCopy) setFailed(true); }}
+        onLoadedMetadata={(event) => { if (useCopy && resumeAt.current) event.currentTarget.currentTime = resumeAt.current; else resume(); }}
+        onTimeUpdate={(event) => { track(event.currentTarget); if (!event.currentTarget.paused && Date.now() - watch.current.savedAt > SAVE_EVERY_MS) save(); }}
+        onPause={(event) => { track(event.currentTarget); save(); }}
+        onEnded={() => save(true)}
+      >{children}</video>
+      {resumedFrom !== null && <div className="playback-notice"><History size={16} /><span>Carried on from {formatDuration(resumedFrom)}, where you left off.</span><button type="button" className="button secondary" onClick={startOver}><RotateCcw size={14} /> Start over</button></div>}
       {(notice || error) && <div className="playback-notice">{notice}{error && <span className="form-error"><CircleAlert size={14} />{error}</span>}</div>}
     </div>
   );

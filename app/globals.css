@@ -702,6 +702,21 @@ kbd { padding: 3px 5px; border: 1px solid var(--line); border-bottom-width: 2px;
 
 .toast { position: fixed; z-index: 200; right: 22px; bottom: 22px; display: flex; max-width: min(390px, calc(100vw - 44px)); min-height: 44px; align-items: center; gap: 9px; padding: 10px 14px; border: 1px solid color-mix(in srgb, var(--brand) 30%, var(--line)); border-radius: 10px; background: var(--panel); color: var(--brand-strong); box-shadow: var(--shadow); font-size: 10px; font-weight: 700; animation: toast-in .2s ease both; }
 .shared-badge { display: inline-flex; flex: 0 0 auto; color: var(--brand); }
+.watch-badge { display: inline-flex; flex: 0 0 auto; color: var(--brand); }
+.watch-progress { position: relative; display: inline-block; flex: 0 0 auto; width: 36px; height: 4px; overflow: hidden; border-radius: 4px; background: var(--line-strong); vertical-align: middle; }
+.watch-progress > span { position: absolute; inset: 0 auto 0 0; background: var(--brand); }
+.file-card .watch-progress, .file-card .watch-badge { margin: 2px auto 0; }
+.watching-empty { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 36px 22px 40px; color: var(--ink-soft); font-size: 11px; text-align: center; }
+.watching-empty strong { color: var(--ink); font-size: 13px; }
+.watching-list { display: grid; gap: 4px; margin: 0; padding: 12px 14px 18px; list-style: none; }
+.watching-list li { display: flex; align-items: center; gap: 4px; border-radius: 10px; }
+.watching-list li:hover { background: var(--panel-soft); }
+.watching-play { display: flex; min-width: 0; flex: 1; align-items: center; gap: 11px; padding: 9px 8px; border: 0; border-radius: 10px; background: none; color: var(--ink); text-align: left; cursor: pointer; }
+.watching-icon { display: grid; width: 34px; height: 34px; flex: 0 0 auto; place-items: center; border-radius: 10px; background: var(--brand-soft); color: var(--brand); }
+.watching-text { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 4px; }
+.watching-text strong { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.watching-text small { overflow: hidden; color: var(--ink-soft); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.watching-text .watch-progress { width: 100%; }
 .nav-count { min-width: 18px; padding: 1px 6px; border-radius: 999px; background: var(--brand-soft); color: var(--brand-strong); font-size: 9px; font-style: normal; font-weight: 800; text-align: center; }
 .share-links { display: grid; gap: 8px; margin: 14px 0 4px; }
 .share-kind-choice { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 14px; }
