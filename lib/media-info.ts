@@ -1,20 +1,15 @@
 import crypto from "node:crypto";
-import sharp from "sharp";
 import { reservedPathCheck } from "./archives";
 import { config } from "./config";
 import { acquireFilesystemLock, getMime, openVerifiedFile } from "./files";
 import { AppError } from "./http";
+import { MAX_EXIF_BYTES, MAX_SOURCE_PIXELS, imageMetadataAvailable, readImageMetadata } from "./image-resize";
 import { MEDIA_FORMATS, inputLimits, sandboxRunner } from "./media-sandbox";
-import { DECODED_FORMATS, MAX_THUMBNAIL_SOURCE_BYTES, THUMBNAIL_TYPES, VIDEO_THUMBNAIL_TYPES, imageSlots, limiter, looksLikeRasterImage, readExactly } from "./thumbnails";
-
-// Reading an image's details shares libuv's small thread pool with file I/O, so sharp keeps no
-// cache and uses one thread per image (and at most two images are read at once).
-sharp.cache(false);
-sharp.concurrency(1);
+import { DECODED_FORMATS, MAX_THUMBNAIL_SOURCE_BYTES, THUMBNAIL_TYPES, VIDEO_THUMBNAIL_TYPES, imageSlots, limiter, looksLikeRasterImage } from "./thumbnails";
 
 /**
  * Media details for Properties: an image's dimensions, format, frames, and (from EXIF) camera and
- * date taken, read by sharp; a video's or audio file's length, resolution, frame rate, codecs, and
+ * date taken, read by sharp outside FilesDude, like thumbnails (see image-resize.ts); a video's or audio file's length, resolution, frame rate, codecs, and
  * tags, read by ffprobe in the same sandbox as video thumbnails (see media-sandbox.ts).
  */
 export type MediaInfo = {
@@ -46,14 +41,15 @@ export type ProbeRunner = (fd: number) => Promise<Buffer | null>;
 
 export const AUDIO_TYPES = new Set(["audio/mpeg", "audio/wav", "audio/ogg", "audio/flac", "audio/mp4", "audio/aac"]);
 const MAX_PROBE_BYTES = 1024 * 1024;
-const MAX_SOURCE_PIXELS = 100_000_000;
 const CACHE_MAX = 2_000;
 // A file that couldn't be read is tried again after this, in case the failure was passing.
 const FAILURE_RETRY_MS = 60 * 60 * 1000;
+// An image whose reading process failed (was stopped, or never started) is tried again sooner.
+const RUN_FAILURE_RETRY_MS = 60 * 1000;
 const MAX_ACTIVE_PER_ACCOUNT = 2;
 
 // Cached by the file's identity, so an edited file is read again; null means it couldn't be read.
-const cache = new Map<string, { info: MediaInfo | null; at: number }>();
+const cache = new Map<string, { info: MediaInfo | null; at: number; retryMs: number }>();
 // Requests for a file already being read share that read.
 const reading = new Map<string, Promise<MediaInfo | null>>();
 const activePerAccount = new Map<string, number>();
@@ -85,13 +81,13 @@ export async function mediaProbeAvailable() {
 
 function cached(key: string) {
   const entry = cache.get(key);
-  if (!entry || (entry.info === null && Date.now() - entry.at >= FAILURE_RETRY_MS)) return undefined;
+  if (!entry || (entry.info === null && Date.now() - entry.at >= entry.retryMs)) return undefined;
   return entry.info;
 }
 
-function remember(key: string, info: MediaInfo | null) {
+function remember(key: string, info: MediaInfo | null, retryMs = FAILURE_RETRY_MS) {
   cache.delete(key);
-  cache.set(key, { info, at: Date.now() });
+  cache.set(key, { info, at: Date.now(), retryMs });
   if (cache.size > CACHE_MAX) cache.delete(cache.keys().next().value!);
 }
 
@@ -230,32 +226,71 @@ function exifDetails(exif: Buffer | undefined) {
   }
 }
 
-async function imageInfo(handle: Awaited<ReturnType<typeof openVerifiedFile>>["handle"], size: number): Promise<MediaInfo | null> {
+const isCount = (max: number) => (value: unknown) => Number.isSafeInteger(value) && (value as number) > 0 && (value as number) <= max;
+// libvips's band formats.
+const DEPTHS = new Set(["uchar", "char", "ushort", "short", "uint", "int", "float", "double", "complex", "dpcomplex"]);
+
+// Every field the decoding process may send, and what each must be.
+const METADATA_FIELDS: Record<string, (value: unknown) => boolean> = {
+  format: (value) => typeof value === "string" && DECODED_FORMATS.has(value),
+  width: isCount(MAX_SOURCE_PIXELS),
+  height: isCount(MAX_SOURCE_PIXELS),
+  pageHeight: isCount(MAX_SOURCE_PIXELS),
+  pages: isCount(MAX_SOURCE_PIXELS),
+  depth: (value) => typeof value === "string" && DEPTHS.has(value),
+  space: (value) => typeof value === "string" && /^[a-z0-9-]{1,16}$/.test(value),
+  hasAlpha: (value) => typeof value === "boolean",
+  orientation: isCount(8),
+  exif: (value) => typeof value === "string" && value.length <= Math.ceil(MAX_EXIF_BYTES / 3) * 4 && /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value),
+};
+
+/**
+ * An image's details from the decoding process's JSON. It parsed a file someone else controls, so
+ * its output is checked as strictly as that file would be: any field that is unknown or not as
+ * expected, or missing dimensions, and none of it is used.
+ */
+export function parseImageMetadata(output: Buffer): MediaInfo | null {
+  let data: unknown;
+  try {
+    data = JSON.parse(output.toString("utf8"));
+  } catch {
+    return null;
+  }
+  if (!data || typeof data !== "object" || Array.isArray(data)) return null;
+  const fields = Object.entries(data);
+  if (fields.some(([name, value]) => !Object.hasOwn(METADATA_FIELDS, name) || !METADATA_FIELDS[name](value))) return null;
+  const meta = data as { format?: string; width?: number; height?: number; pageHeight?: number; pages?: number; depth?: string; space?: string; hasAlpha?: boolean; orientation?: number; exif?: string };
+  if (!meta.format || !meta.width || !meta.height || meta.width * meta.height > MAX_SOURCE_PIXELS) return null;
+  if (meta.pageHeight && meta.pageHeight > meta.height) return null;
+  // EXIF orientations 5-8 turn the picture on its side.
+  const sideways = (meta.orientation ?? 1) >= 5;
+  const height = meta.pageHeight ?? meta.height;
+  return withoutEmpty({
+    kind: "image",
+    format: meta.format === "heif" ? "AVIF" : meta.format.toUpperCase(),
+    width: sideways ? height : meta.width,
+    height: sideways ? meta.width : height,
+    frames: meta.pages && meta.pages > 1 ? meta.pages : undefined,
+    bitDepth: meta.depth?.replace(/^u?char$/, "8-bit").replace(/^u?short$/, "16-bit"),
+    colorSpace: meta.space?.toUpperCase().replace(/^B-W$/, "Greyscale"),
+    hasAlpha: meta.hasAlpha || undefined,
+    ...exifDetails(meta.exif === undefined ? undefined : Buffer.from(meta.exif, "base64")),
+  });
+}
+
+// An image's details, and how long to wait before trying again if there are none.
+async function imageInfo(handle: Awaited<ReturnType<typeof openVerifiedFile>>["handle"], size: number): Promise<{ info: MediaInfo | null; retryMs: number }> {
   const header = Buffer.alloc(64);
   const { bytesRead } = await handle.read(header, 0, header.length, 0);
-  if (!looksLikeRasterImage(header.subarray(0, bytesRead))) return null;
+  if (!looksLikeRasterImage(header.subarray(0, bytesRead))) return { info: null, retryMs: FAILURE_RETRY_MS };
   await imageSlots.take();
   try {
-    const source = await readExactly(handle, size);
-    const meta = await sharp(source, { limitInputPixels: MAX_SOURCE_PIXELS, failOn: "error", animated: true }).metadata();
-    if (!meta.format || !DECODED_FORMATS.has(meta.format)) return null;
-    // EXIF orientations 5-8 turn the picture on its side.
-    const sideways = (meta.orientation ?? 1) >= 5;
-    const height = meta.pageHeight ?? meta.height;
-    return withoutEmpty({
-      kind: "image",
-      format: meta.format === "heif" ? "AVIF" : meta.format.toUpperCase(),
-      width: sideways ? height : meta.width,
-      height: sideways ? meta.width : height,
-      frames: meta.pages && meta.pages > 1 ? meta.pages : undefined,
-      bitDepth: typeof meta.depth === "string" ? meta.depth.replace(/^u?char$/, "8-bit").replace(/^u?short$/, "16-bit") : undefined,
-      colorSpace: meta.space ? meta.space.toUpperCase().replace(/^B-W$/, "Greyscale") : undefined,
-      hasAlpha: meta.hasAlpha || undefined,
-      ...exifDetails(meta.exif),
-    });
-  } catch (error) {
-    if (error instanceof AppError) throw error;
-    return null;
+    // The decoding process is given the open file itself, never its path, and reads no more of it
+    // than the size measured here.
+    const output = await readImageMetadata(handle.fd, { formats: [...DECODED_FORMATS], maxBytes: size });
+    if (!output) return { info: null, retryMs: RUN_FAILURE_RETRY_MS };
+    if (output.toString("latin1") === '"changed"') throw new AppError("This image changed while it was being read", 409, "IMAGE_CHANGED");
+    return { info: parseImageMetadata(output), retryMs: FAILURE_RETRY_MS };
   } finally {
     imageSlots.release();
   }
@@ -292,6 +327,7 @@ async function readMediaInfo(relativePath: string): Promise<MediaInfo> {
   // Refuse other names before opening anything.
   const kind = kindOf(getMime(relativePath));
   if (!kind) throw new AppError("This file type has no media details", 415, "NO_MEDIA_INFO");
+  if (kind === "image" && !(await imageMetadataAvailable())) throw new AppError("Image details aren't available on this server", 415, "NO_MEDIA_INFO");
   if (kind !== "image" && !(await mediaProbeAvailable())) throw new AppError("Audio and video details aren't available on this server", 415, "NO_MEDIA_INFO");
   const isReserved = await reservedPathCheck();
   const unlock = await acquireFilesystemLock();
@@ -314,8 +350,8 @@ async function readMediaInfo(relativePath: string): Promise<MediaInfo> {
       if (!read) {
         read = (async () => {
           try {
-            const result = kind === "image" ? await imageInfo(handle, Number(identity.size)) : await avInfo(handle.fd, kind);
-            remember(key, result);
+            const { info: result, retryMs } = kind === "image" ? await imageInfo(handle, Number(identity.size)) : { info: await avInfo(handle.fd, kind), retryMs: FAILURE_RETRY_MS };
+            remember(key, result, retryMs);
             return result;
           } finally {
             reading.delete(key);
