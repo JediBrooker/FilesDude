@@ -159,6 +159,7 @@ function describe(entry: Entry): Omit<ActivityText, "text"> {
     case "settings.two_factor.disabled": return { parts: ["turned off two-factor sign-in"], tone: "warning" };
     case "settings.two_factor.recovery_codes": return { parts: ["made new recovery codes"] };
     case "settings.two_factor.failed": return { parts: ["entered a wrong two-factor code in preferences"], tone: "danger" };
+    case "settings.notifications": return { parts: [entry.kind === "off" ? "turned notifications off" : `set notifications to go to ${str(entry.kind) === "webhook" ? "a webhook" : str(entry.kind)}`] };
     case "settings.passkey.added": return { parts: str(entry.passkey) ? t`added the passkey ${v(str(entry.passkey))}` : ["added a passkey"] };
     case "settings.passkey.renamed": return { parts: t`renamed the passkey ${v(str(entry.from))} to ${v(str(entry.passkey))}` };
     case "settings.passkey.removed": return { parts: str(entry.passkey) ? t`removed the passkey ${v(str(entry.passkey))}` : ["removed a passkey"] };

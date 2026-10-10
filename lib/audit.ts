@@ -2,6 +2,7 @@ import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { config } from "./config";
+import { notifyFromAudit } from "./notifications";
 
 // The audit log: one JSON object per line in audit.jsonl in the state directory. At 8 MB the file is
 // set aside as a dated archive (audit-<time>.jsonl) and a new one started. Archives are kept for at
@@ -124,6 +125,12 @@ export async function audit(event: string, details: Record<string, unknown> = {}
   queue = run.catch(() => undefined);
   try {
     await run;
+    // What's worth telling the owner about straight away is sent as a notification (if they're on).
+    try {
+      notifyFromAudit(event, details);
+    } catch (error) {
+      console.error("Unable to send a notification", error);
+    }
   } catch (error) {
     console.error("Unable to write audit event", error);
   } finally {

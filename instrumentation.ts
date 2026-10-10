@@ -8,6 +8,9 @@ export async function register() {
   // Reading the preferences sets the request timeout to match the uploads setting.
   const { getPreferences } = await import("./lib/preferences");
   await getPreferences().catch((error: unknown) => console.error("Could not read preferences", error));
+  // Tells the owner (if notifications are on) when the disk is nearly full.
+  const { startFreeSpaceChecks } = await import("./lib/notifications");
+  startFreeSpaceChecks();
   const { startSnapshotSchedule } = await import("./lib/snapshot-schedule");
   startSnapshotSchedule();
 }
