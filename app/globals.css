@@ -664,6 +664,11 @@ kbd { padding: 3px 5px; border: 1px solid var(--line); border-bottom-width: 2px;
 .text-button { padding: 0; border: 0; background: none; color: var(--brand); cursor: pointer; font-size: 9px; font-weight: 700; }
 
 .preview-overlay { padding: 24px; }
+.preview-overlay.fullscreen { padding: 0; background: #000; backdrop-filter: none; }
+.preview-overlay.fullscreen .preview-modal { width: 100%; height: 100vh; border: 0; border-radius: 0; }
+.preview-overlay.fullscreen .preview-body, .preview-overlay.fullscreen .preview-stage { background: #000; }
+.slideshow-controls { display: flex; align-items: center; gap: 6px; }
+.slideshow-controls select { height: 34px; padding: 0 8px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--panel); color: var(--ink); font-size: 10px; }
 .preview-modal { display: flex; width: min(1120px, 100%); height: min(760px, calc(100vh - 48px)); flex-direction: column; overflow: hidden; border: 1px solid var(--line); border-radius: 16px; background: var(--panel); box-shadow: var(--shadow); }
 .preview-modal > header { display: flex; min-height: 63px; align-items: center; justify-content: space-between; gap: 15px; padding: 9px 13px 9px 16px; border-bottom: 1px solid var(--line); }
 .preview-modal > header > div { display: flex; min-width: 0; align-items: center; gap: 9px; }

@@ -48,11 +48,15 @@ import {
   LoaderCircle,
   LockKeyhole,
   LogOut,
+  Maximize2,
   Menu,
+  Minimize2,
   Moon,
   MoreHorizontal,
   PackageOpen,
+  Pause,
   Pencil,
+  Play,
   Plus,
   RefreshCw,
   History,
@@ -131,7 +135,7 @@ type DialogState =
   | { kind: "transfer"; mode: "copy" | "move" }
   | { kind: "bulk" }
   // `siblings` are the files previous/next step through (the folder's files, in its order).
-  | { kind: "preview"; entry: FileEntry; siblings?: FileEntry[] }
+  | { kind: "preview"; entry: FileEntry; siblings?: FileEntry[]; slideshow?: Slideshow }
   | { kind: "edit"; entry: FileEntry }
   | { kind: "preferences" }
   | { kind: "twoFactor" }
@@ -799,8 +803,8 @@ export function FileManager() {
   };
 
   // Stepping through a preview moves the selection along, so closing it leaves you on that file.
-  const showPreview = (entry: FileEntry, siblings?: FileEntry[]) => {
-    setDialog({ kind: "preview", entry, siblings });
+  const showPreview = (entry: FileEntry, siblings?: FileEntry[], slideshow?: Slideshow) => {
+    setDialog({ kind: "preview", entry, siblings, slideshow });
     if (siblings) {
       setSelected(new Set([entry.path]));
       setCursor(entry.path);
@@ -2060,7 +2064,7 @@ function DialogHost({ dialog, selected, currentPath, username, role, home, onClo
   onNotifications: () => void;
   uploadInPieces: boolean;
   onReveal: (entry: FileEntry) => void;
-  onPreview: (entry: FileEntry, siblings?: FileEntry[]) => void;
+  onPreview: (entry: FileEntry, siblings?: FileEntry[], slideshow?: Slideshow) => void;
 }) {
   // The server dialogs are shown by FileManager, which holds the list of servers.
   if (dialog.kind === "server" || dialog.kind === "serverSettings" || dialog.kind === "copyToServer") return null;
@@ -2081,8 +2085,9 @@ function DialogHost({ dialog, selected, currentPath, username, role, home, onClo
   if (dialog.kind === "transfer") return <TransferDialog mode={dialog.mode} entries={selected} startPath={currentPath} home={home} onClose={onClose} onTransfer={onTransfer} />;
   if (dialog.kind === "bulk") return <BulkRenameDialog entries={selected} onClose={onClose} notify={notify} onRefresh={onRefresh} />;
   if (dialog.kind === "preview") {
-    const { siblings } = dialog;
-    return <PreviewDialog key={dialog.entry.path} entry={dialog.entry} siblings={siblings} onStep={(entry) => onPreview(entry, siblings)} onClose={onClose} />;
+    const { siblings, slideshow } = dialog;
+    // The preview is remounted for each file, so the slideshow's settings travel with the dialog.
+    return <PreviewDialog key={dialog.entry.path} entry={dialog.entry} siblings={siblings} onStep={(entry) => onPreview(entry, siblings, slideshow)} onClose={onClose} slideshow={slideshow} onSlideshow={(next) => onPreview(dialog.entry, siblings, next)} />;
   }
   if (dialog.kind === "edit") return <EditDialog entry={dialog.entry} onClose={onClose} onRun={onRun} />;
   if (dialog.kind === "twoFactor") return <TwoFactorDialog onClose={onClose} notify={notify} />;
@@ -3969,7 +3974,11 @@ const PRELOAD_IMAGE_BYTES = 32 * 1024 * 1024;
 export type PreviewUrls = (entry: FileEntry) => { stream: string; download: string };
 const localPreviewUrls: PreviewUrls = (entry) => ({ stream: `/api/fs/stream?path=${encodePath(entry.path)}`, download: `/api/fs/download?path=${encodePath(entry.path)}` });
 
-export function PreviewDialog({ entry, siblings = [], onStep, onClose, urls = localPreviewUrls }: { entry: FileEntry; siblings?: FileEntry[]; onStep: (entry: FileEntry) => void; onClose: () => void; urls?: PreviewUrls }) {
+export type Slideshow = { playing: boolean; seconds: number; fullscreen: boolean };
+const SLIDESHOW_SECONDS = [3, 5, 10, 20];
+const isPicture = (item: FileEntry) => item.mime.startsWith("image/");
+
+export function PreviewDialog({ entry, siblings = [], onStep, onClose, urls = localPreviewUrls, slideshow, onSlideshow }: { entry: FileEntry; siblings?: FileEntry[]; onStep: (entry: FileEntry) => void; onClose: () => void; urls?: PreviewUrls; slideshow?: Slideshow; onSlideshow?: (next: Slideshow) => void }) {
   const [text, setText] = useState<string | null>(null);
   const [error, setError] = useState("");
   const touchStart = useRef<{ x: number; y: number } | null>(null);
@@ -3990,12 +3999,52 @@ export function PreviewDialog({ entry, siblings = [], onStep, onClose, urls = lo
   const previous = index > 0 ? siblings[index - 1] : null;
   const next = index >= 0 && index < siblings.length - 1 ? siblings[index + 1] : null;
 
+  // A slideshow steps through the folder's pictures (round to the first after the last), each shown
+  // for the chosen time once it has loaded. Fullscreen is the whole page, so it lasts across steps.
+  const show = slideshow ?? { playing: false, seconds: 5, fullscreen: false };
+  const pictures = siblings.filter(isPicture);
+  const canShow = Boolean(onSlideshow) && isPicture(entry) && pictures.length > 1;
+  const pictureIndex = pictures.findIndex((item) => item.path === entry.path);
+  const nextPicture = canShow ? pictures[(pictureIndex + 1) % pictures.length] : null;
+  const [pictureReady, setPictureReady] = useState(false);
+  const showRef = useRef(show);
+  useEffect(() => { showRef.current = show; });
+  useEffect(() => {
+    if (!show.playing || !pictureReady || !nextPicture) return;
+    const timer = window.setTimeout(() => onStep(nextPicture), show.seconds * 1000);
+    return () => window.clearTimeout(timer);
+  }, [show.playing, show.seconds, pictureReady, nextPicture, onStep]);
+  useEffect(() => {
+    if (nextPicture && nextPicture.mime !== "image/svg+xml" && nextPicture.size <= PRELOAD_IMAGE_BYTES) new Image().src = urls(nextPicture).stream;
+  }, [nextPicture, urls]);
+  // Leaving fullscreen with the browser's own controls (Esc) is noticed.
+  useEffect(() => {
+    if (!onSlideshow) return;
+    const onChange = () => { if (showRef.current.fullscreen !== Boolean(document.fullscreenElement)) onSlideshow({ ...showRef.current, fullscreen: Boolean(document.fullscreenElement) }); };
+    document.addEventListener("fullscreenchange", onChange);
+    return () => document.removeEventListener("fullscreenchange", onChange);
+  }, [onSlideshow]);
+  const toggleFullscreen = () => {
+    if (document.fullscreenElement) void document.exitFullscreen().catch(() => undefined);
+    else void document.documentElement.requestFullscreen().catch(() => undefined);
+  };
+  const close = () => {
+    if (document.fullscreenElement) void document.exitFullscreen().catch(() => undefined);
+    onClose();
+  };
+
   // Left and right arrows step through the folder, except while a control (like a playing video's
   // seek bar) has the keyboard.
   useEffect(() => {
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
       if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
       if ((event.target as HTMLElement | null)?.closest?.("input, textarea, select, video, audio, [contenteditable]")) return;
+      // P plays or pauses a slideshow.
+      if ((event.key === "p" || event.key === "P") && canShow && onSlideshow) {
+        event.preventDefault();
+        onSlideshow({ ...showRef.current, playing: !showRef.current.playing });
+        return;
+      }
       const target = event.key === "ArrowLeft" ? previous : event.key === "ArrowRight" ? next : null;
       if (!target) return;
       event.preventDefault();
@@ -4003,7 +4052,7 @@ export function PreviewDialog({ entry, siblings = [], onStep, onClose, urls = lo
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [previous, next, onStep]);
+  }, [previous, next, onStep, canShow, onSlideshow]);
 
   useEffect(() => {
     for (const item of [next, previous]) {
@@ -4032,12 +4081,17 @@ export function PreviewDialog({ entry, siblings = [], onStep, onClose, urls = lo
   let preview: ReactNode;
   if (error) preview = <div className="preview-message"><CircleAlert size={24} /><p>{error}</p></div>;
   else if (isText) preview = text === null ? <div className="preview-message"><LoaderCircle className="spin" size={24} /><p>Loading preview…</p></div> : <pre className="text-preview">{text}</pre>;
-  else if (entry.mime.startsWith("image/")) preview = <div className="image-preview"><img src={url} alt={entry.name} /></div>; // eslint-disable-line @next/next/no-img-element
+  else if (entry.mime.startsWith("image/")) preview = <div className="image-preview"><img src={url} alt={entry.name} onLoad={() => setPictureReady(true)} onError={() => setPictureReady(true)} /></div>; // eslint-disable-line @next/next/no-img-element
   else if (entry.mime.startsWith("video/")) preview = <video src={url} controls autoPlay>{subtitles.map((track) => <track key={track.id} kind="subtitles" label={track.label} srcLang={track.language} src={`/api/fs/subtitles?path=${encodePath(entry.path)}&track=${encodeURIComponent(track.id)}`} />)}</video>;
   else if (entry.mime.startsWith("audio/")) preview = <div className="audio-preview"><FileAudio size={54} /><strong>{entry.name}</strong><audio src={url} controls autoPlay /></div>;
   else if (entry.mime === "application/pdf") preview = <iframe src={url} title={`Preview of ${entry.name}`} />;
   else preview = <div className="preview-message"><File size={42} /><h3>Preview unavailable</h3><p>This file type can still be downloaded.</p></div>;
-  return <div className="preview-overlay"><section className="preview-modal" role="dialog" aria-modal="true" aria-label={`Preview ${entry.name}`}><header><div><span className={`file-icon ${entry.type}`}>{fileIcon(entry)}</span><div><strong>{entry.name}</strong><span>{extension(entry.name)} · {formatBytes(entry.size)}{index >= 0 && siblings.length > 1 ? ` · ${index + 1} of ${siblings.length}` : ""}</span></div></div><div><a className="button secondary" href={urls(entry).download}><ArrowDownToLine size={16} /> Download</a><button className="icon-button" aria-label="Close preview" onClick={onClose}><X size={19} /></button></div></header><div className="preview-stage" onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}><div className="preview-body">{preview}</div>{previous && <button type="button" className="preview-nav previous" aria-label={`Previous: ${previous.name}`} title={`${previous.name} (←)`} onClick={() => onStep(previous)}><ChevronLeft size={22} /></button>}{next && <button type="button" className="preview-nav next" aria-label={`Next: ${next.name}`} title={`${next.name} (→)`} onClick={() => onStep(next)}><ChevronRight size={22} /></button>}</div></section></div>;
+  const slideshowControls = canShow && onSlideshow && <div className="slideshow-controls">
+    <button type="button" className={`button ${show.playing ? "primary" : "secondary"}`} aria-pressed={show.playing} title={show.playing ? "Pause the slideshow (P)" : "Play a slideshow of this folder's pictures (P)"} onClick={() => onSlideshow({ ...show, playing: !show.playing })}>{show.playing ? <Pause size={15} /> : <Play size={15} />} {show.playing ? "Pause" : "Slideshow"}</button>
+    <select aria-label="Seconds per picture" value={show.seconds} onChange={(event) => onSlideshow({ ...show, seconds: Number(event.target.value) })}>{SLIDESHOW_SECONDS.map((seconds) => <option key={seconds} value={seconds}>{seconds} s</option>)}</select>
+    {typeof document !== "undefined" && document.fullscreenEnabled && <button type="button" className="icon-button" aria-label={show.fullscreen ? "Leave full screen" : "Full screen"} title={show.fullscreen ? "Leave full screen" : "Full screen"} onClick={toggleFullscreen}>{show.fullscreen ? <Minimize2 size={17} /> : <Maximize2 size={17} />}</button>}
+  </div>;
+  return <div className={`preview-overlay${show.fullscreen ? " fullscreen" : ""}`}><section className="preview-modal" role="dialog" aria-modal="true" aria-label={`Preview ${entry.name}`}><header><div><span className={`file-icon ${entry.type}`}>{fileIcon(entry)}</span><div><strong>{entry.name}</strong><span>{extension(entry.name)} · {formatBytes(entry.size)}{index >= 0 && siblings.length > 1 ? ` · ${index + 1} of ${siblings.length}` : ""}</span></div></div><div>{slideshowControls}<a className="button secondary" href={urls(entry).download}><ArrowDownToLine size={16} /> Download</a><button className="icon-button" aria-label="Close preview" onClick={close}><X size={19} /></button></div></header><div className="preview-stage" onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}><div className="preview-body">{preview}</div>{previous && <button type="button" className="preview-nav previous" aria-label={`Previous: ${previous.name}`} title={`${previous.name} (←)`} onClick={() => onStep(previous)}><ChevronLeft size={22} /></button>}{next && <button type="button" className="preview-nav next" aria-label={`Next: ${next.name}`} title={`${next.name} (→)`} onClick={() => onStep(next)}><ChevronRight size={22} /></button>}</div></section></div>;
 }
 
 type Checksums = { sha256: string; md5: string };
