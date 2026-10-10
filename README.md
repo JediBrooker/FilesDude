@@ -345,6 +345,25 @@ length, resolution, codecs, and tags shown under **Video** or **Audio** in Prope
 `FILEDUDE_MEDIA_INFO=false` to turn that off. Image details are read like image
 thumbnails (above).
 
+## Videos that play everywhere
+
+Browsers don't all play every video: Safari (including on iPhones) can't play MKV at all,
+and Chrome plays Dolby Digital (AC-3, E-AC-3), DTS, and TrueHD sound as silence. When a
+video won't play, or its sound won't, its preview offers **Make it playable**: FilesDude
+repackages it as MP4 without re-encoding the picture (so nothing is lost, and an hour of
+video takes about a minute), turning the sound into stereo AAC where needed, and switches to
+the copy once it's ready, carrying on from the same moment. H.264 and HEVC video can be
+repackaged; other picture formats can't, and HEVC still needs a browser that shows it
+(Safari, Edge, or Chrome on most recent computers).
+
+- ffmpeg runs in the same locked-down sandbox as video thumbnails, reading the already-opened
+  video and writing straight into a file FilesDude opened for it, never by path; it's
+  stopped if its output grows past one and a half times the video, and runs at low disk and
+  CPU priority. One video is prepared at a time (each account one), with a few waiting.
+- Copies are kept in `playback/` in the state directory, up to 50 GB in total (set
+  `FILEDUDE_PLAYBACK_CACHE_GB` to change it), the least recently watched going first. A
+  changed video gets a new copy. Set `FILEDUDE_PLAYBACK=false` to turn this off.
+
 ## Activity
 
 The owner's **Activity** view (in the sidebar) reads the audit log, `audit.jsonl` in the

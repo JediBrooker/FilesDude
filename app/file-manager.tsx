@@ -3974,6 +3974,93 @@ const PRELOAD_IMAGE_BYTES = 32 * 1024 * 1024;
 export type PreviewUrls = (entry: FileEntry) => { stream: string; download: string };
 const localPreviewUrls: PreviewUrls = (entry) => ({ stream: `/api/fs/stream?path=${encodePath(entry.path)}`, download: `/api/fs/download?path=${encodePath(entry.path)}` });
 
+type PlaybackCodecs = { container: string; video?: string; audio?: string };
+type PlaybackStatus = { state: "ready" | "preparing" | "none" | "unsupported" | "failed" | "unavailable"; progress?: number; codecs?: PlaybackCodecs };
+
+const AUDIO_LABELS: Record<string, string> = { ac3: "Dolby Digital (AC-3)", eac3: "Dolby Digital Plus (E-AC-3)", dts: "DTS", truehd: "Dolby TrueHD" };
+
+/** Sound this browser won't play (it would show the picture silently), or null. */
+function unplayableSound(codecs?: PlaybackCodecs) {
+  if (!codecs?.audio || typeof document === "undefined") return null;
+  const probe = document.createElement("video");
+  const types: Record<string, string> = { ac3: 'audio/mp4; codecs="ac-3"', eac3: 'audio/mp4; codecs="ec-3"' };
+  if (codecs.audio in types) return probe.canPlayType(types[codecs.audio]) ? null : AUDIO_LABELS[codecs.audio];
+  return codecs.audio === "dts" || codecs.audio === "truehd" ? AUDIO_LABELS[codecs.audio] : null;
+}
+
+/** Whether this browser can show the picture at all (HEVC isn't everywhere), once repackaged. */
+function pictureSupported(codecs?: PlaybackCodecs) {
+  if (codecs?.video !== "hevc" || typeof document === "undefined") return true;
+  return document.createElement("video").canPlayType('video/mp4; codecs="hvc1.1.6.L93.B0"') !== "";
+}
+
+/**
+ * A video, played as it is where the browser can; otherwise (it fails to play, or its sound wouldn't
+ * play here) FilesDude offers a copy that plays everywhere, and switches to it once it's ready,
+ * carrying on from the same moment.
+ */
+function VideoPreview({ entry, url, children }: { entry: FileEntry; url: string; children: ReactNode }) {
+  const [status, setStatus] = useState<PlaybackStatus | null>(null);
+  const [failed, setFailed] = useState(false);
+  const [useCopy, setUseCopy] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const resumeAt = useRef(0);
+  const statusUrl = `/api/fs/playback?path=${encodePath(entry.path)}&status=1`;
+  const sound = unplayableSound(status?.codecs);
+  const needsCopy = failed || Boolean(sound);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    requestJson<PlaybackStatus>(statusUrl, { signal: controller.signal }).then(setStatus).catch(() => undefined);
+    return () => controller.abort();
+  }, [statusUrl]);
+  // A copy that's ready is used straight away when it's needed.
+  useEffect(() => {
+    if (status?.state === "ready" && needsCopy && !useCopy) {
+      resumeAt.current = videoRef.current?.currentTime ?? 0;
+      const timer = window.setTimeout(() => setUseCopy(true), 0);
+      return () => window.clearTimeout(timer);
+    }
+  }, [status?.state, needsCopy, useCopy]);
+  // While a copy is being made, the browser asks how it's going.
+  useEffect(() => {
+    if (status?.state !== "preparing") return;
+    const timer = window.setTimeout(() => { requestJson<PlaybackStatus>(statusUrl).then(setStatus).catch(() => undefined); }, 2_000);
+    return () => window.clearTimeout(timer);
+  }, [status, statusUrl]);
+
+  const prepare = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      setStatus(await requestJson<PlaybackStatus>("/api/fs/playback", { method: "POST", body: JSON.stringify({ action: "prepare", path: entry.path }) }));
+    } catch (caught) {
+      setError((caught as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const src = useCopy ? `/api/fs/playback?path=${encodePath(entry.path)}` : url;
+  let notice: ReactNode = null;
+  if (needsCopy && !useCopy && status) {
+    const reason = failed ? "This video can't play in this browser." : `Its sound (${sound}) won't play in this browser.`;
+    if (!pictureSupported(status.codecs)) notice = <><CircleAlert size={16} /><span>{reason} Its picture is HEVC, which this browser can&apos;t show either; try Safari or Edge, or download it.</span></>;
+    else if (status.state === "none") notice = <><Info size={16} /><span>{reason} FilesDude can make a copy that plays everywhere, without re-encoding the picture (about a minute for an hour of video).</span><button type="button" className="button primary" disabled={busy} onClick={() => void prepare()}>{busy ? <LoaderCircle className="spin" size={14} /> : <Play size={14} />} Make it playable</button></>;
+    else if (status.state === "preparing") notice = <><LoaderCircle className="spin" size={16} /><span>Making a copy that plays everywhere… {Math.round((status.progress ?? 0) * 100)}%</span><span className="playback-progress"><span style={{ width: `${Math.round((status.progress ?? 0) * 100)}%` }} /></span></>;
+    else if (status.state === "unsupported") notice = <><CircleAlert size={16} /><span>{reason} Its picture format{status.codecs?.video ? ` (${status.codecs.video.toUpperCase()})` : ""} can&apos;t be repackaged to play here; download it to watch.</span></>;
+    else if (status.state === "failed") notice = <><CircleAlert size={16} /><span>{reason} Making a playable copy didn&apos;t work; download it to watch.</span></>;
+  }
+  return (
+    <div className="video-preview">
+      <video key={src} ref={videoRef} src={src} controls autoPlay onError={() => { if (!useCopy) setFailed(true); }} onLoadedMetadata={(event) => { if (useCopy && resumeAt.current) event.currentTarget.currentTime = resumeAt.current; }}>{children}</video>
+      {(notice || error) && <div className="playback-notice">{notice}{error && <span className="form-error"><CircleAlert size={14} />{error}</span>}</div>}
+    </div>
+  );
+}
+
 export type Slideshow = { playing: boolean; seconds: number; fullscreen: boolean };
 const SLIDESHOW_SECONDS = [3, 5, 10, 20];
 const isPicture = (item: FileEntry) => item.mime.startsWith("image/");
@@ -4082,7 +4169,10 @@ export function PreviewDialog({ entry, siblings = [], onStep, onClose, urls = lo
   if (error) preview = <div className="preview-message"><CircleAlert size={24} /><p>{error}</p></div>;
   else if (isText) preview = text === null ? <div className="preview-message"><LoaderCircle className="spin" size={24} /><p>Loading preview…</p></div> : <pre className="text-preview">{text}</pre>;
   else if (entry.mime.startsWith("image/")) preview = <div className="image-preview"><img src={url} alt={entry.name} onLoad={() => setPictureReady(true)} onError={() => setPictureReady(true)} /></div>; // eslint-disable-line @next/next/no-img-element
-  else if (entry.mime.startsWith("video/")) preview = <video src={url} controls autoPlay>{subtitles.map((track) => <track key={track.id} kind="subtitles" label={track.label} srcLang={track.language} src={`/api/fs/subtitles?path=${encodePath(entry.path)}&track=${encodeURIComponent(track.id)}`} />)}</video>;
+  else if (entry.mime.startsWith("video/")) {
+    const tracks = subtitles.map((track) => <track key={track.id} kind="subtitles" label={track.label} srcLang={track.language} src={`/api/fs/subtitles?path=${encodePath(entry.path)}&track=${encodeURIComponent(track.id)}`} />);
+    preview = local ? <VideoPreview entry={entry} url={url}>{tracks}</VideoPreview> : <video src={url} controls autoPlay>{tracks}</video>;
+  }
   else if (entry.mime.startsWith("audio/")) preview = <div className="audio-preview"><FileAudio size={54} /><strong>{entry.name}</strong><audio src={url} controls autoPlay /></div>;
   else if (entry.mime === "application/pdf") preview = <iframe src={url} title={`Preview of ${entry.name}`} />;
   else preview = <div className="preview-message"><File size={42} /><h3>Preview unavailable</h3><p>This file type can still be downloaded.</p></div>;

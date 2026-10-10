@@ -114,6 +114,70 @@ export async function sandboxRunner(tool: string, options: SandboxOptions = {}):
   };
 }
 
+/**
+ * Runs the tool with an open file as input and another open file as its output (standard output):
+ * for writing large results, such as a video repackaged to play in browsers, straight into a file
+ * FilesDude opened, never by path. Stopped if the output passes `maxBytes`, after `seconds` (up to
+ * four hours), or when `signal` fires. Resolves true if the tool succeeded.
+ */
+export type SandboxFileRun = (args: string[], input: number, output: number, maxBytes: number, seconds: number, signal?: AbortSignal) => Promise<boolean>;
+
+const MAX_FILE_RUN_SECONDS = 4 * 60 * 60;
+
+export async function sandboxFileRunner(tool: string): Promise<SandboxFileRun | null> {
+  if (process.platform !== "linux" || typeof process.getuid !== "function" || process.getuid() !== 0) return null;
+  if (!(await executable(tool)) || !(await executable(SYSTEMD_RUN))) return null;
+  const hidden = hiddenPaths();
+  return async (args, input, output, maxBytes, seconds, signal) => {
+    if (signal?.aborted || args.some((arg) => arg.includes("$"))) return false;
+    const limit = Math.min(Math.max(1, Math.round(seconds)), MAX_FILE_RUN_SECONDS);
+    const source = await fs.open(`/proc/self/fd/${input}`, constants.O_RDONLY | constants.O_NOCTTY).catch(() => null);
+    if (!source) return false;
+    try {
+      const original = fstatSync(input);
+      const reopened = await source.stat();
+      if (!reopened.isFile() || original.dev !== reopened.dev || original.ino !== reopened.ino) return false;
+      const unit = `filesdude-media-${crypto.randomUUID()}`;
+      return await new Promise<boolean>((resolve) => {
+        const child = spawn(SYSTEMD_RUN, unitArguments(unit, [tool, ...args], limit, hidden), { stdio: [source.fd, output, "ignore"] });
+        let stopped = false;
+        const stop = () => {
+          if (stopped) return;
+          stopped = true;
+          execFile(SYSTEMCTL, ["stop", unit], () => undefined);
+          child.kill("SIGKILL");
+        };
+        // The output is watched as it grows, so a crafted file can't fill the disk.
+        const watch = setInterval(() => {
+          try {
+            if (fstatSync(output).size > maxBytes) stop();
+          } catch {
+            stop();
+          }
+        }, 2_000);
+        const timer = setTimeout(stop, (limit + 10) * 1000);
+        signal?.addEventListener("abort", stop, { once: true });
+        const finish = (ok: boolean) => {
+          clearInterval(watch);
+          clearTimeout(timer);
+          signal?.removeEventListener("abort", stop);
+          let size = Infinity;
+          try {
+            size = fstatSync(output).size;
+          } catch {
+            // A closed output means nothing usable was written.
+          }
+          resolve(ok && !stopped && size > 0 && size <= maxBytes);
+        };
+        child.on("error", () => finish(false));
+        child.on("close", (code) => finish(code === 0));
+      });
+    } finally {
+      await source.close().catch(() => undefined);
+    }
+  };
+}
+
 /** systemd-run's arguments for one run of this command, as the unit with this name. */
 export function unitArguments(unit: string, command: string[], seconds: number, hidden: string[], { mounts = [], inspectSockets = false }: SandboxOptions = {}) {
   return [
