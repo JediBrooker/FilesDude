@@ -65,6 +65,7 @@ import {
   Play,
   Plus,
   RefreshCw,
+  Diff,
   Route,
   Waypoints,
   PieChart,
@@ -100,6 +101,7 @@ import { ACTIVITY_CATEGORIES, activityCategory, activityUser, describeActivity, 
 import { isNewerBuild as differsFrom, type BuildIdentity } from "@/lib/build";
 import { CopyToServerDialog, RemoteBrowserDialog, ServerSettingsDialog, type ServerConnection } from "./remote-servers";
 import { DiskMapDialog } from "./disk-map";
+import { TextDiffDialog, type DiffSource } from "./text-diff";
 import { FolderCompareDialog } from "./folder-compare";
 import { ArchiveBrowserDialog } from "./archive-browser";
 import { closeTab, MAX_TABS, openTab, parseTabs, shownTabs, type FolderTabs } from "@/lib/folder-tabs";
@@ -170,6 +172,8 @@ type DialogState =
   // Comparing the two folders of the split view.
   | { kind: "compare" }
   | { kind: "versions"; entry: FileEntry }
+  // Two text files side by side.
+  | { kind: "diff"; left: DiffSource; right: DiffSource }
   // Looking inside an archive without extracting it.
   | { kind: "archive"; entry: FileEntry }
   | { kind: "details"; entry: FileEntry }
@@ -183,7 +187,7 @@ type SnapshotEntry = { name: string; path: string; type: "file" | "directory" | 
 type SnapshotVersion = { snapshot: string; snapshotCreatedAt: string; type: SnapshotEntry["type"]; size: number; modified: string };
 const SNAPSHOT_KIND_LABELS: Record<SnapshotInfo["kind"], string> = { auto: "Scheduled", manual: "Manual", other: "Other" };
 
-type EntryAction = "versions" | "open" | "edit" | "download" | "favorite" | "openOther" | "usage" | "openTab" | "link" | "relink" | "rename" | "cut" | "clipboard" | "paste" | "copy" | "move" | "compress" | "extract" | "share" | "permissions" | "ownership" | "details" | "delete";
+type EntryAction = "versions" | "open" | "edit" | "download" | "favorite" | "openOther" | "usage" | "compare" | "openTab" | "link" | "relink" | "rename" | "cut" | "clipboard" | "paste" | "copy" | "move" | "compress" | "extract" | "share" | "permissions" | "ownership" | "details" | "delete";
 type FavoriteLocation = { path: string; name: string; createdAt: string };
 type SelectOptions = { additive?: boolean; range?: boolean };
 type MenuPosition = { top: number; left: number };
@@ -431,8 +435,18 @@ export function extension(name: string) {
 }
 
 function isEditable(entry: FileEntry) {
-  const textType = entry.mime.startsWith("text/") || entry.mime.includes("json") || entry.mime.includes("javascript") || entry.mime.includes("typescript");
-  return entry.type === "file" && textType && entry.size <= 2 * 1024 * 1024;
+  return isTextFile(entry) && entry.size <= 2 * 1024 * 1024;
+}
+
+function isTextFile(entry: Pick<FileEntry, "type" | "mime">) {
+  return entry.type === "file" && (entry.mime.startsWith("text/") || entry.mime.includes("json") || entry.mime.includes("javascript") || entry.mime.includes("typescript") || entry.mime.includes("xml"));
+}
+
+/** Two files chosen to compare: the earlier-named on the left. */
+function diffOf(entries: FileEntry[]) {
+  const [left, right] = [...entries].sort((a, b) => a.path.localeCompare(b.path, undefined, { numeric: true }));
+  const source = (entry: FileEntry): DiffSource => ({ label: `/${entry.path}`, url: `/api/fs/stream?path=${encodePath(entry.path)}` });
+  return { kind: "diff" as const, left: source(left), right: source(right) };
 }
 
 export function fileIcon(entry: Pick<FileEntry, "type" | "mime">, size = 20) {
@@ -1701,6 +1715,9 @@ export function FileManager() {
       case "compress":
         setDialog({ kind: "compress" });
         break;
+      case "compare":
+        if (targets.length === 2) setDialog(diffOf(targets));
+        break;
       case "extract":
         void startArchiveJob({ action: "extract", path: entry.path });
         break;
@@ -2121,6 +2138,7 @@ export function FileManager() {
                 {selectedEntries.length === 1 && <button onClick={() => openEntry(selectedEntries[0])}><Eye size={16} /> Open</button>}
                 {canWrite && selectedEntries.length === 1 && isEditable(selectedEntries[0]) && <button onClick={() => setDialog({ kind: "edit", entry: selectedEntries[0] })}><FilePenLine size={16} /> Edit</button>}
                 {selectedEntries.length > 0 && <button onClick={downloadSelected}><Download size={16} /> Download</button>}
+                {selectedEntries.length === 2 && selectedEntries.every(isTextFile) && <button onClick={() => setDialog(diffOf(selectedEntries))}><Diff size={16} /> Compare</button>}
                 {selectedEntries.length === 1 && selectedEntries[0].type === "directory" && <button onClick={() => void toggleFavorite(selectedEntries[0].path)}><Star size={16} fill={favoritePaths.has(selectedEntries[0].path) ? "currentColor" : "none"} /> {favoritePaths.has(selectedEntries[0].path) ? "Unfavourite" : "Favourite"}</button>}
                 {canWrite && selectedEntries.length === 1 && <button onClick={() => setDialog({ kind: "rename", entry: selectedEntries[0] })}><Pencil size={16} /> Rename</button>}
                 {canWrite && <button onClick={() => setDialog({ kind: "transfer", mode: "copy" })}><Copy size={16} /> Copy</button>}
@@ -2261,6 +2279,7 @@ export function FileManager() {
           onNavigate={(target) => { setDialog(null); navigate(target); }}
           onTagsChanged={() => setTagsVersion((version) => version + 1)}
           onUsage={(usagePath) => setDialog({ kind: "usage", path: usagePath })}
+          onCompare={(left, right) => setDialog({ kind: "diff", left, right })}
         />
       )}
       {menu && createPortal(menu.kind === "entry"
@@ -2854,7 +2873,7 @@ function FileActionMenu({ entry, targets, position, menuRef, favoritePaths, canW
         {canWrite && entry.type === "file" && item("edit", "Edit", <FilePenLine size={16} />, { disabled: !isEditable(entry) })}
         {item("download", "Download", <Download size={16} />)}
       </div>}
-      {multiple && <div className="file-menu-section">{item("download", "Download as ZIP", <Download size={16} />)}</div>}
+      {multiple && <div className="file-menu-section">{item("download", "Download as ZIP", <Download size={16} />)}{targets.length === 2 && targets.every(isTextFile) && item("compare", "Compare files", <Diff size={16} />)}</div>}
       <div className="file-menu-section">
         {canWrite && !multiple && item("rename", "Rename", <Pencil size={16} />)}
         {canWrite && !multiple && (entry.type === "file" || entry.type === "directory") && item("link", "Make link…", <Waypoints size={16} />)}
@@ -3039,7 +3058,7 @@ function JobPanel({ job, onCancel }: { job: JobState; onCancel: () => void }) {
   );
 }
 
-function DialogHost({ dialog, selected, currentPath, username, role, home, onClose, onRun, notify, onRefresh, onStartJob, onTransfer, onJob, canWrite, onSharesChanged, onCredentialsUpdated, onTwoFactor, onPasskeys, onNotifications, onReveal, onPreview, onPlayer, onNavigate, onTagsChanged, onUsage, uploadInPieces }: {
+function DialogHost({ dialog, selected, currentPath, username, role, home, onClose, onRun, notify, onRefresh, onStartJob, onTransfer, onJob, canWrite, onSharesChanged, onCredentialsUpdated, onTwoFactor, onPasskeys, onNotifications, onReveal, onPreview, onPlayer, onNavigate, onTagsChanged, onUsage, onCompare, uploadInPieces }: {
   dialog: NonNullable<DialogState>;
   selected: FileEntry[];
   currentPath: string;
@@ -3066,6 +3085,7 @@ function DialogHost({ dialog, selected, currentPath, username, role, home, onClo
   onNavigate: (path: string) => void;
   onTagsChanged: () => void;
   onUsage: (path: string) => void;
+  onCompare: (left: DiffSource, right: DiffSource) => void;
 }) {
   // The server dialogs are shown by FileManager, which holds the list of servers.
   if (dialog.kind === "server" || dialog.kind === "serverSettings" || dialog.kind === "copyToServer" || dialog.kind === "compare") return null;
@@ -3101,7 +3121,8 @@ function DialogHost({ dialog, selected, currentPath, username, role, home, onClo
   if (dialog.kind === "watching") return <ContinueWatchingDialog onClose={onClose} onPreview={onPreview} onReveal={onReveal} notify={notify} />;
   if (dialog.kind === "snapshots") return <SnapshotsDialog isOwner={role === "owner"} canWrite={canWrite} home={home} onClose={onClose} notify={notify} onJob={onJob} />;
   if (dialog.kind === "archive") return <ArchiveBrowserDialog entry={dialog.entry} canWrite={canWrite} onClose={onClose} onJob={onJob} notify={notify} />;
-  if (dialog.kind === "versions") return <VersionsDialog entry={dialog.entry} canWrite={canWrite} isOwner={role === "owner"} onClose={onClose} notify={notify} onJob={onJob} />;
+  if (dialog.kind === "versions") return <VersionsDialog entry={dialog.entry} canWrite={canWrite} isOwner={role === "owner"} onClose={onClose} notify={notify} onJob={onJob} onCompare={onCompare} />;
+  if (dialog.kind === "diff") return <TextDiffDialog left={dialog.left} right={dialog.right} onClose={onClose} />;
   if (dialog.kind === "preferences") return role === "owner"
     ? <PreferencesDialog username={username} onClose={onClose} onUpdated={onCredentialsUpdated} onTwoFactor={onTwoFactor} onPasskeys={onPasskeys} onNotifications={onNotifications} />
     : <AccountPasswordDialog username={username} role={role} home={home} onClose={onClose} onUpdated={onCredentialsUpdated} onTwoFactor={onTwoFactor} onPasskeys={onPasskeys} />;
@@ -3723,7 +3744,7 @@ function SnapshotsDialog({ isOwner, canWrite, home, onClose, notify, onJob }: { 
   );
 }
 
-function VersionsDialog({ entry, canWrite, isOwner, onClose, notify, onJob }: { entry: FileEntry; canWrite: boolean; isOwner: boolean; onClose: () => void; notify: (message: string, tone?: "error") => void; onJob: (job: JobState) => Promise<boolean> }) {
+function VersionsDialog({ entry, canWrite, isOwner, onClose, notify, onJob, onCompare }: { entry: FileEntry; canWrite: boolean; isOwner: boolean; onClose: () => void; notify: (message: string, tone?: "error") => void; onJob: (job: JobState) => Promise<boolean>; onCompare: (left: DiffSource, right: DiffSource) => void }) {
   const [versions, setVersions] = useState<SnapshotVersion[] | null>(null);
   const [error, setError] = useState("");
   useEffect(() => {
@@ -3748,6 +3769,7 @@ function VersionsDialog({ entry, canWrite, isOwner, onClose, notify, onJob }: { 
                     <span className="muted" role="cell">{version.type === "directory" ? "—" : formatBytes(version.size)}</span>
                     <span className="muted" role="cell" title={new Date(version.modified).toLocaleString()}>{formatDate(version.modified)}</span>
                     <span className="largest-actions" role="cell">
+                      {version.type === "file" && isTextFile(entry) && <button className="icon-button" title="Compare with the current version" aria-label={`Compare the version from ${formatDateTime(version.snapshotCreatedAt)} with the current one`} onClick={() => onCompare({ label: `${entry.name} (${formatDateTime(version.snapshotCreatedAt)})`, url: snapshotDownloadUrl(version.snapshot, entry.path) }, { label: `${entry.name} (now)`, url: `/api/fs/stream?path=${encodePath(entry.path)}` })}><Diff size={15} /></button>}
                       {(version.type === "file" || version.type === "directory") && <button className="icon-button" title="Download this version" aria-label={`Download the version from ${formatDateTime(version.snapshotCreatedAt)}`} onClick={() => downloadFrom(snapshotDownloadUrl(version.snapshot, entry.path))}><ArrowDownToLine size={15} /></button>}
                       {canWrite && <button className="icon-button" title="Restore next to the current version" aria-label={`Restore the version from ${formatDateTime(version.snapshotCreatedAt)}`} onClick={() => void startRestore(version.snapshot, entry.path, onJob, notify)}><RotateCcw size={15} /></button>}
                     </span>
