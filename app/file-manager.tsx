@@ -105,6 +105,8 @@ import { DiskMapDialog } from "./disk-map";
 import { TextDiffDialog, type DiffSource } from "./text-diff";
 import { FolderCompareDialog } from "./folder-compare";
 import { ArchiveBrowserDialog } from "./archive-browser";
+import { RichPreview } from "./rich-preview";
+import { richKind } from "@/lib/rich-text";
 import { closeTab, MAX_TABS, openTab, parseTabs, shownTabs, type FolderTabs } from "@/lib/folder-tabs";
 import { moveCursor, selectionRange } from "@/lib/selection";
 import { INITIAL_DIRECTION, nextSort, parseSort, sortEntries, type SortKey, type SortState } from "@/lib/sort";
@@ -5824,6 +5826,10 @@ export function PreviewDialog({ entry, siblings = [], onStep, onClose, urls = lo
     if (target) onStep(target);
   };
   const isText = entry.mime.startsWith("text/") || entry.mime.includes("json") || entry.mime.includes("javascript") || entry.mime.includes("typescript");
+  // Markdown, CSV and TSV, and JSON are shown formatted, with the plain text a click away.
+  const rich = isText ? richKind(entry.name, entry.mime) : null;
+  // A big Markdown file opens as plain text (formatting it all takes a while), and can be formatted on request.
+  const [plainText, setPlainText] = useState(rich === "markdown" && entry.size > 512 * 1024);
   // Only the first 2 MB of a text file is fetched (a huge log would otherwise be read whole), and the
   // fetch stops when the preview closes or moves on.
   useEffect(() => {
@@ -5837,7 +5843,9 @@ export function PreviewDialog({ entry, siblings = [], onStep, onClose, urls = lo
   }, [isText, url]);
   let preview: ReactNode;
   if (error) preview = <div className="preview-message"><CircleAlert size={24} /><p>{error}</p></div>;
-  else if (isText) preview = text === null ? <div className="preview-message"><LoaderCircle className="spin" size={24} /><p>Loading preview…</p></div> : <pre className="text-preview">{text}</pre>;
+  else if (isText) preview = text === null ? <div className="preview-message"><LoaderCircle className="spin" size={24} /><p>Loading preview…</p></div>
+    : rich && !plainText ? <RichPreview kind={rich} text={text} partial={entry.size > 2_000_000} folder={entry.path.split("/").slice(0, -1).join("/")} pictureUrl={local ? (path) => `/api/fs/stream?path=${encodePath(path)}` : undefined} />
+    : <pre className="text-preview">{text}</pre>;
   else if (entry.mime.startsWith("image/")) preview = <div className="image-preview"><img src={url} alt={entry.name} onLoad={() => setPictureReady(true)} onError={() => setPictureReady(true)} /></div>; // eslint-disable-line @next/next/no-img-element
   else if (entry.mime.startsWith("video/")) {
     const tracks = subtitles.map((track) => <track key={track.id} kind="subtitles" label={track.label} srcLang={track.language} src={`/api/fs/subtitles?path=${encodePath(entry.path)}&track=${encodeURIComponent(track.id)}`} />);
@@ -5853,7 +5861,7 @@ export function PreviewDialog({ entry, siblings = [], onStep, onClose, urls = lo
     <select aria-label="Seconds per picture" value={show.seconds} onChange={(event) => onSlideshow({ ...show, seconds: Number(event.target.value) })}>{SLIDESHOW_SECONDS.map((seconds) => <option key={seconds} value={seconds}>{seconds} s</option>)}</select>
     {typeof document !== "undefined" && document.fullscreenEnabled && <button type="button" className="icon-button" aria-label={show.fullscreen ? "Leave full screen" : "Full screen"} title={show.fullscreen ? "Leave full screen" : "Full screen"} onClick={toggleFullscreen}>{show.fullscreen ? <Minimize2 size={17} /> : <Maximize2 size={17} />}</button>}
   </div>;
-  return <div className={`preview-overlay${show.fullscreen ? " fullscreen" : ""}`}><section className="preview-modal" role="dialog" aria-modal="true" aria-label={`Preview ${entry.name}`}><header><div><span className={`file-icon ${entry.type}`}>{fileIcon(entry)}</span><div><strong>{entry.name}</strong><span>{extension(entry.name)} · {formatBytes(entry.size)}{index >= 0 && siblings.length > 1 ? ` · ${index + 1} of ${siblings.length}` : ""}</span></div></div><div>{slideshowControls}{onPlayer && kind && <button type="button" className="button secondary" title={kind === "video" ? "Keep watching in a small player while you browse" : "Keep listening while you browse"} onClick={() => handOff(kind === "video")}><PictureInPicture2 size={16} /> {kind === "video" ? "Picture in picture" : "Keep playing"}</button>}<a className="button secondary" href={urls(entry).download}><ArrowDownToLine size={16} /> Download</a><button className="icon-button" aria-label="Close preview" onClick={close}><X size={19} /></button></div></header><div className="preview-stage" onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}><div className="preview-body">{preview}</div>{previous && <button type="button" className="preview-nav previous" aria-label={`Previous: ${previous.name}`} title={`${previous.name} (←)`} onClick={() => onStep(previous)}><ChevronLeft size={22} /></button>}{next && <button type="button" className="preview-nav next" aria-label={`Next: ${next.name}`} title={`${next.name} (→)`} onClick={() => onStep(next)}><ChevronRight size={22} /></button>}</div></section></div>;
+  return <div className={`preview-overlay${show.fullscreen ? " fullscreen" : ""}`}><section className="preview-modal" role="dialog" aria-modal="true" aria-label={`Preview ${entry.name}`}><header><div><span className={`file-icon ${entry.type}`}>{fileIcon(entry)}</span><div><strong>{entry.name}</strong><span>{extension(entry.name)} · {formatBytes(entry.size)}{index >= 0 && siblings.length > 1 ? ` · ${index + 1} of ${siblings.length}` : ""}</span></div></div><div>{slideshowControls}{rich && text !== null && !error && <button type="button" className="button secondary" aria-pressed={plainText} title={plainText ? "Show it formatted" : "Show the file's plain text"} onClick={() => setPlainText(!plainText)}>{plainText ? <Eye size={16} /> : <FileCode2 size={16} />} {plainText ? "Formatted" : "Plain text"}</button>}{onPlayer && kind && <button type="button" className="button secondary" title={kind === "video" ? "Keep watching in a small player while you browse" : "Keep listening while you browse"} onClick={() => handOff(kind === "video")}><PictureInPicture2 size={16} /> {kind === "video" ? "Picture in picture" : "Keep playing"}</button>}<a className="button secondary" href={urls(entry).download}><ArrowDownToLine size={16} /> Download</a><button className="icon-button" aria-label="Close preview" onClick={close}><X size={19} /></button></div></header><div className="preview-stage" onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}><div className="preview-body">{preview}</div>{previous && <button type="button" className="preview-nav previous" aria-label={`Previous: ${previous.name}`} title={`${previous.name} (←)`} onClick={() => onStep(previous)}><ChevronLeft size={22} /></button>}{next && <button type="button" className="preview-nav next" aria-label={`Next: ${next.name}`} title={`${next.name} (→)`} onClick={() => onStep(next)}><ChevronRight size={22} /></button>}</div></section></div>;
 }
 
 type Checksums = { sha256: string; md5: string };
