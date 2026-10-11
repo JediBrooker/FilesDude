@@ -45,11 +45,20 @@ export type ArchiveListing = {
 };
 
 type Entry = { type: ArchiveItemType; size: number; modified: string | null; encrypted?: boolean };
-type Catalog = { format: ArchiveListing["format"]; entries: Map<string, Entry>; children: Map<string, Set<string>>; total: number; unsafe: number; truncated: boolean };
+type Catalog = { format: ArchiveListing["format"]; entries: Map<string, Entry>; children: Map<string, Set<string>>; total: number; unsafe: number; truncated: boolean; bytes: number };
 
 const MAX_ENTRIES = 100_000;
 const READ_MS = 30_000;
 const MAX_CACHED = 12;
+// What the cached catalogs may take together (roughly, by the length of their paths), and one alone.
+const MAX_CACHED_BYTES = 64 * 1024 * 1024;
+const MAX_CATALOG_BYTES = 32 * 1024 * 1024;
+// Like extraction, names nested deeper or longer than this are treated as unsafe.
+const MAX_DEPTH = 64;
+const MAX_PATH_BYTES = 4096;
+// Reading a tar for one file stops after this long, or this much unpacked, before reaching it.
+const SEEK_MS = 60_000;
+const MAX_UNPACKED_BYTES = 64 * 1024 ** 3;
 const MAX_LISTED = 5_000;
 const ON_LINUX = process.platform === "linux";
 const openFd = promisify(fs.open);
@@ -62,8 +71,9 @@ export function entryPath(raw: string) {
   const name = raw.replaceAll("\\", "/");
   if (!name || name.includes("\0") || name.startsWith("/") || /^[A-Za-z]:/.test(name)) return null;
   const parts = name.split("/").filter((part) => part && part !== ".");
-  if (!parts.length || parts.some((part) => part === ".." || INTERNAL_NAMES.has(part) || Buffer.byteLength(part, "utf8") > 255)) return null;
-  return parts.join("/");
+  if (!parts.length || parts.length > MAX_DEPTH || parts.some((part) => part === ".." || INTERNAL_NAMES.has(part) || Buffer.byteLength(part, "utf8") > 255)) return null;
+  const joined = parts.join("/");
+  return Buffer.byteLength(joined, "utf8") > MAX_PATH_BYTES ? null : joined;
 }
 
 class CatalogBuilder {
@@ -72,30 +82,41 @@ class CatalogBuilder {
   total = 0;
   unsafe = 0;
   truncated = false;
+  /** Roughly what the catalog takes: the length of every path it holds. */
+  bytes = 0;
   private readonly startedAt = Date.now();
+
+  /** Whether reading should stop (too many entries, too long, or too large), which marks it short. */
+  spent() {
+    if (this.total > MAX_ENTRIES || this.bytes > MAX_CATALOG_BYTES || Date.now() - this.startedAt > READ_MS) this.truncated = true;
+    return this.truncated;
+  }
 
   /** Adds an entry; false once reading should stop. */
   add(raw: string, entry: Entry) {
     this.total += 1;
-    if (this.total > MAX_ENTRIES || Date.now() - this.startedAt > READ_MS) {
-      this.truncated = true;
-      return false;
-    }
+    if (this.spent()) return false;
     const relative = entryPath(raw);
     if (!relative) {
       this.unsafe += 1;
       return true;
     }
-    const parts = relative.split("/");
-    // Folders that only appear in their contents' paths are listed too.
-    for (let depth = 1; depth < parts.length; depth += 1) {
-      const folder = parts.slice(0, depth).join("/");
-      this.link(folder);
+    // Folders that only appear in their contents' paths are listed too, from the nearest up, until
+    // one already listed (whose own folders are then listed already).
+    for (let folder = path.posix.dirname(relative); folder !== "."; folder = path.posix.dirname(folder)) {
       const existing = this.entries.get(folder);
-      if (!existing) this.entries.set(folder, { type: "directory", size: 0, modified: null });
-      else if (existing.type !== "directory") existing.type = "directory";
+      if (existing) {
+        existing.type = "directory";
+        break;
+      }
+      this.entries.set(folder, { type: "directory", size: 0, modified: null });
+      this.link(folder);
+      this.bytes += folder.length * 2;
     }
-    this.link(relative);
+    if (!this.entries.has(relative)) {
+      this.link(relative);
+      this.bytes += relative.length * 2;
+    }
     const existing = this.entries.get(relative);
     // A folder seen first through its contents takes its own entry's date; a repeated file keeps the first.
     if (!existing || (existing.type === "directory" && entry.type === "directory")) this.entries.set(relative, entry);
@@ -159,15 +180,32 @@ async function readZipCatalog(handle: FileHandle, real: string, builder: Catalog
  * A tar's bytes (unzipped for .tar.gz), read through a descriptor of its own, opened now: the
  * archive's handle can then be closed without the read ever going through a reused number.
  */
-async function tarStreams(handle: FileHandle, real: string, gzip: boolean): Promise<Readable[]> {
+async function tarStreams(handle: FileHandle, real: string, gzip: boolean, guard: Transform): Promise<Readable[]> {
   const fd = await openFd(ON_LINUX ? `/proc/self/fd/${handle.fd}` : real, "r");
   const file = fs.createReadStream("", { fd, autoClose: true });
-  return gzip ? [file, zlib.createGunzip()] : [file];
+  return gzip ? [file, zlib.createGunzip(), guard] : [file, guard];
+}
+
+class Spent extends Error {}
+
+/**
+ * Passes a tar's unpacked bytes through until `spent()` says to stop (checked on every chunk, so a
+ * huge entry inside, such as a gzip bomb, can't keep it reading), or more than `limit` have passed.
+ */
+function guarded(spent: () => boolean, limit = MAX_UNPACKED_BYTES) {
+  let seen = 0;
+  return new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      seen += chunk.length;
+      if (seen > limit || spent()) callback(new Spent());
+      else callback(null, chunk);
+    },
+  });
 }
 
 async function readTarCatalog(handle: FileHandle, real: string, gzip: boolean, builder: CatalogBuilder) {
   const extract = tarStream.extract();
-  const streams = await tarStreams(handle, real, gzip);
+  const streams = await tarStreams(handle, real, gzip, guarded(() => builder.spent()));
   const stop = new AbortController();
   extract.on("entry", (header, stream, next) => {
     const type = tarType(header.type);
@@ -179,6 +217,10 @@ async function readTarCatalog(handle: FileHandle, real: string, gzip: boolean, b
     await pipeline([...streams, extract], { signal: stop.signal });
   } catch (error) {
     if (stop.signal.aborted) return;
+    if (error instanceof Spent) {
+      builder.truncated = true;
+      return;
+    }
     throw new AppError(`This archive can't be read (${(error as Error).message})`, 422, "INVALID_ARCHIVE");
   }
 }
@@ -197,8 +239,9 @@ async function openArchive(archivePath: string): Promise<Opened> {
       const format = await detectFormat(opened.handle, opened.absolute).catch(() => {
         throw new AppError("Only .zip, .tar, .tar.gz, and .tgz archives can be opened", 415, "UNSUPPORTED_ARCHIVE");
       });
-      const { dev, ino, size, mtimeMs } = opened.stat;
-      return { handle: opened.handle, real: opened.openedPath, key: `${dev}:${ino}:${size}:${mtimeMs}`, format };
+      // The change time too: unlike the modified time, nothing can set it back.
+      const { dev, ino, size, mtimeMs, ctimeMs } = opened.stat;
+      return { handle: opened.handle, real: opened.openedPath, key: `${dev}:${ino}:${size}:${mtimeMs}:${ctimeMs}`, format };
     } catch (error) {
       await opened.handle.close().catch(() => undefined);
       throw error;
@@ -222,9 +265,10 @@ async function catalogOf(opened: Opened) {
       const builder = new CatalogBuilder();
       if (opened.format === "zip") await readZipCatalog(opened.handle, opened.real, builder);
       else await readTarCatalog(opened.handle, opened.real, opened.format === "tar.gz", builder);
-      const catalog: Catalog = { format: opened.format, entries: builder.entries, children: builder.children, total: builder.total, unsafe: builder.unsafe, truncated: builder.truncated };
+      const catalog: Catalog = { format: opened.format, entries: builder.entries, children: builder.children, total: builder.total, unsafe: builder.unsafe, truncated: builder.truncated, bytes: builder.bytes };
       catalogs.set(opened.key, catalog);
-      while (catalogs.size > MAX_CACHED) catalogs.delete(catalogs.keys().next().value!);
+      const cachedBytes = () => [...catalogs.values()].reduce((total, item) => total + item.bytes, 0);
+      while (catalogs.size > 1 && (catalogs.size > MAX_CACHED || cachedBytes() > MAX_CACHED_BYTES)) catalogs.delete(catalogs.keys().next().value!);
       return catalog;
     })().finally(() => reading.delete(opened.key));
     reading.set(opened.key, pending);
@@ -273,11 +317,15 @@ export async function readArchiveEntry(archivePath: string, entryName: string, s
   const opened = await openArchive(archivePath);
   try {
     const catalog = await catalogOf(opened);
+    // Whoever asked may have gone while the archive was read.
+    if (signal?.aborted) throw new AppError("The request was cancelled", 499, "CANCELLED");
     const entry = catalog.entries.get(wanted);
     if (!entry || entry.type !== "file") throw new AppError("That file isn't in this archive", 404, "NOT_FOUND");
     if (entry.encrypted) throw new AppError("That file is encrypted", 422, "ENCRYPTED_ARCHIVE");
     const output = new PassThrough();
-    // Whoever reads it going away stops the reading.
+    // Errors are for whoever reads it (and one arriving before they start never goes unhandled);
+    // whoever reads it going away stops the reading.
+    output.on("error", () => undefined);
     signal?.addEventListener("abort", () => output.destroy(), { once: true });
     const name = path.posix.basename(wanted);
     if (opened.format === "zip") {
@@ -298,10 +346,12 @@ export async function readArchiveEntry(archivePath: string, entryName: string, s
       void pipeline(stream, capped(entry.size), output, { signal }).catch(() => undefined).finally(() => zip.close());
     } else {
       const extract = tarStream.extract();
-      const streams = await tarStreams(opened.handle, opened.real, opened.format === "tar.gz");
       const stop = new AbortController();
-      output.on("close", () => stop.abort());
+      const startedAt = Date.now();
       let found = false;
+      // Reaching the file is limited in time (a gzip bomb before it); once found, its size limits it.
+      const streams = await tarStreams(opened.handle, opened.real, opened.format === "tar.gz", guarded(() => !found && Date.now() - startedAt > SEEK_MS));
+      output.on("close", () => stop.abort());
       extract.on("entry", (header, stream, next) => {
         if (found || entryPath(header.name) !== wanted || tarType(header.type) !== "file") {
           stream.on("end", next);
@@ -315,7 +365,7 @@ export async function readArchiveEntry(archivePath: string, entryName: string, s
           stop.abort();
         });
       });
-      void pipeline([...streams, extract], { signal: stop.signal }).then(
+      void pipeline([...streams, extract], { signal: signal ? AbortSignal.any([stop.signal, signal]) : stop.signal }).then(
         () => { if (!found) output.destroy(new AppError("That file isn't in this archive", 404, "NOT_FOUND")); },
         (error: Error) => { if (!stop.signal.aborted || !found) output.destroy(error); },
       );

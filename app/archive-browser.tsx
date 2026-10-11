@@ -2,6 +2,7 @@
 
 import { ChevronRight, CircleAlert, Download, File, FileArchive, Folder, Link2, LoaderCircle, PackageOpen } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
+import { visibleText } from "@/lib/activity-text";
 import type { ArchiveItem, ArchiveListing } from "@/lib/archive-browse";
 import type { FileEntry, JobState } from "@/lib/types";
 import { CheckBox, formatBytes, formatDate, Modal, requestJson } from "./file-manager";
@@ -54,7 +55,7 @@ function Preview({ archive, item }: { archive: string; item: ArchiveItem }) {
                 : <div className="snapshot-empty"><LoaderCircle className="spin" size={20} /></div>;
   return (
     <div className="archive-preview">
-      <div className="archive-preview-head"><strong title={item.path}>{item.name}</strong><span className="muted">{formatBytes(item.size)}{item.modified ? ` · ${formatDate(item.modified)}` : ""}</span></div>
+      <div className="archive-preview-head"><strong title={visibleText(item.path)}>{visibleText(item.name)}</strong><span className="muted">{formatBytes(item.size)}{item.modified ? ` · ${formatDate(item.modified)}` : ""}</span></div>
       {body}
       {!item.encrypted && <a className="button secondary" href={entryUrl(archive, item.path, true)} download={item.name}><Download size={15} /> Download</a>}
     </div>
@@ -123,7 +124,7 @@ export function ArchiveBrowserDialog({ entry, canWrite, onClose, onJob, notify }
       <div className="storage-browser archive-browser">
         <nav className="snapshot-crumbs" aria-label="Folder in the archive">
           <button onClick={() => { setFolder(""); setPreviewing(null); }}>{entry.name}</button>
-          {crumbs.map((part, index) => <span key={index}><ChevronRight size={13} /><button onClick={() => { setFolder(crumbs.slice(0, index + 1).join("/")); setPreviewing(null); }}>{part}</button></span>)}
+          {crumbs.map((part, index) => <span key={index}><ChevronRight size={13} /><button onClick={() => { setFolder(crumbs.slice(0, index + 1).join("/")); setPreviewing(null); }}><bdi>{visibleText(part)}</bdi></button></span>)}
         </nav>
         {error && <div className="form-error"><CircleAlert size={16} />{error}</div>}
         {shown && (shown.unsafe > 0 || shown.truncated) && <div className="storage-scan-note"><CircleAlert size={15} /> {[shown.unsafe ? `${shown.unsafe.toLocaleString()} ${shown.unsafe === 1 ? "item has" : "items have"} unsafe names and ${shown.unsafe === 1 ? "isn't" : "aren't"} shown: the whole archive can't be extracted, only items you choose` : "", shown.truncated ? "Only part of this archive is shown: it's very large" : ""].filter(Boolean).join(" · ")}</div>}
@@ -141,8 +142,8 @@ export function ArchiveBrowserDialog({ entry, canWrite, onClose, onJob, notify }
                 <div key={item.path} className={`snapshot-entry ${previewing?.path === item.path ? "active" : ""}`} role="row">
                   {canWrite && usable ? <CheckBox checked={selected.has(item.path)} onChange={() => toggle(item)} label={`Choose ${item.name}`} /> : <span />}
                   {usable
-                    ? <button className="snapshot-entry-name archive-entry-name" onClick={() => open(item)} title={item.type === "directory" ? `Open ${item.name}` : `Preview ${item.name}`}><ItemIcon item={item} /><bdi>{item.name}</bdi></button>
-                    : <span className="snapshot-entry-name archive-entry-name muted" title="Links and special files are never extracted"><ItemIcon item={item} /><bdi>{item.name}</bdi></span>}
+                    ? <button className="snapshot-entry-name archive-entry-name" onClick={() => open(item)} title={item.type === "directory" ? `Open ${visibleText(item.name)}` : `Preview ${visibleText(item.name)}`}><ItemIcon item={item} /><bdi>{visibleText(item.name)}</bdi></button>
+                    : <span className="snapshot-entry-name archive-entry-name muted" title="Links and special files are never extracted"><ItemIcon item={item} /><bdi>{visibleText(item.name)}</bdi></span>}
                   <span className="muted">{item.type === "directory" ? `${(item.items ?? 0).toLocaleString()} ${item.items === 1 ? "item" : "items"}` : item.type === "file" ? formatBytes(item.size) : item.type === "link" ? "Link" : "Special"}</span>
                   <span className="muted">{item.modified ? formatDate(item.modified) : ""}</span>
                   {item.type === "file" && !item.encrypted ? <a className="icon-button" href={entryUrl(entry.path, item.path, true)} download={item.name} aria-label={`Download ${item.name}`} title="Download"><Download size={15} /></a> : <span />}

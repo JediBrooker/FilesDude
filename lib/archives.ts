@@ -426,6 +426,8 @@ class ExtractionTarget {
   entries = 0;
   bytes = 0;
   skipped = 0;
+  /** Every entry looked at, extracted or not: the entry limit counts them all. */
+  private visited = 0;
   private readonly directories = new Set<string>();
 
   constructor(
@@ -456,7 +458,14 @@ class ExtractionTarget {
 
   /** Whether an entry is extracted at all (so one that isn't need not be read). */
   wants(raw: string) {
+    this.visit();
     return this.place(raw) !== null;
+  }
+
+  /** Counts an entry looked at, extracted or not. */
+  visit() {
+    this.visited += 1;
+    if (this.visited > this.maxEntries * 2) throw new AppError(`This archive has more than ${(this.maxEntries * 2).toLocaleString()} entries, which is more than FilesDude will read`, 413, "ARCHIVE_TOO_LARGE");
   }
 
   private locate(raw: string) {
@@ -622,6 +631,7 @@ async function extractTar(handle: FileHandle, gzip: boolean, size: number, targe
   const extract = tarStream.extract();
   extract.on("entry", (header, stream, next) => {
     void (async () => {
+      target.visit();
       if (header.type === "directory") {
         await target.directory(header.name);
         stream.resume();

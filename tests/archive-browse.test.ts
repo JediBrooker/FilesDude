@@ -117,6 +117,21 @@ test("a zip's folders are listed, including ones only its files' paths name, wit
   });
 });
 
+test("names nested too deeply or too long are left out, and listing them stays cheap", async () => {
+  await withRoot(async (root) => {
+    const deep = Array.from({ length: 70 }, () => "a").join("/");
+    const long = `${"b".repeat(250)}/`.repeat(20) + "file.txt";
+    await tarFile(path.join(root, "deep.tar"), [{ name: `${deep}/x.txt`, body: "x" }, { name: long, body: "y" }, { name: "fine/ok.txt", body: "ok" }]);
+    const started = Date.now();
+    const listing = await listArchive("deep.tar");
+    assert.deepEqual([names(listing), listing.unsafe], [["fine/ (1)"], 2]);
+    assert.ok(Date.now() - started < 2_000);
+    // Many entries deep inside one folder list that folder's parents only once.
+    await zipFile(path.join(root, "wide.zip"), Array.from({ length: 300 }, (_, index) => ({ name: `${"d/".repeat(60)}f${index}.txt`, body: "z" })));
+    assert.deepEqual(names(await listArchive("wide.zip")), ["d/ (1)"]);
+  });
+});
+
 test("a gzipped tar is listed, with links shown but never treated as files", async () => {
   await withRoot(async (root) => {
     await tarFile(path.join(root, "site.tar.gz"), [
@@ -218,6 +233,14 @@ test("files from archives are only shown as safe kinds: web pages and scripts ar
     const download = await get("été \"q\".txt", "&download=1");
     assert.equal(download.headers.get("content-disposition"), `attachment; filename="_t_ _q_.txt"; filename*=UTF-8''${encodeURIComponent("été \"q\".txt")}`);
     await download.body?.cancel();
+    // Requests given up on, before or while reading, don't keep their slots (three per account).
+    for (let round = 0; round < 4; round += 1) {
+      const gone = await archiveEntry(new Request("http://localhost/api/fs/archive-entry?path=web.zip&entry=page.html", { headers: { cookie }, signal: AbortSignal.abort() })).catch(() => null);
+      await gone?.body?.cancel().catch(() => undefined);
+      const read = await get("page.html");
+      await read.body?.cancel();
+    }
+    assert.equal((await get("page.html")).status, 200);
     // Other sites can't load them.
     assert.equal((await get("photo.png", "", { "sec-fetch-site": "cross-site" })).status, 403);
     assert.equal((await archiveEntry(new Request("http://localhost/api/fs/archive-entry?path=web.zip&entry=photo.png"))).status, 401);
