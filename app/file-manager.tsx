@@ -96,6 +96,7 @@ import { ACTIVITY_CATEGORIES, activityCategory, activityUser, describeActivity, 
 import { isNewerBuild as differsFrom, type BuildIdentity } from "@/lib/build";
 import { CopyToServerDialog, RemoteBrowserDialog, ServerSettingsDialog, type ServerConnection } from "./remote-servers";
 import { FolderCompareDialog } from "./folder-compare";
+import { ArchiveBrowserDialog } from "./archive-browser";
 import { moveCursor, selectionRange } from "@/lib/selection";
 import { INITIAL_DIRECTION, nextSort, parseSort, sortEntries, type SortKey, type SortState } from "@/lib/sort";
 import type { ContentSearchHit, ContentSearchResult, ShareLink } from "@/lib/types";
@@ -158,6 +159,8 @@ type DialogState =
   // Comparing the two folders of the split view.
   | { kind: "compare" }
   | { kind: "versions"; entry: FileEntry }
+  // Looking inside an archive without extracting it.
+  | { kind: "archive"; entry: FileEntry }
   | { kind: "details"; entry: FileEntry }
   | null;
 
@@ -961,7 +964,10 @@ export function FileManager() {
 
   const openEntry = (entry: FileEntry) => {
     if (entry.type === "directory") navigate(entry.path);
-    else if (!entry.symlinkBlocked) setDialog({ kind: "preview", entry, siblings: previewSiblings() });
+    else if (entry.symlinkBlocked) return;
+    // An archive opens like a folder, to look inside it.
+    else if (isArchive(entry)) setDialog({ kind: "archive", entry });
+    else setDialog({ kind: "preview", entry, siblings: previewSiblings() });
   };
 
   // Stepping through a preview moves the selection along, so closing it leaves you on that file.
@@ -2686,7 +2692,7 @@ function FileActionMenu({ entry, targets, position, menuRef, favoritePaths, canW
         })}
       </div>
       {!multiple && <div className="file-menu-section">
-        {item("open", entry.type === "directory" ? "Open" : "Preview", entry.type === "directory" ? <FolderOpen size={16} /> : <Eye size={16} />)}
+        {item("open", entry.type === "directory" ? "Open" : isArchive(entry) ? "Look inside" : "Preview", entry.type === "directory" ? <FolderOpen size={16} /> : isArchive(entry) ? <PackageOpen size={16} /> : <Eye size={16} />)}
         {canWrite && entry.type === "file" && item("edit", "Edit", <FilePenLine size={16} />, { disabled: !isEditable(entry) })}
         {item("download", "Download", <Download size={16} />)}
       </div>}
@@ -2927,6 +2933,7 @@ function DialogHost({ dialog, selected, currentPath, username, role, home, onClo
   if (dialog.kind === "tag") return <TagDialog color={dialog.color} onClose={onClose} onPreview={onPreview} onReveal={onReveal} onNavigate={onNavigate} onChanged={onTagsChanged} notify={notify} />;
   if (dialog.kind === "watching") return <ContinueWatchingDialog onClose={onClose} onPreview={onPreview} onReveal={onReveal} notify={notify} />;
   if (dialog.kind === "snapshots") return <SnapshotsDialog isOwner={role === "owner"} canWrite={canWrite} home={home} onClose={onClose} notify={notify} onJob={onJob} />;
+  if (dialog.kind === "archive") return <ArchiveBrowserDialog entry={dialog.entry} canWrite={canWrite} onClose={onClose} onJob={onJob} notify={notify} />;
   if (dialog.kind === "versions") return <VersionsDialog entry={dialog.entry} canWrite={canWrite} isOwner={role === "owner"} onClose={onClose} notify={notify} onJob={onJob} />;
   if (dialog.kind === "preferences") return role === "owner"
     ? <PreferencesDialog username={username} onClose={onClose} onUpdated={onCredentialsUpdated} onTwoFactor={onTwoFactor} onPasskeys={onPasskeys} onNotifications={onNotifications} />

@@ -1,6 +1,6 @@
 import path from "node:path";
 import { NextResponse } from "next/server";
-import { compressEntries, extractArchive } from "@/lib/archives";
+import { archiveSelection, compressEntries, extractArchive } from "@/lib/archives";
 import { withAccess } from "@/lib/access";
 import { audit } from "@/lib/audit";
 import { assertMutationRequest, AppError, jsonError, readJsonBody } from "@/lib/http";
@@ -24,7 +24,7 @@ export async function GET(request: Request) {
   }
 }
 
-type ArchiveBody = { action?: string; paths?: unknown; destination?: unknown; name?: unknown; format?: unknown; path?: unknown; id?: unknown };
+type ArchiveBody = { action?: string; paths?: unknown; destination?: unknown; name?: unknown; format?: unknown; path?: unknown; id?: unknown; select?: unknown };
 
 function stringField(value: unknown, label: string, maxLength = 4096) {
   if (typeof value !== "string" || value.length > maxLength) throw new AppError(`${label} is invalid`, 400, "INVALID_REQUEST");
@@ -61,9 +61,12 @@ export async function POST(request: Request) {
       }
       case "extract": {
         const archivePath = stringField(body.path, "Archive path");
-        job = startJob("extract", `Extracting ${path.posix.basename(archivePath)}`, { done: 0, unit: "bytes" },
-          (report, signal) => extractArchive(archivePath, report, signal),
-          recordResult("fs.extract", { path: archivePath }));
+        // Only some of its items, chosen while looking inside it.
+        const selection = body.select === undefined ? null : archiveSelection(body.select);
+        const label = selection ? `Extracting ${selection.items.length === 1 ? path.posix.basename(selection.items[0]) : `${selection.items.length} items`} from ${path.posix.basename(archivePath)}` : `Extracting ${path.posix.basename(archivePath)}`;
+        job = startJob("extract", label, { done: 0, unit: "bytes" },
+          (report, signal) => extractArchive(archivePath, report, signal, {}, selection),
+          recordResult("fs.extract", { path: archivePath, items: selection?.items }));
         break;
       }
       case "cancel":
