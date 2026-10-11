@@ -153,6 +153,18 @@ a { color: inherit; text-decoration: none; }
 .mini-avatar { width: 23px; height: 23px; font-size: 8px; }
 
 .main-panel { width: calc(100% - 252px); min-width: 0; margin-left: 252px; }
+.folder-tabs { display: flex; min-width: 0; align-items: flex-end; gap: 2px; padding: 8px 28px 0; overflow-x: auto; border-bottom: 1px solid var(--line); scrollbar-width: thin; }
+.folder-tab { display: flex; min-width: 0; max-width: 220px; flex: 0 1 auto; align-items: center; border: 1px solid transparent; border-bottom: 0; border-radius: 9px 9px 0 0; color: var(--ink-soft); }
+.folder-tab:hover { background: var(--panel-soft); }
+.folder-tab.active { margin-bottom: -1px; border-color: var(--line); background: var(--panel); color: var(--ink); }
+.folder-tab.drop-target { background: var(--brand-soft); color: var(--brand-strong); }
+.folder-tab-open { display: flex; min-width: 0; align-items: center; gap: 6px; padding: 7px 4px 7px 11px; border: 0; background: transparent; color: inherit; cursor: pointer; font-size: 11px; font-weight: 700; }
+.folder-tab-open bdi { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.folder-tab-open svg { flex: 0 0 auto; color: var(--brand); }
+.folder-tab-close { display: grid; width: 22px; height: 22px; flex: 0 0 auto; place-items: center; margin-right: 5px; border: 0; border-radius: 6px; background: transparent; color: var(--ink-faint); cursor: pointer; }
+.folder-tab-close:hover { background: var(--panel-strong); color: var(--ink); }
+.folder-tab-new { flex: 0 0 auto; margin: 0 0 3px 4px; }
+@media (max-width: 720px) { .folder-tabs { padding: 6px 12px 0; } .folder-tab { max-width: 150px; } }
 .topbar { position: sticky; top: 0; z-index: 20; display: flex; height: 63px; align-items: center; gap: 12px; padding: 0 28px; border-bottom: 1px solid var(--line); background: color-mix(in srgb, var(--panel) 91%, transparent); backdrop-filter: blur(16px); }
 .icon-button { display: inline-grid; width: 34px; height: 34px; flex: 0 0 auto; place-items: center; border: 1px solid transparent; border-radius: 8px; background: transparent; cursor: pointer; }
 .icon-button:hover:not(:disabled) { border-color: var(--line); background: var(--panel-soft); }

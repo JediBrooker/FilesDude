@@ -4,6 +4,7 @@ import {
   Activity,
   ArrowDownToLine,
   ArrowDownWideNarrow,
+  AppWindow,
   ArrowLeft,
   ArrowRight,
   ArrowUp,
@@ -97,6 +98,7 @@ import { isNewerBuild as differsFrom, type BuildIdentity } from "@/lib/build";
 import { CopyToServerDialog, RemoteBrowserDialog, ServerSettingsDialog, type ServerConnection } from "./remote-servers";
 import { FolderCompareDialog } from "./folder-compare";
 import { ArchiveBrowserDialog } from "./archive-browser";
+import { closeTab, MAX_TABS, openTab, parseTabs, shownTabs, type FolderTabs } from "@/lib/folder-tabs";
 import { moveCursor, selectionRange } from "@/lib/selection";
 import { INITIAL_DIRECTION, nextSort, parseSort, sortEntries, type SortKey, type SortState } from "@/lib/sort";
 import type { ContentSearchHit, ContentSearchResult, ShareLink } from "@/lib/types";
@@ -172,7 +174,7 @@ type SnapshotEntry = { name: string; path: string; type: "file" | "directory" | 
 type SnapshotVersion = { snapshot: string; snapshotCreatedAt: string; type: SnapshotEntry["type"]; size: number; modified: string };
 const SNAPSHOT_KIND_LABELS: Record<SnapshotInfo["kind"], string> = { auto: "Scheduled", manual: "Manual", other: "Other" };
 
-type EntryAction = "versions" | "open" | "edit" | "download" | "favorite" | "openOther" | "rename" | "cut" | "clipboard" | "paste" | "copy" | "move" | "compress" | "extract" | "share" | "permissions" | "ownership" | "details" | "delete";
+type EntryAction = "versions" | "open" | "edit" | "download" | "favorite" | "openOther" | "openTab" | "rename" | "cut" | "clipboard" | "paste" | "copy" | "move" | "compress" | "extract" | "share" | "permissions" | "ownership" | "details" | "delete";
 type FavoriteLocation = { path: string; name: string; createdAt: string };
 type SelectOptions = { additive?: boolean; range?: boolean };
 type MenuPosition = { top: number; left: number };
@@ -255,6 +257,8 @@ type EntryInteractions = {
   onContextMenu: (entry: FileEntry, event: React.MouseEvent) => void;
   onDragStart: (entry: FileEntry, event: React.DragEvent<HTMLElement>) => void;
   onDragEnd: () => void;
+  /** Opens a folder in a new tab (a middle click on it). */
+  onOpenTab: (entry: FileEntry) => void;
   /** How far the account got in the videos shown, by path. */
   watching: Map<string, WatchEntry>;
   /** The account's colour tags on the items shown, by path. */
@@ -322,6 +326,28 @@ function storedSplit(account: string) {
     return null;
   }
 }
+
+// Folder tabs (see lib/folder-tabs.ts), remembered per account in this browser.
+const TABS_STORAGE_PREFIX = "filesdude-tabs:";
+
+function storedTabs(account: string): FolderTabs | null {
+  try {
+    return typeof window === "undefined" ? null : parseTabs(window.localStorage.getItem(`${TABS_STORAGE_PREFIX}${account}`));
+  } catch {
+    return null;
+  }
+}
+
+function rememberTabs(account: string, tabs: FolderTabs | null) {
+  try {
+    if (tabs) window.localStorage.setItem(`${TABS_STORAGE_PREFIX}${account}`, JSON.stringify(tabs));
+    else window.localStorage.removeItem(`${TABS_STORAGE_PREFIX}${account}`);
+  } catch {
+    // Not remembered in this browser.
+  }
+}
+
+const tabLabel = (tabPath: string) => (tabPath ? tabPath.split("/").at(-1)! : "All files");
 
 // The split view only shows on screens wide enough for both sides (as in globals.css).
 const SPLIT_MEDIA = "(min-width: 1200px)";
@@ -476,6 +502,10 @@ function modifierLabel() {
   return /Mac|iPhone|iPad/.test(navigator.platform) ? "⌘" : "Ctrl+";
 }
 
+function altLabel() {
+  return typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform) ? "⌥" : "Alt+";
+}
+
 // Nothing can go into itself or its own subfolders, and moving into the folder it is already in does nothing.
 function canDropInto(destination: string, paths: string[], copy: boolean) {
   return paths.length > 0 && paths.every((item) => item !== destination && !destination.startsWith(`${item}/`) && (copy || parentOf(item) !== destination));
@@ -603,6 +633,9 @@ export function FileManager() {
   const [split, setSplit] = useState<{ account: string; path: string | null } | null>(null);
   const account = auth.authenticated ? auth.username ?? "" : null;
   const splitPath = account === null ? null : split?.account === account ? split.path : storedSplit(account);
+  // The signed-in account's folder tabs (null with just one folder open).
+  const [tabState, setTabState] = useState<{ account: string; tabs: FolderTabs | null } | null>(null);
+  const tabs = account === null ? null : tabState?.account === account ? tabState.tabs : storedTabs(account);
   const wideScreen = useSyncExternalStore(subscribeSplitMedia, () => window.matchMedia(SPLIT_MEDIA).matches, () => false);
   const splitShown = splitPath !== null && wideScreen;
   // The details pane beside the list (on screens wide enough), remembered per browser.
@@ -952,6 +985,38 @@ export function FileManager() {
       window.history.pushState({ path: nextPath, index: nextIndex }, "", buildUrl(nextPath));
     }
   }, [history, historyIndex]);
+
+  // The tab showing is always the folder open: wherever you go, it goes.
+  const tabsShown = shownTabs(tabs, currentPath);
+  const saveTabs = (next: FolderTabs | null) => {
+    if (account === null) return;
+    setTabState({ account, tabs: next });
+    rememberTabs(account, next);
+  };
+  useEffect(() => {
+    if (account !== null && tabsShown) rememberTabs(account, tabsShown);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- remembered whenever the folder showing changes
+  }, [currentPath]);
+  const newTab = (tabPath: string) => {
+    const next = openTab(tabs, currentPath, tabPath);
+    if (!next) {
+      notify(`Up to ${MAX_TABS} tabs can be open; close one first`, "error");
+      return;
+    }
+    saveTabs(next);
+    navigate(tabPath);
+  };
+  const switchTab = (index: number) => {
+    if (!tabsShown || index === tabsShown.active || index >= tabsShown.paths.length) return;
+    saveTabs({ paths: tabsShown.paths, active: index });
+    navigate(tabsShown.paths[index]);
+  };
+  const endTab = (index: number) => {
+    if (!tabsShown) return;
+    const { tabs: next, show } = closeTab(tabsShown, index);
+    saveTabs(next);
+    if (show !== null) navigate(show);
+  };
 
   const changeHistory = (direction: -1 | 1) => {
     const nextIndex = historyIndex + direction;
@@ -1445,6 +1510,7 @@ export function FileManager() {
     },
     onDragStart: startDrag,
     onDragEnd: endDrag,
+    onOpenTab: (entry) => newTab(entry.path),
     watching,
     tags,
   };
@@ -1576,6 +1642,9 @@ export function FileManager() {
       case "openOther":
         openSplit(entry.path);
         break;
+      case "openTab":
+        newTab(entry.path);
+        break;
       case "rename":
         setDialog({ kind: "rename", entry });
         break;
@@ -1627,6 +1696,26 @@ export function FileManager() {
         return;
       }
       if (dialog || menu || isTypingTarget(event.target)) return;
+      // Tabs: Option/Alt and a number shows that tab, T opens this folder in a new one, W closes it
+      // (by key position, as Option on a Mac types other characters).
+      if (event.altKey && !modifier && !event.shiftKey) {
+        const digit = /^Digit([1-9])$/.exec(event.code);
+        if (digit && tabsShown) {
+          event.preventDefault();
+          switchTab(Number(digit[1]) - 1);
+          return;
+        }
+        if (event.code === "KeyT") {
+          event.preventDefault();
+          newTab(currentPath);
+          return;
+        }
+        if (event.code === "KeyW" && tabsShown) {
+          event.preventDefault();
+          endTab(tabsShown.active);
+          return;
+        }
+      }
       if (!canWrite && (key === "delete" || key === "f2" || (modifier && ["z", "v", "c", "x", "backspace"].includes(key)))) return;
       if (modifier && !event.shiftKey && key === "z") {
         if (undoRef.current) {
@@ -1905,6 +1994,21 @@ export function FileManager() {
           </div>
         </header>
 
+        {tabsShown && (
+          <nav className="folder-tabs" role="tablist" aria-label="Folder tabs">
+            {tabsShown.paths.map((tabPath, index) => {
+              const active = index === tabsShown.active;
+              const label = tabLabel(tabPath);
+              return (
+                <div key={index} role="presentation" className={`folder-tab ${active ? "active" : ""} ${!active && dropTarget === tabPath ? "drop-target" : ""}`} title={`/${tabPath}${index < 9 ? ` (${altLabel()}${index + 1})` : ""}`} {...(canWrite && !active ? { "data-drop-path": tabPath, ...dropHandlers } : {})} onAuxClick={(event) => { if (event.button === 1) { event.preventDefault(); endTab(index); } }}>
+                  <button role="tab" aria-selected={active} className="folder-tab-open" onClick={() => switchTab(index)}><Folder size={14} /><bdi>{label}</bdi></button>
+                  <button className="folder-tab-close" aria-label={`Close the ${label} tab`} title={active ? `Close (${altLabel()}W)` : "Close"} onClick={() => endTab(index)}><X size={13} /></button>
+                </div>
+              );
+            })}
+            <button className="icon-button folder-tab-new" aria-label="Open this folder in a new tab" title={`Open this folder in a new tab (${altLabel()}T)`} onClick={() => newTab(currentPath)}><Plus size={15} /></button>
+          </nav>
+        )}
         <div className={`workspaces ${splitShown || infoShown ? "split" : ""}`}>
         <section className="workspace">
           <div className="workspace-heading">
@@ -2580,10 +2684,17 @@ function LoginScreen({ auth, onSuccess, theme, onToggleTheme }: { auth: AuthStat
 // Drag, drop, context-menu, and clipboard props shared by list rows and grid cards.
 function entryItemProps(entry: FileEntry, interactions: EntryInteractions) {
   const onContextMenu = (event: React.MouseEvent) => interactions.onContextMenu(entry, event);
+  // A middle click opens a folder in a new tab.
+  const onAuxClick = (event: React.MouseEvent) => {
+    if (event.button !== 1 || entry.type !== "directory") return;
+    event.preventDefault();
+    interactions.onOpenTab(entry);
+  };
   // Read-only accounts can't drag items around.
-  if (!interactions.canWrite) return { draggable: false, onContextMenu };
+  if (!interactions.canWrite) return { draggable: false, onContextMenu, onAuxClick };
   return {
     draggable: true,
+    onAuxClick,
     onDragStart: (event: React.DragEvent<HTMLElement>) => interactions.onDragStart(entry, event),
     onDragEnd: interactions.onDragEnd,
     onContextMenu,
@@ -2700,6 +2811,7 @@ function FileActionMenu({ entry, targets, position, menuRef, favoritePaths, canW
       <div className="file-menu-section">
         {canWrite && !multiple && item("rename", "Rename", <Pencil size={16} />)}
         {!multiple && entry.type === "directory" && item("favorite", favoritePaths.has(entry.path) ? "Remove from favourites" : "Add to favourites", <Star size={16} fill={favoritePaths.has(entry.path) ? "currentColor" : "none"} />)}
+        {!multiple && entry.type === "directory" && item("openTab", "Open in new tab", <AppWindow size={16} />)}
         {!multiple && entry.type === "directory" && item("openOther", "Open in split view", <Columns2 size={16} />)}
         {canWrite && item("cut", "Cut", <Scissors size={16} />)}
         {canWrite && item("clipboard", "Copy", <ClipboardCopy size={16} />)}
