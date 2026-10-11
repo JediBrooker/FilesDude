@@ -373,12 +373,14 @@ async function copyContents(input: FileHandle, output: FileHandle, context: Copy
   }
 }
 
-// Copies keep each item's permissions (without setuid/setgid) and, when FilesDude can change owners,
-// its owner, like `cp -a`. Attributes are applied through the new item's own handle, and a folder
+// Copies keep each item's permissions (without setuid/setgid), modified time and, when FilesDude can
+// change owners, its owner, like `cp -a`. Attributes are applied through the new item's own handle
+// (a folder's once everything inside it is copied, so its time isn't changed again), and a folder
 // is only used once it is confirmed to be the one this copy just made. Special files are refused.
 async function applyCopiedAttributes(handle: FileHandle, source: Stats) {
   if (canChangeOwnership()) await handle.chown(source.uid, source.gid);
   await handle.chmod(source.mode & 0o1777);
+  await handle.utimes(source.atimeMs / 1000, source.mtimeMs / 1000);
 }
 
 async function copyEntry(from: AnchoredDirectory, name: string, to: AnchoredDirectory, targetName: string, context: CopyContext, depth = 0) {

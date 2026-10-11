@@ -192,7 +192,7 @@ export interface ArchiveResult {
 export interface JobState {
   id: string;
   /** "send" is a copy to another server: its paths are on that server, so it has no undo here. */
-  kind: "compress" | "extract" | "copy" | "move" | "restore" | "send";
+  kind: "compress" | "extract" | "copy" | "move" | "restore" | "send" | "sync";
   label: string;
   status: "running" | "done" | "failed" | "cancelled";
   startedAt: string;
@@ -201,6 +201,8 @@ export interface JobState {
   result?: ArchiveResult;
   /** For copy and move jobs: what was transferred, including items finished before a failure. */
   transferred?: TransferResult[];
+  /** For sync jobs: items left alone, because they changed since the comparison or couldn't be copied. */
+  skipped?: Array<{ path: string; reason: "changed" | "failed"; message?: string }>;
   error?: string;
   /** Whether the signed-in account started the job (the owner also sees other accounts' jobs). */
   own?: boolean;

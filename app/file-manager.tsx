@@ -64,6 +64,7 @@ import {
   Play,
   Plus,
   RefreshCw,
+  GitCompareArrows,
   History,
   RotateCcw,
   Scissors,
@@ -94,6 +95,7 @@ import { browserSupportsWebAuthn, startAuthentication, startRegistration, type P
 import { ACTIVITY_CATEGORIES, activityCategory, activityUser, describeActivity, groupUploads, SHARE_LINK_ACTOR, SYSTEM_ACTOR, visibleText, type ActivityCategory } from "@/lib/activity-text";
 import { isNewerBuild as differsFrom, type BuildIdentity } from "@/lib/build";
 import { CopyToServerDialog, RemoteBrowserDialog, ServerSettingsDialog, type ServerConnection } from "./remote-servers";
+import { FolderCompareDialog } from "./folder-compare";
 import { moveCursor, selectionRange } from "@/lib/selection";
 import { INITIAL_DIRECTION, nextSort, parseSort, sortEntries, type SortKey, type SortState } from "@/lib/sort";
 import type { ContentSearchHit, ContentSearchResult, ShareLink } from "@/lib/types";
@@ -110,7 +112,7 @@ type AuthState = {
   root: string | null;
   configurationIssues: string[];
   /** What this server can do (sent once signed in). */
-  features?: { videoThumbnails: boolean; uploadInPieces?: boolean };
+  features?: { videoThumbnails: boolean; uploadInPieces?: boolean; trash?: boolean };
   /** The build the server runs (sent once signed in). */
   build?: ServerBuild;
 };
@@ -153,6 +155,8 @@ type DialogState =
   | { kind: "tag"; color: TagColor }
   | { kind: "snapshots" }
   | { kind: "duplicates" }
+  // Comparing the two folders of the split view.
+  | { kind: "compare" }
   | { kind: "versions"; entry: FileEntry }
   | { kind: "details"; entry: FileEntry }
   | null;
@@ -539,7 +543,12 @@ export async function requestJson<T>(url: string, options: RequestInit = {}): Pr
   if (options.method && options.method !== "GET") headers.set("x-filedude-request", "1");
   if (options.body && !(options.body instanceof FormData)) headers.set("Content-Type", "application/json");
   const response = await fetch(url, { ...options, headers, credentials: "same-origin", cache: "no-store" });
-  const data = await response.json().catch(() => ({}));
+  // A body that isn't JSON reads as empty, but a request called off while its body arrives stays
+  // called off (an empty result would be taken for a real one).
+  const data = await response.json().catch((error: unknown) => {
+    if (options.signal?.aborted) throw error;
+    return {};
+  });
   if (!response.ok) {
     const error = new Error(data.error || `Request failed (${response.status})`);
     Object.assign(error, { status: response.status, code: data.code });
@@ -1062,6 +1071,16 @@ export function FileManager() {
       if (job.status === "done") notify(`${itemCount(items.length)} copied to ${server}`);
       else if (job.status === "failed") notify(job.error || `The copy to ${server} failed`, "error");
       else notify(`Copy to ${server} cancelled${items.length ? ` after ${itemCount(items.length)}` : ""}`);
+    } else if (job.kind === "sync") {
+      // Copies between compared folders: what they replaced is in the trash, so there's no undo here.
+      const copied = job.transferred?.length ?? 0;
+      const skipped = job.skipped ?? [];
+      const changed = skipped.filter((item) => item.reason === "changed").length;
+      const failed = skipped.length - changed;
+      const leftAlone = [changed ? `${itemCount(changed)} changed since the comparison` : "", failed ? `${itemCount(failed)} couldn't be copied${skipped.find((item) => item.message)?.message ? ` (${skipped.find((item) => item.message)!.message})` : ""}` : ""].filter(Boolean).join(", ");
+      if (job.status === "done") notify(`${itemCount(copied)} copied across${leftAlone ? ` · left alone: ${leftAlone}` : ""}`, leftAlone ? "error" : undefined);
+      else if (job.status === "failed") notify(job.error || "The copy between the folders failed", "error");
+      else notify(`Copying across cancelled${copied ? ` after ${itemCount(copied)}` : ""}`);
     } else if (job.kind === "restore") {
       const restored = job.transferred?.[0];
       if (job.status === "done" && restored) {
@@ -1922,6 +1941,7 @@ export function FileManager() {
             <button className={`toolbar-button ${showHidden ? "active" : ""}`} onClick={() => setShowHidden(!showHidden)} title="Show hidden files">{showHidden ? <Eye size={17} /> : <EyeOff size={17} />}<span>Hidden</span></button>
             <button className={`toolbar-button split-view-toggle ${infoShown ? "active" : ""}`} aria-pressed={infoShown} onClick={() => toggleInfo()} title="Show details of what's selected beside the list"><Info size={16} /><span>Info</span></button>
             <button className={`toolbar-button split-view-toggle ${splitPath !== null ? "active" : ""}`} aria-pressed={splitPath !== null} onClick={() => (splitPath === null ? openSplit(currentPath) : closeSplit())} title="Show a second folder side by side, to copy or move between them"><Columns2 size={16} /><span>Split</span></button>
+            {splitShown && withinHome(splitPath) && <button className="toolbar-button split-view-toggle" onClick={() => setDialog({ kind: "compare" })} title="Compare the two folders, and copy what differs from one to the other"><GitCompareArrows size={16} /><span>Compare</span></button>}
             <div className="view-switch" role="group" aria-label="View style">
               <button className={view === "list" ? "active" : ""} aria-label="List view" onClick={() => setView("list")}><List size={17} /></button>
               <button className={view === "grid" ? "active" : ""} aria-label="Grid view" onClick={() => setView("grid")}><LayoutGrid size={17} /></button>
@@ -2055,6 +2075,7 @@ export function FileManager() {
           notify={notify}
         />
       )}
+      {dialog?.kind === "compare" && splitPath !== null && <FolderCompareDialog left={currentPath} right={splitPath} canWrite={canWrite} trashEnabled={auth.features?.trash ?? true} onClose={() => setDialog(null)} onJob={trackJob} notify={notify} />}
       {dialog?.kind === "copyToServer" && connections.length > 0 && <CopyToServerDialog entries={selectedEntries} connections={connections} onClose={() => setDialog(null)} onJob={trackJob} notify={notify} />}
       {dialog && (
         <DialogHost
@@ -2839,7 +2860,7 @@ function FileSkeleton() {
 }
 
 function JobPanel({ job, onCancel }: { job: JobState; onCancel: () => void }) {
-  const icons: Record<JobState["kind"], ReactNode> = { compress: <FileArchive size={17} />, extract: <PackageOpen size={17} />, copy: <Copy size={17} />, move: <FolderInput size={17} />, restore: <History size={17} />, send: <Server size={17} /> };
+  const icons: Record<JobState["kind"], ReactNode> = { compress: <FileArchive size={17} />, extract: <PackageOpen size={17} />, copy: <Copy size={17} />, move: <FolderInput size={17} />, restore: <History size={17} />, send: <Server size={17} />, sync: <GitCompareArrows size={17} /> };
   const percent = job.progress.total ? Math.min(100, (job.progress.done / job.progress.total) * 100) : undefined;
   return (
     <div className="job-panel" role="status" aria-live="polite">
@@ -2877,7 +2898,7 @@ function DialogHost({ dialog, selected, currentPath, username, role, home, onClo
   onTagsChanged: () => void;
 }) {
   // The server dialogs are shown by FileManager, which holds the list of servers.
-  if (dialog.kind === "server" || dialog.kind === "serverSettings" || dialog.kind === "copyToServer") return null;
+  if (dialog.kind === "server" || dialog.kind === "serverSettings" || dialog.kind === "copyToServer" || dialog.kind === "compare") return null;
   if (dialog.kind === "upload") return <UploadDialog items={dialog.items} folders={dialog.folders} currentPath={dialog.destination ?? currentPath} chooseOwnership={role === "owner"} inPieces={uploadInPieces} onClose={onClose} notify={notify} onComplete={onRefresh} />;
   if (dialog.kind === "users") return <UsersDialog onClose={onClose} notify={notify} />;
   if (dialog.kind === "duplicates") return <DuplicatesDialog startPath={currentPath} onClose={onClose} notify={notify} onRefresh={onRefresh} onReveal={onReveal} />;
