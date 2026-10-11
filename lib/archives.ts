@@ -399,6 +399,27 @@ export function safeEntryPath(raw: string) {
   return parts.length ? parts.join("/") : null;
 }
 
+/**
+ * Chosen entries of an archive (files or folders, all in one folder of it): only they are extracted,
+ * placed relative to that folder.
+ */
+export type Selection = { items: string[]; parent: string };
+
+/** Checks chosen entry paths: safe, distinct, and all in the same folder of the archive. */
+export function archiveSelection(paths: unknown): Selection {
+  if (!Array.isArray(paths) || !paths.length || paths.length > 1_000) throw new AppError("Choose between 1 and 1,000 items to extract", 400, "INVALID_PATHS");
+  const items = [...new Set(paths.map((item) => {
+    if (typeof item !== "string" || item.length > MAX_ENTRY_PATH_BYTES) throw new AppError("An item to extract is invalid", 400, "INVALID_PATHS");
+    const relative = safeEntryPath(item);
+    if (!relative) throw new AppError("An item to extract is invalid", 400, "INVALID_PATHS");
+    return relative;
+  }))];
+  const parents = new Set(items.map((item) => path.posix.dirname(item)));
+  if (parents.size !== 1) throw new AppError("Choose items from one folder of the archive", 400, "INVALID_PATHS");
+  const [parent] = parents;
+  return { items, parent: parent === "." ? "" : parent };
+}
+
 // Writes extracted entries inside the private folder. Links, devices, and other special entries
 // are never created, so nothing extracted can point anywhere else.
 class ExtractionTarget {
@@ -412,11 +433,35 @@ class ExtractionTarget {
     private readonly budget: number,
     private readonly maxEntries: number,
     private readonly signal: AbortSignal,
+    private readonly selection: Selection | null = null,
   ) {}
+
+  /** Where an entry goes, or null for one that isn't extracted (outside the selection, or the root). */
+  private place(raw: string) {
+    if (!this.selection) return safeEntryPath(raw);
+    // Only chosen items are written, so an unsafe entry elsewhere in the archive is simply left out
+    // (extracting the whole archive refuses it).
+    let relative: string | null;
+    try {
+      relative = safeEntryPath(raw);
+    } catch (error) {
+      if (error instanceof AppError && (error.code === "UNSAFE_ARCHIVE" || error.code === "ARCHIVE_TOO_DEEP")) return null;
+      throw error;
+    }
+    if (relative === null) return null;
+    const { items, parent } = this.selection;
+    if (!items.some((item) => relative === item || relative.startsWith(`${item}/`))) return null;
+    return parent ? relative.slice(parent.length + 1) : relative;
+  }
+
+  /** Whether an entry is extracted at all (so one that isn't need not be read). */
+  wants(raw: string) {
+    return this.place(raw) !== null;
+  }
 
   private locate(raw: string) {
     if (this.signal.aborted) throw cancelled();
-    const relative = safeEntryPath(raw);
+    const relative = this.place(raw);
     if (relative === null) return null;
     this.entries += 1;
     if (this.entries > this.maxEntries) throw new AppError(`This archive has more than ${this.maxEntries.toLocaleString()} entries, which is more than FilesDude will extract`, 413, "ARCHIVE_TOO_LARGE");
@@ -504,6 +549,21 @@ function extractionFailure(error: unknown, label: string) {
   return new AppError(`${label} can't be extracted (${(error as Error).message})`, 422, "INVALID_ARCHIVE");
 }
 
+// The upper half of code page 437, which zip names use unless they're marked as UTF-8.
+const CP437 = "ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒáíóúñÑªº¿⌐¬½¼¡«»░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■ ";
+
+/**
+ * A zip entry's name. FilesDude decodes names itself and judges them (yauzl would refuse the whole
+ * archive over one unsafe name, where browsing or extracting chosen items only leaves it out).
+ */
+export function zipName(entry: yauzl.Entry) {
+  const raw = entry.fileName as unknown as Buffer;
+  if (entry.generalPurposeBitFlag & 0x800) return raw.toString("utf8");
+  let name = "";
+  for (const byte of raw) name += byte < 0x80 ? String.fromCharCode(byte) : CP437[byte - 0x80];
+  return name;
+}
+
 async function extractZip(archive: { handle: FileHandle; real: string }, target: ExtractionTarget, report: ProgressReporter) {
   // yauzl gets its own descriptor for the same file and closes it itself (zip.close()), so it can
   // never read through a descriptor number that has been closed and reused.
@@ -511,7 +571,7 @@ async function extractZip(archive: { handle: FileHandle; real: string }, target:
   let zip: yauzl.ZipFile;
   try {
     zip = await new Promise<yauzl.ZipFile>((resolve, reject) => {
-      yauzl.fromFd(fd, { lazyEntries: true, autoClose: true, decodeStrings: true, validateEntrySizes: true, strictFileNames: false }, (error, file) => (error || !file ? reject(error ?? new Error("Unreadable zip file")) : resolve(file)));
+      yauzl.fromFd(fd, { lazyEntries: true, autoClose: true, decodeStrings: false, validateEntrySizes: true, strictFileNames: false }, (error, file) => (error || !file ? reject(error ?? new Error("Unreadable zip file")) : resolve(file)));
     });
   } catch (error) {
     fs.close(fd, () => undefined);
@@ -526,15 +586,17 @@ async function extractZip(archive: { handle: FileHandle; real: string }, target:
       zip.on("entry", (entry: yauzl.Entry) => {
         void (async () => {
           const type = (entry.externalFileAttributes >>> 16) & 0o170000;
-          if (entry.fileName.endsWith("/")) {
-            await target.directory(entry.fileName);
+          if (!target.wants(zipName(entry))) {
+            // Outside the chosen items: not read at all.
+          } else if (zipName(entry).endsWith("/")) {
+            await target.directory(zipName(entry));
           } else if (type !== 0 && type !== 0o100000) {
             // Symlinks and other special entries are never created.
-            target.skip(entry.fileName);
+            target.skip(zipName(entry));
           } else {
             if (entry.isEncrypted()) throw new AppError("Encrypted zip files can't be extracted", 422, "ENCRYPTED_ARCHIVE");
             const stream = await new Promise<Readable>((open, fail) => zip.openReadStream(entry, (error, readable) => (error || !readable ? fail(error) : open(readable))));
-            await target.file(entry.fileName, stream);
+            await target.file(zipName(entry), stream);
           }
           processed += 1;
           report({ done: processed, total, unit: "entries" });
@@ -584,7 +646,7 @@ async function extractTar(handle: FileHandle, gzip: boolean, size: number, targe
   }
 }
 
-async function detectFormat(handle: FileHandle, name: string): Promise<"zip" | "tar" | "tar.gz"> {
+export async function detectFormat(handle: FileHandle, name: string): Promise<"zip" | "tar" | "tar.gz"> {
   const header = Buffer.alloc(265);
   const { bytesRead } = await handle.read(header, 0, header.length, 0);
   if (bytesRead >= 4 && header[0] === 0x50 && header[1] === 0x4b && (header[2] === 3 || header[2] === 5)) return "zip";
@@ -595,10 +657,10 @@ async function detectFormat(handle: FileHandle, name: string): Promise<"zip" | "
 }
 
 /**
- * Extracts an archive into a new folder beside it, named after the archive. Any unsafe entry
- * stops the whole extraction and removes the partial folder.
+ * Extracts an archive (or, with `selection`, only those entries of it) into a new folder beside it,
+ * named after the archive. Any unsafe entry stops the whole extraction and removes the partial folder.
  */
-export async function extractArchive(archivePath: string, report: ProgressReporter, signal: AbortSignal, limits: { maxEntries?: number; reserveBytes?: number } = {}): Promise<ArchiveResult> {
+export async function extractArchive(archivePath: string, report: ProgressReporter, signal: AbortSignal, limits: { maxEntries?: number; reserveBytes?: number } = {}, selection: Selection | null = null): Promise<ArchiveResult> {
   const isReserved = await reservedPathCheck();
   const release = await acquireFilesystemLock();
   let source: { handle: FileHandle; real: string };
@@ -635,11 +697,12 @@ export async function extractArchive(archivePath: string, report: ProgressReport
     const disk = await fsp.statfs(folder.base);
     const budget = Number(disk.bavail) * Number(disk.bsize) - (limits.reserveBytes ?? EXTRACT_DISK_RESERVE);
     if (budget <= 0) throw new AppError("There isn't enough free space on this disk to extract anything", 507, "INSUFFICIENT_STORAGE");
-    const target = new ExtractionTarget(folder.base, budget, limits.maxEntries ?? MAX_EXTRACT_ENTRIES, signal);
+    const target = new ExtractionTarget(folder.base, budget, limits.maxEntries ?? MAX_EXTRACT_ENTRIES, signal, selection);
     report({ done: 0, total: format === "zip" ? undefined : size, unit: format === "zip" ? "entries" : "bytes" });
     if (format === "zip") await extractZip(source, target, report);
     else await extractTar(source.handle, format === "tar.gz", size, target, report, signal);
     if (signal.aborted) throw cancelled();
+    if (selection && !target.entries) throw new AppError("The chosen items aren't in this archive", 404, "NOT_FOUND");
 
     const owner = ownerFor(parent);
     await handOver(folder.base, owner);
