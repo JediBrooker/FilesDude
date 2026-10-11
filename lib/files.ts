@@ -168,6 +168,9 @@ export async function openVerifiedFile(relativePath: string, access: "read" | "w
   const handle = await fs.open(absolute, (access === "write" ? constants.O_RDWR : constants.O_RDONLY) | constants.O_NONBLOCK | constants.O_NOCTTY);
   try {
     const { openedPath, stat } = await verifyFileHandleWithinRoot(handle, absolute);
+    // Where it really is: a link elsewhere in the root can't open FilesDude's own files (the trash,
+    // or a state folder inside the root).
+    if (await isReservedLocation(openedPath)) throw new AppError("That path is reserved by FilesDude", 403, "RESERVED_PATH");
     return { absolute, handle, openedPath, stat };
   } catch (error) {
     await handle.close().catch(() => undefined);
@@ -901,6 +904,119 @@ export async function createEntry(parentPath: string, name: string, type: "file"
       }
     }
     return toEntry(location, relative, entryName);
+  });
+}
+
+const linkFailure = (error: unknown): never => {
+  const code = (error as NodeJS.ErrnoException).code;
+  if (code === "EEXIST") throw new AppError("An item with that name already exists there", 409, "NAME_CONFLICT");
+  if (code === "EXDEV") throw new AppError("A hard link can only be made on the same disk as the file", 400, "OTHER_FILESYSTEM");
+  if (code === "EPERM" || code === "ENOTSUP" || code === "EOPNOTSUPP") throw new AppError("This disk doesn't allow that kind of link", 400, "LINK_UNSUPPORTED");
+  throw error;
+};
+
+/**
+ * Where an item really is, for linking to it: inside the account's folder (following any links on
+ * the way, which must stay inside it too), and not one of FilesDude's own.
+ */
+async function linkTarget(targetPath: string) {
+  const targetRelative = cleanRelative(targetPath);
+  if (!targetRelative) throw new AppError("Choose an item inside the folder to link to", 400, "INVALID_PATH");
+  // Following everything, the item must end up inside the account's folder.
+  await safeResolve(targetRelative);
+  return withParent(targetRelative, async (parent, name) => {
+    const real = path.join(parent.real, name);
+    // Neither the item nor, if it's a link, where it leads may be FilesDude's own.
+    if (await isReservedLocation(real) || await isReservedLocation(await fs.realpath(real))) throw new AppError("That path is reserved by FilesDude", 403, "RESERVED_PATH");
+    return real;
+  });
+}
+
+/**
+ * Accounts other than the owner may only make links that point inside the link's own folder (no
+ * ".."): a link that climbs out of its folder would point somewhere else, perhaps outside their
+ * folder, once it's moved.
+ */
+function assertLinkStaysPut(stored: string) {
+  const scope = currentScope();
+  if (scope && scope.role !== "owner" && stored.split(path.sep).includes("..")) {
+    throw new AppError("Links can only point to items in the same folder as the link, or in folders inside it", 400, "LINK_CLIMBS");
+  }
+}
+
+/**
+ * Makes a link to an item, named `name` in the folder `destinationPath`: a symbolic link (to a file
+ * or folder) or a hard link (to a file). A symbolic link stores the way from its folder to the item,
+ * so it never names a host path and keeps working when both move together. The item must be inside
+ * the account's folder. Call with the filesystem lock held.
+ */
+export async function createLink(targetPath: string, destinationPath: string, name: string, kind: "symbolic" | "hard") {
+  const linkName = validateName(name);
+  const destinationRelative = cleanRelative(destinationPath);
+  const linkRelative = childOf(destinationRelative, linkName);
+  await safeResolve(linkRelative, { mustExist: false });
+  const targetRelative = cleanRelative(targetPath);
+  await safeResolve(targetRelative);
+  return withParent(targetRelative, async (targetParent, targetName) => {
+    const targetReal = path.join(targetParent.real, targetName);
+    if (await isReservedLocation(targetReal) || await isReservedLocation(await fs.realpath(targetReal))) throw new AppError("That path is reserved by FilesDude", 403, "RESERVED_PATH");
+    const target = await fs.lstat(inside(targetParent, targetName));
+    const scope = currentScope();
+    if (kind === "hard") {
+      if (!target.isFile()) throw new AppError("Hard links can only be made to files", 400, "NOT_A_FILE");
+      // Another name for a setuid or setgid program would keep those bits, as a copy wouldn't.
+      if (target.mode & 0o6000) throw new AppError("Hard links can't be made to programs that run as their owner", 400, "SPECIAL_PERMISSIONS");
+      // A hard link shares everything about the file, its permissions and any file capabilities
+      // included, so other accounts may only link plain files nobody else can write to.
+      if (scope && scope.role !== "owner" && !linkableMode(target.mode)) throw new AppError("Hard links can't be made to programs, or to files others can change", 400, "PERMISSIONS");
+    } else if (!target.isFile() && !target.isDirectory() && !target.isSymbolicLink()) {
+      throw new AppError("Links can only be made to files, folders, and links", 400, "SPECIAL_FILE");
+    }
+    return withOpen(openDirectory(destinationRelative), async (directory) => {
+      const location = inside(directory, linkName);
+      if (kind === "hard") {
+        await fs.link(inside(targetParent, targetName), location).catch(linkFailure);
+        // The name linked may have been swapped for something else after it was checked: the new
+        // name must be the very file checked, or it goes.
+        const made = await fs.lstat(location).catch(missingAsNull);
+        if (!made || !made.isFile() || made.dev !== target.dev || made.ino !== target.ino || made.mode !== target.mode) {
+          if (made) await fs.unlink(location).catch(() => undefined);
+          throw new AppError("The file changed while it was being linked", 409, "PATH_CHANGED");
+        }
+      } else {
+        // Links keep FilesDude's ownership: changing it would be by name, in a folder others may write to.
+        const stored = path.relative(directory.real, targetReal) || ".";
+        assertLinkStaysPut(stored);
+        await fs.symlink(stored, location).catch(linkFailure);
+      }
+      return toEntry(location, linkRelative, linkName);
+    });
+  });
+}
+
+/**
+ * Points a symbolic link at another item (inside the account's folder), as the way from the link's
+ * folder to it. The link is replaced in one step, and only if it is still the link that was checked.
+ * Call with the filesystem lock held.
+ */
+export async function retargetLink(linkPath: string, targetPath: string) {
+  const targetReal = await linkTarget(targetPath);
+  return withParent(linkPath, async (parent, name, relative) => {
+    const before = await fs.lstat(inside(parent, name));
+    if (!before.isSymbolicLink()) throw new AppError("Only links can be pointed somewhere else", 400, "NOT_A_LINK");
+    const temporary = `.filedude-link-${crypto.randomUUID()}`;
+    const stored = path.relative(parent.real, targetReal) || ".";
+    assertLinkStaysPut(stored);
+    await fs.symlink(stored, inside(parent, temporary));
+    try {
+      const current = await fs.lstat(inside(parent, name)).catch(missingAsNull);
+      if (!current || identityOf(current) !== identityOf(before)) throw new AppError("The link changed while it was being changed", 409, "PATH_CHANGED");
+      await fs.rename(inside(parent, temporary), inside(parent, name));
+    } catch (error) {
+      await fs.unlink(inside(parent, temporary)).catch(() => undefined);
+      throw error;
+    }
+    return toEntry(inside(parent, name), relative, name);
   });
 }
 
