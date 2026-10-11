@@ -80,10 +80,13 @@ immutable release, writes a hardened systemd service, and starts FilesDude.
 FilesDude runs as its own `filesdude` account, not root. It holds just the file
 capabilities a file manager needs: changing owners, and reading and writing files
 whatever their permissions (FilesDude keeps its own accounts to their folders). The
-service only sees the system's programs and libraries, its release, its folder, and
-its state. Everything else is hidden or replaced with an empty folder: Proxmox's
-cluster configuration and keys, SSH host keys, password hashes, other storage, logs,
-and the sockets in `/run`. The one part that runs as root is a small helper,
+service only sees the system's programs and libraries, its release, its folder, its
+state, and the few files in `/etc` it needs (accounts, name resolution, time zone,
+certificates). Everything else is replaced with an empty folder or hidden: the rest of
+`/etc` (Proxmox's cluster configuration and keys, SSH host keys, password hashes),
+`/var`, other storage, and the sockets in `/run`. Because FilesDude can read and change
+everything in its folder, the installer refuses a folder that holds or is inside the
+system's own (such as `/etc`, `/usr`, or `/root`). The one part that runs as root is a small helper,
 `filesdude-sandbox.service`. It is reached through a socket only FilesDude's account
 can use, and it does one job: start the media sandbox (below) for ffmpeg, ffprobe, or
 the image decoder, with its own fixed settings. Older installs that run as root can
@@ -92,7 +95,8 @@ state to the new account; `--service-user root` switches back.
 
 To let only your reverse proxy or tunnel reach FilesDude's port, pass its address. Add
 any network interfaces that should also reach it, such as Tailscale's. The installer
-keeps a small nftables filter for this and remembers it across updates;
+keeps a small nftables filter for this and remembers it across updates. FilesDude
+doesn't start without the filter, so if it fails the port stays closed.
 `--allow-from any` removes it:
 
 ```bash
@@ -644,7 +648,7 @@ The container runs as UID/GID `1001:1001` by default. Give that account access t
 - Back up the underlying data independently. Protected trash helps with mistakes but is not a backup.
 - Keep Proxmox, the container image, and reverse proxy patched. `filesdude-update --reset-credentials` signs everyone out; rotating the session secret also does, and ends every share link.
 - Behind a tunnel, let only the tunnel reach FilesDude's port (`--allow-from`, above), so nobody on the LAN signs in over plain HTTP.
-- FilesDude's account can read and change every file the host shows it, its folder included. Anyone who could run code inside FilesDude could do the same, but couldn't read the host's secrets or act as root. Keep it patched, and run updates only from the repository you trust: the updater itself runs as root.
+- FilesDude's account can read and change every file the host shows it, its folder included. Anyone who could run code inside FilesDude could do the same, but couldn't see the rest of the host's configuration or act as root. Keep it patched, and run updates only from the repository you trust: the updater itself runs as root.
 
 ## Useful keyboard shortcuts
 

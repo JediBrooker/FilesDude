@@ -106,7 +106,7 @@ ensure_node() {
   runtime="${APP_HOME}/runtimes/${filename%.tar.xz}"
   mkdir -p "${APP_HOME}/runtimes"
   rm -rf "${runtime}"
-  tar -xJf "${archive}" -C "${APP_HOME}/runtimes"
+  tar --no-same-owner -xJf "${archive}" -C "${APP_HOME}/runtimes"
   rm -f "${archive}"
   ln -sfn "${runtime}" "${APP_HOME}/node"
 }
@@ -284,6 +284,17 @@ fi
 # Read the configured root without executing the environment file.
 ROOT_PATH="$(env_value FILEDUDE_ROOT)"
 [[ -n ${ROOT_PATH} && ${ROOT_PATH} != "/" ]] || fail "Invalid FILEDUDE_ROOT in ${ENV_FILE}."
+case "${ROOT_PATH}" in *[[:cntrl:]]*) fail "The managed folder's path can't contain control characters." ;; esac
+
+# FilesDude can read and write everything in its folder, so a folder holding the system, its own
+# release or state, or root's files would let anyone who took over FilesDude take over the host.
+ROOT_REAL="$(realpath -m "${ROOT_PATH}")"
+for sensitive in /etc /usr /bin /sbin /lib /lib32 /lib64 /libx32 /boot /root /proc /sys /dev /run /var/spool "${APP_HOME}" "${STATE_DIR}" "${CONFIG_DIR}"; do
+  sensitive_real="$(realpath -m "${sensitive}")"
+  if [[ ${ROOT_REAL} == "${sensitive_real}" || ${ROOT_REAL} == "${sensitive_real}/"* || ${sensitive_real} == "${ROOT_REAL}/"* ]]; then
+    fail "FilesDude can't manage ${ROOT_PATH}: it holds or is inside ${sensitive}. Choose a data folder."
+  fi
+done
 
 if [[ -z ${SERVICE_ACCOUNT} ]]; then
   if [[ ${MODE} != "install" && -f ${UNIT_FILE} ]]; then
@@ -306,6 +317,9 @@ chmod -R g+rX "${RELEASE}"
 # permissions (FilesDude keeps its own accounts to their folders). Root is held to the same.
 CAPABILITY_LIST="CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_FSETID"
 
+# Paths in unit files: quoted, with backslashes, quotes, and systemd's % specifiers escaped.
+quote_unit() { local value="${1//\\/\\\\}"; value="${value//\"/\\\"}"; value="${value//%/%%}"; printf '"%s"' "${value}"; }
+
 # ZFS snapshots: over a folder on ZFS, the service gets /dev/zfs (bound into its otherwise private
 # /dev) and only the ZFS permissions snapshots need on that one dataset, delegated with zfs allow,
 # instead of the broad CAP_SYS_ADMIN capability.
@@ -316,21 +330,30 @@ if [[ -c /dev/zfs ]] && command -v zfs >/dev/null 2>&1; then
     say "Allowing ZFS snapshots of ${ZFS_DATASET}"
     zfs allow -u "${SERVICE_ACCOUNT}" snapshot,destroy,mount "${ZFS_DATASET}"
     ZFS_UNIT=$'BindPaths=/dev/zfs\nDeviceAllow=/dev/zfs rw'
+    # Snapshots are read from the dataset's .zfs folder, which a folder below its mountpoint doesn't
+    # include: it is shown too (read-only; FilesDude keeps to its folder inside each snapshot).
+    ZFS_MOUNTPOINT="$(zfs get -H -o value mountpoint "${ZFS_DATASET}" 2>/dev/null || true)"
+    if [[ ${ZFS_MOUNTPOINT} == /* && ${ZFS_MOUNTPOINT} != "${ROOT_REAL}" && -d ${ZFS_MOUNTPOINT}/.zfs/snapshot ]]; then
+      ZFS_UNIT+=$'\n'"BindReadOnlyPaths=$(quote_unit "-${ZFS_MOUNTPOINT}/.zfs/snapshot")"
+    fi
   fi
 fi
-
-quote_unit() { local value="${1//\\/\\\\}"; value="${value//\"/\\\"}"; printf '"%s"' "${value}"; }
 ROOT_UNIT="$(quote_unit "${ROOT_PATH}")"
 STATE_UNIT="$(quote_unit "${STATE_DIR}")"
 
 # What FilesDude can see of the host: the system's programs and libraries, its own release, its
-# folder, and its state. Everything else, the host's secrets (Proxmox's cluster configuration and
-# keys, SSH host keys, password hashes), other storage, logs, and the sockets in /run (which its
-# capabilities would otherwise let it use), is hidden or replaced with an empty folder.
+# folder, its state, and the few files in /etc it needs (accounts and groups, name resolution, time
+# zone, certificates). Everything else is replaced with an empty folder or hidden: the rest of /etc
+# (Proxmox's cluster configuration and keys, SSH host keys, password hashes, any other service's
+# secrets), /var, other storage, kernel debugging, and the sockets in /run, which its capabilities
+# would otherwise let it use.
 top_of() { local rest="${1#/}"; printf '/%s' "${rest%%/*}"; }
-HIDDEN="-/etc/pve -/etc/ssh -/etc/shadow -/etc/shadow- -/etc/gshadow -/etc/gshadow- -/etc/sudoers -/etc/sudoers.d -/etc/wireguard -/etc/ssl/private -/etc/filesdude -/var/log -/var/backups -/var/spool -/var/mail -/var/cache -/boot -/lost+found"
-EMPTIED="/run:ro /opt:ro /var/lib:ro"
-SHOWN=""
+HIDDEN="-/boot -/lost+found -/sys/kernel/debug -/sys/kernel/security -/sys/firmware"
+EMPTIED="/etc:ro /run:ro /opt:ro /var:ro"
+ETC_SHOWN=""
+for file in passwd group hosts host.conf resolv.conf nsswitch.conf gai.conf services protocols localtime timezone ssl/certs ca-certificates ld.so.cache alternatives hostid zfs; do
+  ETC_SHOWN+=" -/etc/${file}"
+done
 for entry in /*; do
   name="${entry#/}"
   [[ -d ${entry} && ! -L ${entry} ]] || continue
@@ -345,12 +368,30 @@ for entry in /*; do
   fi
 done
 
+# Who may reach FilesDude's port: with addresses (or interfaces) set, only those (and this host)
+# can, so nobody else on the network signs in over plain HTTP. Kept in the environment file.
+if [[ ${ALLOW_FROM_REQUESTED} == "true" ]]; then
+  [[ ${ALLOW_FROM} == "any" ]] && ALLOW_FROM=""
+  set_env_value FILEDUDE_ALLOW_FROM "${ALLOW_FROM}"
+fi
+if [[ ${ALLOW_INTERFACES_REQUESTED} == "true" ]]; then
+  set_env_value FILEDUDE_ALLOW_INTERFACES "${ALLOW_INTERFACES}"
+fi
+ALLOW_FROM="$(env_value FILEDUDE_ALLOW_FROM)"
+ALLOW_INTERFACES="$(env_value FILEDUDE_ALLOW_INTERFACES)"
+# FilesDude doesn't start without its port filter, so a filter that fails leaves it closed, not open.
+FIREWALL_DEPENDENCY=""
+if [[ -n ${ALLOW_FROM} || -n ${ALLOW_INTERFACES} ]]; then
+  FIREWALL_DEPENDENCY=$'Requires=filesdude-firewall.service\nAfter=filesdude-firewall.service'
+fi
+
 say "Installing the systemd services"
 cat >"${UNIT_FILE}" <<EOF
 [Unit]
 Description=FilesDude secure web file manager
 After=network-online.target filesdude-sandbox.socket
 Wants=network-online.target filesdude-sandbox.socket
+${FIREWALL_DEPENDENCY}
 
 [Service]
 Type=simple
@@ -385,7 +426,7 @@ CapabilityBoundingSet=${CAPABILITY_LIST}
 AmbientCapabilities=${CAPABILITY_LIST}
 TemporaryFileSystem=${EMPTIED}
 InaccessiblePaths=${HIDDEN}
-BindReadOnlyPaths=${APP_HOME} -/run/filesdude-sandbox -/run/systemd/resolve
+BindReadOnlyPaths=${APP_HOME} -/run/filesdude-sandbox -/run/systemd/resolve${ETC_SHOWN}
 BindPaths=${ROOT_UNIT} ${STATE_UNIT}
 ReadWritePaths=${ROOT_UNIT} ${STATE_UNIT}
 ${ZFS_UNIT}
@@ -427,7 +468,7 @@ After=filesdude-sandbox.socket
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 ${APP_HOME}/current/scripts/sandbox-helper.py
+ExecStart=/usr/bin/python3 -I ${APP_HOME}/current/scripts/sandbox-helper.py
 Environment=$(quote_unit "FILEDUDE_ROOT=${ROOT_PATH}")
 Environment=$(quote_unit "FILEDUDE_STATE_DIR=${STATE_DIR}")
 Environment=FILEDUDE_SANDBOX_USER=${SERVICE_ACCOUNT}
@@ -477,17 +518,6 @@ exec /opt/filesdude/current/install.sh --update "$@"
 EOF
 chmod 755 /usr/local/sbin/filesdude-update
 
-# Who may reach FilesDude's port: with addresses (or interfaces) set, only those (and this host)
-# can, so nobody else on the network signs in over plain HTTP. Kept in the environment file.
-if [[ ${ALLOW_FROM_REQUESTED} == "true" ]]; then
-  [[ ${ALLOW_FROM} == "any" ]] && ALLOW_FROM=""
-  set_env_value FILEDUDE_ALLOW_FROM "${ALLOW_FROM}"
-fi
-if [[ ${ALLOW_INTERFACES_REQUESTED} == "true" ]]; then
-  set_env_value FILEDUDE_ALLOW_INTERFACES "${ALLOW_INTERFACES}"
-fi
-ALLOW_FROM="$(env_value FILEDUDE_ALLOW_FROM)"
-ALLOW_INTERFACES="$(env_value FILEDUDE_ALLOW_INTERFACES)"
 FIREWALL_FILE="${CONFIG_DIR}/firewall.nft"
 FIREWALL_UNIT="/etc/systemd/system/filesdude-firewall.service"
 if [[ -n ${ALLOW_FROM} || -n ${ALLOW_INTERFACES} ]]; then
@@ -549,15 +579,24 @@ if [[ -f ${FIREWALL_UNIT} ]]; then
   systemctl restart filesdude-firewall.service
 fi
 
-# FilesDude's own files belong to its account: its state, and its folders in the managed folder
-# (only those: the trash's items keep their owners).
+# FilesDude's own files belong to its account: its state, and, when switching between root and its
+# own account, its folders in the managed folder. Only folders the previous account owned that nobody
+# else can write to are handed over (other users may write to the managed folder); the trash's items
+# keep their owners.
 systemctl stop filesdude.service filesdude-sandbox.service 2>/dev/null || true
 find "${STATE_DIR}" -xdev ! -user "${SERVICE_ACCOUNT}" -exec chown -h "${SERVICE_ACCOUNT}:${SERVICE_GROUP}" {} +
-for internal in "${ROOT_PATH}/.filedude" "${ROOT_PATH}/.filedude/trash" "${ROOT_PATH}/.filedude/trash-info"; do
-  if [[ -d ${internal} && ! -L ${internal} ]]; then chown -h "${SERVICE_ACCOUNT}:${SERVICE_GROUP}" "${internal}"; fi
-done
-if [[ -d ${ROOT_PATH}/.filedude/trash-info && ! -L ${ROOT_PATH}/.filedude/trash-info ]]; then
-  find "${ROOT_PATH}/.filedude/trash-info" -mindepth 1 -maxdepth 1 -type f -exec chown -h "${SERVICE_ACCOUNT}:${SERVICE_GROUP}" {} +
+PREVIOUS_ACCOUNT="filesdude"
+[[ ${SERVICE_ACCOUNT} == "filesdude" ]] && PREVIOUS_ACCOUNT="root"
+if id "${PREVIOUS_ACCOUNT}" >/dev/null 2>&1; then
+  for internal in "${ROOT_PATH}/.filedude" "${ROOT_PATH}/.filedude/trash" "${ROOT_PATH}/.filedude/trash-info"; do
+    if [[ -n $(find "${internal}" -maxdepth 0 -type d -user "${PREVIOUS_ACCOUNT}" ! -perm /022 2>/dev/null) ]]; then
+      chown -h "${SERVICE_ACCOUNT}:${SERVICE_GROUP}" "${internal}"
+    fi
+  done
+  INFO="${ROOT_PATH}/.filedude/trash-info"
+  if [[ -n $(find "${INFO}" -maxdepth 0 -type d -user "${SERVICE_ACCOUNT}" ! -perm /022 2>/dev/null) ]]; then
+    find "${INFO}" -mindepth 1 -maxdepth 1 -type f -user "${PREVIOUS_ACCOUNT}" -exec chown -h "${SERVICE_ACCOUNT}:${SERVICE_GROUP}" {} +
+  fi
 fi
 
 systemctl enable --now filesdude-sandbox.socket >/dev/null

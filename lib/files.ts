@@ -958,15 +958,24 @@ function entryType(stat: { isDirectory(): boolean; isSymbolicLink(): boolean }):
   return stat.isDirectory() ? "directory" : stat.isSymbolicLink() ? "symlink" : "file";
 }
 
+// Trash folders are FilesDude's own, and nobody else may write to them (other users may write to the root).
+function privateToService(stat: { uid: number; mode: number }) {
+  return (typeof process.getuid !== "function" || stat.uid === process.getuid()) && (stat.mode & 0o022) === 0;
+}
+
 async function trashDirectories(create: true): Promise<TrashDirectories>;
 async function trashDirectories(create?: boolean): Promise<TrashDirectories | null>;
 async function trashDirectories(create = false) {
   const internal = path.join(await ensureRoot(), ".filedude");
   const directories = { items: path.join(internal, "trash"), info: path.join(internal, "trash-info") };
+  const parent = await fs.lstat(internal).catch(() => null);
+  if (parent && (!parent.isDirectory() || !privateToService(parent))) {
+    throw new AppError("FilesDude's trash folder is not a regular folder inside the root", 500, "TRASH_UNSAFE");
+  }
   for (const directory of Object.values(directories)) {
     if (create) await fs.mkdir(directory, { recursive: true, mode: 0o700 });
     try {
-      if ((await fs.realpath(directory)) !== directory) {
+      if ((await fs.realpath(directory)) !== directory || !privateToService(await fs.lstat(directory))) {
         throw new AppError("FilesDude's trash folder is not a regular folder inside the root", 500, "TRASH_UNSAFE");
       }
     } catch (error) {
@@ -1239,7 +1248,7 @@ async function openVerifiedTrashFolder(location: string) {
   const folder = await openTrashFolder(location);
   try {
     const opened = await openedHandlePath(folder.handle, location);
-    if (opened !== location || (typeof process.getuid === "function" && folder.stat.uid !== process.getuid())) {
+    if (opened !== location || !privateToService(folder.stat)) {
       throw new AppError("FilesDude's trash folder is not a regular folder inside the root", 500, "TRASH_UNSAFE");
     }
     return folder;
@@ -1680,7 +1689,8 @@ export async function recoverInterruptedCopies() {
         const stat = await fs.lstat(inside(directory, entry.name), { bigint: true }).catch(missingAsNull);
         if (!stat || `${stat.dev}:${stat.ino}` !== entry.identity) return;
         if (entry.birth !== undefined && String(stat.birthtimeNs) !== entry.birth) return;
-        if (typeof process.getuid === "function" && stat.uid !== BigInt(process.getuid())) return;
+        // Its own, or (from before FilesDude ran as its own account) root's.
+        if (typeof process.getuid === "function" && stat.uid !== BigInt(process.getuid()) && stat.uid !== BigInt(0)) return;
         const mode = Number(stat.mode & BigInt(0o7777));
         if (stat.isDirectory() ? mode !== 0o700 : stat.isFile() ? mode !== 0o600 : !stat.isSymbolicLink()) return;
         await removeCreated(directory, entry.name, entry.identity);

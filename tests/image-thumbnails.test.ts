@@ -128,7 +128,7 @@ test("with privileges, images are only ever decoded in the sandbox", () => {
   assert.equal(decodingMode({ sandbox: false, privileged: false }), "process");
 });
 
-const unitArguments = (request: object, env: Record<string, string> = {}) => JSON.parse(execFileSync("python3", [HELPER, "--print-args", JSON.stringify(request)], { env: { ...helperEnvironment(), ...env } }).toString()) as string[];
+const unitArguments = (request: object, env: Record<string, string> = {}) => JSON.parse(execFileSync("python3", ["-I", HELPER, "--print-args", JSON.stringify(request)], { env: { ...helperEnvironment(), ...env } }).toString()) as string[];
 
 test("the sandbox shows Node.js and its packages read-only, and keeps hiding everything else", () => {
   const args = unitArguments({ tool: "node", args: ["-e", "code"], inspectSockets: true }, { FILEDUDE_SANDBOX_NODE: "/opt/node/bin/node", FILEDUDE_SANDBOX_MODULES: "/opt/my app/node_modules" });
@@ -145,7 +145,7 @@ test("the sandbox shows Node.js and its packages read-only, and keeps hiding eve
 });
 
 test("the sandbox helper only runs its own three tools, with plain arguments", () => {
-  const refused = (request: unknown) => assert.throws(() => execFileSync("python3", [HELPER, "--print-args", JSON.stringify(request)], { stdio: "ignore", env: helperEnvironment() }), JSON.stringify(request));
+  const refused = (request: unknown) => assert.throws(() => execFileSync("python3", ["-I", HELPER, "--print-args", JSON.stringify(request)], { stdio: "ignore", env: helperEnvironment() }), JSON.stringify(request));
   refused({ tool: "/bin/sh", args: [] });
   refused({ tool: "python", args: [] });
   refused({ tool: "ffmpeg", args: "-version" });
@@ -287,7 +287,7 @@ test("the sandbox helper stops a run when FilesDude gives up on it, and serves n
   let output = "";
   let failed = false;
   try {
-    output = execFileSync("setpriv", ["--reuid=65534", "--regid=65534", "--clear-groups", "/usr/bin/python3", client, request], { input: "", env: environment({ FILEDUDE_SANDBOX_SOCKET: socket }) }).toString();
+    output = execFileSync("setpriv", ["--reuid=65534", "--regid=65534", "--clear-groups", "/usr/bin/python3", "-I", client, request], { input: "", env: environment({ FILEDUDE_SANDBOX_SOCKET: socket }) }).toString();
   } catch {
     failed = true;
   } finally {

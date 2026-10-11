@@ -120,7 +120,7 @@ test("one video is worked on at a time, and videos never hold up images", async 
 
 test("the sandbox hides every top-level folder except the system's own, and FilesDude's folders", () => {
   const env = { ...helperEnvironment(), FILEDUDE_ROOT: "/srv/my files", FILEDUDE_STATE_DIR: "/opt/state" };
-  const args = JSON.parse(execFileSync("python3", [HELPER, "--print-args", JSON.stringify({ tool: "ffmpeg", args: [] })], { env }).toString()) as string[];
+  const args = JSON.parse(execFileSync("python3", ["-I", HELPER, "--print-args", JSON.stringify({ tool: "ffmpeg", args: [] })], { env }).toString()) as string[];
   const hidden = args.find((arg) => arg.startsWith("InaccessiblePaths="))!;
   const kept = new Set(["usr", "bin", "sbin", "lib", "lib32", "lib64", "libx32", "proc", "dev", "tmp", "etc", "run"]);
   const expected = readdirSync("/", { withFileTypes: true }).filter((entry) => !entry.isSymbolicLink() && !kept.has(entry.name)).map((entry) => `-/${entry.name}`).sort();

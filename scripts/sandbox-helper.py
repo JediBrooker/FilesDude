@@ -19,6 +19,7 @@ Run by filesdude-sandbox.service (socket-activated), or with --socket PATH (test
 """
 
 import json
+import math
 import os
 import pwd
 import select
@@ -41,6 +42,10 @@ MAX_FILE_SECONDS = 4 * 60 * 60
 MAX_REQUEST_BYTES = 1024 * 1024
 MAX_ARGS = 256
 MAX_RUNNING = 16
+# Connections beyond this are closed straight away, so nothing can make the helper run out of threads.
+MAX_CONNECTIONS = 48
+# A request waits this long for one of the running slots before it's turned away.
+SLOT_WAIT_SECONDS = 60
 
 SANDBOX = [
     "DynamicUser=yes", "PrivateNetwork=yes", "PrivateTmp=yes", "PrivateDevices=yes", "PrivateIPC=yes",
@@ -113,7 +118,7 @@ def checked(request):
     if file_output is not None and (not isinstance(file_output, int) or isinstance(file_output, bool) or file_output < 1 or file_output > 2 ** 40):
         raise ValueError("invalid output limit")
     seconds = request.get("seconds", DEFAULT_SECONDS)
-    if not isinstance(seconds, (int, float)) or isinstance(seconds, bool) or seconds != seconds:
+    if not isinstance(seconds, (int, float)) or isinstance(seconds, bool) or not math.isfinite(seconds):
         seconds = DEFAULT_SECONDS
     seconds = min(max(1, round(seconds)), MAX_FILE_SECONDS if file_output is not None else MAX_SECONDS)
     inspect = request.get("inspectSockets") is True
@@ -134,7 +139,8 @@ def unit_arguments(request, unit):
     bound = os.environ.get("FILEDUDE_SANDBOX_BIND", "filesdude.service")
     if bound:
         properties.append("BindsTo=" + bound)
-    properties.append("RuntimeMaxSec=%d" % seconds)
+    # Stopping a run doesn't wait long for it.
+    properties += ["RuntimeMaxSec=%d" % seconds, "TimeoutStopSec=5"]
     # Long runs read whole videos; they yield the disk to everything else.
     if seconds > DEFAULT_SECONDS:
         properties += ["IOWeight=10", "CPUWeight=20"]
@@ -166,8 +172,31 @@ def reply(connection, code):
         pass
 
 
-def stop_unit(unit):
-    subprocess.run([SYSTEMCTL, "stop", unit], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=False)
+def systemctl(*args):
+    try:
+        return subprocess.run([SYSTEMCTL, *args], capture_output=True, text=True, timeout=30, check=False).stdout
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+
+
+def unit_gone(unit):
+    state = systemctl("show", "-p", "LoadState", "-p", "ActiveState", unit)
+    return "LoadState=not-found" in state or "ActiveState=inactive" in state or "ActiveState=failed" in state
+
+
+def stop_unit(unit, process):
+    """Stops a run for good: its unit may only be created after systemd-run is stopped, so the unit is
+    stopped until it has stayed gone for a moment."""
+    systemctl("stop", unit)
+    process.kill()
+    process.wait()
+    gone_for = 0
+    for _ in range(100):
+        systemctl("stop", unit)
+        gone_for = gone_for + 1 if unit_gone(unit) else 0
+        if gone_for >= 3:
+            return
+        time.sleep(0.3)
 
 
 def run(request, files, connection):
@@ -183,18 +212,27 @@ def run(request, files, connection):
     stopped = False
     while process.poll() is None:
         readable, _, _ = select.select([connection], [], [], 0.5)
-        # The client sends nothing more, so anything readable means it has gone.
-        gone = bool(readable) and not connection.recv(1, socket.MSG_PEEK)
-        if gone or time.monotonic() > deadline:
+        # The client sends nothing more, so anything readable means it has gone (or broke the protocol).
+        if readable or time.monotonic() > deadline:
             stopped = True
-            stop_unit(unit)
-            process.kill()
-            process.wait()
+            stop_unit(unit, process)
             break
     return 124 if stopped else process.returncode
 
 
-def serve(connection, allowed, slots):
+def wait_for_slot(slots, connection):
+    """Waits for a running slot, giving up when the client goes away or after a while."""
+    deadline = time.monotonic() + SLOT_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        if slots.acquire(timeout=0.5):
+            return True
+        readable, _, _ = select.select([connection], [], [], 0)
+        if readable:
+            return False
+    return False
+
+
+def serve(connection, allowed, slots, connections):
     files = []
     try:
         _, uid, _ = struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
@@ -210,7 +248,7 @@ def serve(connection, allowed, slots):
             return
         request = checked(json.loads(receive_exactly(connection, length)))
         connection.settimeout(None)
-        if not slots.acquire(blocking=False):
+        if not wait_for_slot(slots, connection):
             reply(connection, 75)
             return
         try:
@@ -218,8 +256,10 @@ def serve(connection, allowed, slots):
             reply(connection, run(request, handed, connection))
         finally:
             slots.release()
-    except (ValueError, ConnectionError, OSError, json.JSONDecodeError):
+    except (ValueError, ConnectionError, OSError, OverflowError, json.JSONDecodeError):
         reply(connection, 64)
+    except Exception:  # noqa: BLE001 - one bad request must never take the helper down
+        reply(connection, 70)
     finally:
         for descriptor in files:
             try:
@@ -227,6 +267,7 @@ def serve(connection, allowed, slots):
             except OSError:
                 pass
         connection.close()
+        connections.release()
 
 
 def allowed_accounts():
@@ -256,9 +297,21 @@ def main():
         sys.exit("usage: sandbox-helper.py --socket PATH | --print-args REQUEST (or socket activation)")
     allowed = allowed_accounts()
     slots = threading.BoundedSemaphore(MAX_RUNNING)
+    connections = threading.BoundedSemaphore(MAX_CONNECTIONS)
     while True:
-        connection, _ = server.accept()
-        threading.Thread(target=serve, args=(connection, allowed, slots), daemon=True).start()
+        try:
+            connection, _ = server.accept()
+        except OSError:
+            time.sleep(0.1)
+            continue
+        if not connections.acquire(blocking=False):
+            connection.close()
+            continue
+        try:
+            threading.Thread(target=serve, args=(connection, allowed, slots, connections), daemon=True).start()
+        except RuntimeError:
+            connection.close()
+            connections.release()
 
 
 if __name__ == "__main__":

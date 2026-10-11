@@ -196,7 +196,7 @@ test("pieces left by an earlier FilesDude are removed", async () => {
   }, { "h264-aac": { video: "h264", audio: "aac" } });
 });
 
-const unitArguments = (request: object, env: Record<string, string> = {}) => JSON.parse(execFileSync("python3", [HELPER, "--print-args", JSON.stringify(request)], { env: { ...helperEnvironment(), ...env } }).toString()) as string[];
+const unitArguments = (request: object, env: Record<string, string> = {}) => JSON.parse(execFileSync("python3", ["-I", HELPER, "--print-args", JSON.stringify(request)], { env: { ...helperEnvironment(), ...env } }).toString()) as string[];
 
 test("runs that write a file can't grow it past its limit or reserve space, and stop with FilesDude", () => {
   const args = unitArguments({ tool: "ffmpeg", args: [], seconds: 9000, fileOutput: 1000 }, { FILEDUDE_SANDBOX_BIND: "filesdude.service" });
@@ -206,7 +206,7 @@ test("runs that write a file can't grow it past its limit or reserve space, and 
   // Only a run writing a file may last longer than ten minutes.
   assert.ok(plain.includes("RuntimeMaxSec=600"));
   // A fractional limit isn't one.
-  assert.throws(() => execFileSync("python3", [HELPER, "--print-args", JSON.stringify({ tool: "ffmpeg", args: [], fileOutput: 1000.5 })], { stdio: "ignore" }));
+  assert.throws(() => execFileSync("python3", ["-I", HELPER, "--print-args", JSON.stringify({ tool: "ffmpeg", args: [], fileOutput: 1000.5 })], { stdio: "ignore" }));
 });
 
 const realSandbox = sandboxHost && existsSync("/usr/bin/ffmpeg") && existsSync("/usr/bin/ffprobe");

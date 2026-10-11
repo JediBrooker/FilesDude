@@ -57,6 +57,7 @@ export interface SandboxOptions {
 /** Disk space a file takes up, which a file with space reserved past its end can exceed its size by. */
 export const diskUsage = (stat: { size: number; blocks: number }) => Math.max(stat.size, stat.blocks * 512);
 
+// Isolated mode: Python reads no environment and no user site folder (which FilesDude could write).
 const PYTHON = "/usr/bin/python3";
 const socketPath = () => process.env.FILEDUDE_SANDBOX_SOCKET || "/run/filesdude-sandbox/sandbox.sock";
 const clientPath = () => process.env.FILEDUDE_SANDBOX_CLIENT || path.join(process.cwd(), "scripts", "sandbox-client.py");
@@ -101,7 +102,7 @@ export async function sandboxRunner(tool: SandboxTool, options: SandboxOptions =
     const limit = Number.isFinite(seconds) ? Math.min(Math.max(1, Math.round(seconds)), MAX_SECONDS) : DEFAULT_SECONDS;
     const request = JSON.stringify({ tool, args, seconds: limit, inspectSockets: Boolean(options.inspectSockets) });
     // The time limit has a backstop in case systemd's own limit doesn't stop it.
-    const start = (stdin: number | Buffer) => runProgram(PYTHON, [clientPath(), request], stdin, maxBytes, (limit + 15) * 1000, { signal, env: clientEnvironment() });
+    const start = (stdin: number | Buffer) => runProgram(PYTHON, ["-I", clientPath(), request], stdin, maxBytes, (limit + 15) * 1000, { signal, env: clientEnvironment() });
     return Buffer.isBuffer(input) ? start(input) : freshOpening(input, start, null);
   };
 }
@@ -125,7 +126,7 @@ export async function sandboxFileRunner(tool: SandboxTool): Promise<SandboxFileR
     const request = JSON.stringify({ tool, args, seconds: limit, fileOutput: Math.max(1, Math.floor(maxBytes)) });
     return freshOpening(input, (source) => new Promise<boolean>((resolve) => {
       const stdio: StdioOptions = [source, output, "ignore"];
-      const child: ChildProcess = spawn(PYTHON, [clientPath(), request], { stdio, env: clientEnvironment() as NodeJS.ProcessEnv });
+      const child: ChildProcess = spawn(PYTHON, ["-I", clientPath(), request], { stdio, env: clientEnvironment() as NodeJS.ProcessEnv });
       let stopped = false;
       const stop = () => {
         if (stopped) return;

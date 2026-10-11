@@ -28,7 +28,7 @@ export function helperEnvironment(extra: Record<string, string> = {}) {
 export async function startSandboxHelper(extra: Record<string, string> = {}) {
   const folder = await fs.mkdtemp(path.join(os.tmpdir(), "filesdude-helper-"));
   const socket = path.join(folder, "sandbox.sock");
-  const child: ChildProcess = spawn("/usr/bin/python3", [HELPER, "--socket", socket], { stdio: ["ignore", "ignore", "inherit"], env: helperEnvironment(extra) });
+  const child: ChildProcess = spawn("/usr/bin/python3", ["-I", HELPER, "--socket", socket], { stdio: ["ignore", "ignore", "inherit"], env: helperEnvironment(extra) });
   for (let tries = 0; tries < 100 && !existsSync(socket); tries += 1) await new Promise((resolve) => setTimeout(resolve, 50));
   if (!existsSync(socket)) throw new Error("The sandbox helper didn't start");
   return {
