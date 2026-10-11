@@ -65,6 +65,8 @@ import {
   Play,
   Plus,
   RefreshCw,
+  Route,
+  Waypoints,
   GitCompareArrows,
   History,
   RotateCcw,
@@ -142,6 +144,9 @@ type DialogState =
   | { kind: "copyToServer" }
   | { kind: "new" }
   | { kind: "rename"; entry: FileEntry }
+  // Making a link to an item, and pointing a link somewhere else.
+  | { kind: "link"; entry: FileEntry }
+  | { kind: "relink"; entry: FileEntry }
   | { kind: "delete" }
   | { kind: "permissions" }
   | { kind: "ownership" }
@@ -174,7 +179,7 @@ type SnapshotEntry = { name: string; path: string; type: "file" | "directory" | 
 type SnapshotVersion = { snapshot: string; snapshotCreatedAt: string; type: SnapshotEntry["type"]; size: number; modified: string };
 const SNAPSHOT_KIND_LABELS: Record<SnapshotInfo["kind"], string> = { auto: "Scheduled", manual: "Manual", other: "Other" };
 
-type EntryAction = "versions" | "open" | "edit" | "download" | "favorite" | "openOther" | "openTab" | "rename" | "cut" | "clipboard" | "paste" | "copy" | "move" | "compress" | "extract" | "share" | "permissions" | "ownership" | "details" | "delete";
+type EntryAction = "versions" | "open" | "edit" | "download" | "favorite" | "openOther" | "openTab" | "link" | "relink" | "rename" | "cut" | "clipboard" | "paste" | "copy" | "move" | "compress" | "extract" | "share" | "permissions" | "ownership" | "details" | "delete";
 type FavoriteLocation = { path: string; name: string; createdAt: string };
 type SelectOptions = { additive?: boolean; range?: boolean };
 type MenuPosition = { top: number; left: number };
@@ -1674,6 +1679,10 @@ export function FileManager() {
       case "rename":
         setDialog({ kind: "rename", entry });
         break;
+      case "link":
+      case "relink":
+        setDialog({ kind: action, entry });
+        break;
       case "cut":
       case "clipboard":
         clip(action === "cut" ? "cut" : "copy", targets.map((item) => item.path));
@@ -2839,6 +2848,8 @@ function FileActionMenu({ entry, targets, position, menuRef, favoritePaths, canW
       {multiple && <div className="file-menu-section">{item("download", "Download as ZIP", <Download size={16} />)}</div>}
       <div className="file-menu-section">
         {canWrite && !multiple && item("rename", "Rename", <Pencil size={16} />)}
+        {canWrite && !multiple && (entry.type === "file" || entry.type === "directory") && item("link", "Make link…", <Waypoints size={16} />)}
+        {canWrite && !multiple && entry.type === "symlink" && item("relink", "Edit link target…", <Route size={16} />)}
         {!multiple && entry.type === "directory" && item("favorite", favoritePaths.has(entry.path) ? "Remove from favourites" : "Add to favourites", <Star size={16} fill={favoritePaths.has(entry.path) ? "currentColor" : "none"} />)}
         {!multiple && entry.type === "directory" && item("openTab", "Open in new tab", <AppWindow size={16} />)}
         {!multiple && entry.type === "directory" && item("openOther", "Open in split view", <Columns2 size={16} />)}
@@ -3057,6 +3068,8 @@ function DialogHost({ dialog, selected, currentPath, username, role, home, onClo
   if (dialog.kind === "activity") return <ActivityDialog owner={username} onClose={onClose} />;
   if (dialog.kind === "new") return <NewDialog path={currentPath} onClose={onClose} onRun={onRun} />;
   if (dialog.kind === "rename") return <RenameDialog entry={dialog.entry} onClose={onClose} onRun={onRun} />;
+  if (dialog.kind === "link") return <LinkDialog entry={dialog.entry} home={home} onClose={onClose} onRun={onRun} />;
+  if (dialog.kind === "relink") return <RelinkDialog entry={dialog.entry} home={home} onClose={onClose} onRun={onRun} />;
   if (dialog.kind === "delete") return <DeleteDialog entries={selected} onClose={onClose} onRun={onRun} />;
   if (dialog.kind === "permissions") return <PermissionsDialog entries={selected} onClose={onClose} onRun={onRun} />;
   if (dialog.kind === "ownership") return <OwnershipDialog entries={selected} onClose={onClose} onRun={onRun} />;
@@ -4209,6 +4222,84 @@ function RenameDialog({ entry, onClose, onRun }: { entry: FileEntry; onClose: ()
   const [busy, setBusy] = useState(false);
   const submit = async (event: FormEvent) => { event.preventDefault(); setBusy(true); await onRun({ action: "rename", path: entry.path, name }, "Item renamed"); setBusy(false); };
   return <Modal title="Rename item" subtitle={`Choose a new name for ${entry.name}`} icon={<Pencil size={18} />} onClose={onClose}><form onSubmit={submit}><FormField label="New name"><input autoFocus value={name} onFocus={(event) => { const index = name.lastIndexOf("."); event.currentTarget.setSelectionRange(0, index > 0 ? index : name.length); }} onChange={(event) => setName(event.target.value)} required /></FormField><ModalActions onClose={onClose} submitLabel="Rename" busy={busy} /></form></Modal>;
+}
+
+// The name a link gets beside its item: "photo link.jpg", "Photos link".
+function linkNameFor(entry: FileEntry) {
+  const dot = entry.type === "file" ? entry.name.lastIndexOf(".") : -1;
+  return dot > 0 ? `${entry.name.slice(0, dot)} link${entry.name.slice(dot)}` : `${entry.name} link`;
+}
+
+function LinkDialog({ entry, home, onClose, onRun }: { entry: FileEntry; home: string; onClose: () => void; onRun: (body: Record<string, unknown>, success: string) => Promise<boolean> }) {
+  const parent = parentOf(entry.path);
+  const [kind, setKind] = useState<"symbolic" | "hard">("symbolic");
+  const [destination, setDestination] = useState(parent);
+  // Until it's changed by hand, the name follows the folder: the item's own name elsewhere.
+  const [typed, setTyped] = useState<string | null>(null);
+  const name = typed ?? (destination === parent ? linkNameFor(entry) : entry.name);
+  const [busy, setBusy] = useState(false);
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    setBusy(true);
+    await onRun({ action: "link", path: entry.path, destination, name, kind }, kind === "symbolic" ? `Link to ${entry.name} made` : `Hard link to ${entry.name} made`);
+    setBusy(false);
+  };
+  const option = (value: "symbolic" | "hard", title: string, detail: string, disabled = false) => (
+    <label className={`ownership-option ${kind === value ? "active" : ""} ${disabled ? "disabled" : ""}`}><input type="radio" name="link-kind" value={value} checked={kind === value} disabled={disabled} onChange={() => setKind(value)} /><span className="ownership-radio" /><span><strong>{title}</strong><small>{detail}</small></span></label>
+  );
+  return (
+    <Modal title="Make a link" subtitle={`A link to ${entry.name}`} icon={<Waypoints size={19} />} onClose={onClose}>
+      <form onSubmit={submit}>
+        <div className="ownership-options">
+          {option("symbolic", "Symbolic link", "Points to the item where it is now. Works for files and folders; stops working if the item is moved or renamed without it.")}
+          {option("hard", "Hard link", entry.type === "file" ? "Another name for the same file, on the same disk: both stay until the last is deleted, and changes show in both." : "Only for files.", entry.type !== "file")}
+        </div>
+        <FormField label="Name"><input value={name} onChange={(event) => setTyped(event.target.value)} /></FormField>
+        <FormField label="Put it in" hint="Leave empty to use the root folder">
+          <div className="path-input"><span>/</span><input value={destination} onChange={(event) => setDestination(event.target.value.replace(/^\/+/, ""))} placeholder="media/links" /></div>
+        </FormField>
+        <FolderPicker value={destination} onChange={setDestination} home={home} />
+        <ModalActions onClose={onClose} submitLabel="Make link" busy={busy} disabled={!name.trim()} />
+      </form>
+    </Modal>
+  );
+}
+
+// Where a link points, as a path from the top of the files (when it points inside them).
+function linkDestination(entry: FileEntry) {
+  const target = entry.symlinkTarget;
+  if (!target || target.startsWith("/")) return "";
+  const parts: string[] = parentOf(entry.path) ? parentOf(entry.path).split("/") : [];
+  for (const part of target.split("/")) {
+    if (part === "..") {
+      if (!parts.length) return "";
+      parts.pop();
+    } else if (part && part !== ".") parts.push(part);
+  }
+  return parts.join("/");
+}
+
+function RelinkDialog({ entry, home, onClose, onRun }: { entry: FileEntry; home: string; onClose: () => void; onRun: (body: Record<string, unknown>, success: string) => Promise<boolean> }) {
+  const [target, setTarget] = useState(() => linkDestination(entry));
+  const [busy, setBusy] = useState(false);
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    setBusy(true);
+    await onRun({ action: "relink", path: entry.path, target }, "Link updated");
+    setBusy(false);
+  };
+  return (
+    <Modal title="Edit link target" subtitle={`Where ${entry.name} points`} icon={<Route size={19} />} onClose={onClose}>
+      <form onSubmit={submit}>
+        <div className="info-box"><Info size={17} /> It points to <code>{visibleText(entry.symlinkTarget ?? "")}</code>{entry.symlinkBlocked ? ", which is outside the files FilesDude manages." : "."}</div>
+        <FormField label="Point it to" hint="A file or folder inside your files; browse to a folder below, then add a file's name if it's a file">
+          <div className="path-input"><span>/</span><input autoFocus value={target} onChange={(event) => setTarget(event.target.value.replace(/^\/+/, ""))} placeholder="media/film.mkv" /></div>
+        </FormField>
+        <FolderPicker value={target} onChange={setTarget} home={home} />
+        <ModalActions onClose={onClose} submitLabel="Save" busy={busy} disabled={!target.trim()} />
+      </form>
+    </Modal>
+  );
 }
 
 function DeleteDialog({ entries, onClose, onRun }: { entries: FileEntry[]; onClose: () => void; onRun: (body: Record<string, unknown>, success: string) => Promise<boolean> }) {

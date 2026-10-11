@@ -7,12 +7,14 @@ import {
   changeMode,
   changeOwner,
   createEntry,
+  createLink,
   deleteEntries,
   details,
   listDirectory,
   listFolders,
   previewBulkRename,
   renameEntry,
+  retargetLink,
   withFilesystemLock,
   writeTextFile,
 } from "@/lib/files";
@@ -92,6 +94,9 @@ type ActionBody = {
   rule?: BulkRenameRule;
   apply?: boolean;
   content?: string;
+  /** For making a link: what kind, and (to point a link elsewhere) what at. */
+  kind?: "symbolic" | "hard";
+  target?: string;
 };
 
 export async function POST(request: Request) {
@@ -105,6 +110,8 @@ export async function POST(request: Request) {
     if (body.path !== undefined && (typeof body.path !== "string" || body.path.length > 4096)) throw new AppError("Path is invalid", 400, "INVALID_PATH");
     if (body.destination !== undefined && (typeof body.destination !== "string" || body.destination.length > 4096)) throw new AppError("Destination is invalid", 400, "INVALID_PATH");
     if (body.name !== undefined && (typeof body.name !== "string" || Buffer.byteLength(body.name, "utf8") > 255)) throw new AppError("Name is invalid", 400, "INVALID_NAME");
+    if (body.target !== undefined && (typeof body.target !== "string" || body.target.length > 4096)) throw new AppError("Link target is invalid", 400, "INVALID_PATH");
+    if (body.kind !== undefined && body.kind !== "symbolic" && body.kind !== "hard") throw new AppError("Choose a symbolic or hard link", 400, "INVALID_REQUEST");
     for (const flag of ["permanent", "requireTrash", "apply"] as const) {
       if (body[flag] !== undefined && typeof body[flag] !== "boolean") throw new AppError("Request body is invalid", 400, "INVALID_REQUEST");
     }
@@ -166,6 +173,14 @@ export async function POST(request: Request) {
         if (!body.path || typeof body.content !== "string") throw new AppError("Path and text content are required");
         operationResult = await writeTextFile(body.path, body.content);
         break;
+      case "link":
+        if (!body.path || !body.name || !body.kind) throw new AppError("The item, a name, and the kind of link are required");
+        operationResult = await createLink(body.path, body.destination ?? "", body.name, body.kind);
+        break;
+      case "relink":
+        if (!body.path || body.target === undefined) throw new AppError("The link and where it should point are required");
+        operationResult = await retargetLink(body.path, body.target);
+        break;
       default:
         throw new AppError("Unknown file operation", 400, "UNKNOWN_ACTION");
       }
@@ -180,7 +195,10 @@ export async function POST(request: Request) {
       path: action === "delete" || action === "chmod" || action === "chown" || action === "bulkRename" ? undefined : body.path,
       paths: action === "delete" || action === "chmod" || action === "chown" || action === "bulkRename" ? paths : undefined,
       permanent: action === "delete" ? Boolean(body.permanent) : undefined,
-      name: action === "create" || action === "rename" ? body.name : undefined,
+      name: action === "create" || action === "rename" || action === "link" ? body.name : undefined,
+      destination: action === "link" ? body.destination ?? "" : undefined,
+      kind: action === "link" ? body.kind : undefined,
+      target: action === "relink" ? body.target : undefined,
       mode: action === "chmod" ? String(body.mode) : undefined,
       uid: action === "chown" ? Number(body.uid) : undefined,
       gid: action === "chown" ? Number(body.gid) : undefined,
