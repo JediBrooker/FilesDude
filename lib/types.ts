@@ -189,10 +189,24 @@ export interface ArchiveResult {
   skipped: number;
 }
 
+/** What changing permissions or ownership found (and, applied, did). */
+export interface AccessReport {
+  files: number;
+  folders: number;
+  /** Items whose permissions or ownership differ from what was asked for. */
+  changing: number;
+  /** Items changed (when applied). */
+  changed: number;
+  /** Links, special files, FilesDude's own folders, and items that changed meanwhile. */
+  skipped: number;
+  complete: boolean;
+  reason?: "limit" | "time";
+}
+
 export interface JobState {
   id: string;
   /** "send" is a copy to another server: its paths are on that server, so it has no undo here. */
-  kind: "compress" | "extract" | "copy" | "move" | "restore" | "send" | "sync";
+  kind: "compress" | "extract" | "copy" | "move" | "restore" | "send" | "sync" | "access";
   label: string;
   status: "running" | "done" | "failed" | "cancelled";
   startedAt: string;
@@ -203,6 +217,8 @@ export interface JobState {
   transferred?: TransferResult[];
   /** For sync jobs: items left alone, because they changed since the comparison or couldn't be copied. */
   skipped?: Array<{ path: string; reason: "changed" | "failed"; message?: string }>;
+  /** For permission and ownership changes: what was found and changed. */
+  access?: AccessReport;
   error?: string;
   /** Whether the signed-in account started the job (the owner also sees other accounts' jobs). */
   own?: boolean;

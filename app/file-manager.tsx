@@ -108,7 +108,7 @@ import { closeTab, MAX_TABS, openTab, parseTabs, shownTabs, type FolderTabs } fr
 import { moveCursor, selectionRange } from "@/lib/selection";
 import { INITIAL_DIRECTION, nextSort, parseSort, sortEntries, type SortKey, type SortState } from "@/lib/sort";
 import type { ContentSearchHit, ContentSearchResult, ShareLink } from "@/lib/types";
-import type { ArchiveFormat, BulkRenameRule, DeleteResult, DiskInfo, FileEntry, JobState, TransferResult, IdentityOption, LargestFilesProgress, LargestFilesReady, LargestFilesResult, OwnershipPair, RenamePreview, TrashItem, TrashListing, TrashRestoreResult, UploadOwnershipOptions, UploadOwnershipPreference } from "@/lib/types";
+import type { AccessReport, ArchiveFormat, BulkRenameRule, DeleteResult, DiskInfo, FileEntry, JobState, TransferResult, IdentityOption, LargestFilesProgress, LargestFilesReady, LargestFilesResult, OwnershipPair, RenamePreview, TrashItem, TrashListing, TrashRestoreResult, UploadOwnershipOptions, UploadOwnershipPreference } from "@/lib/types";
 
 type Role = "owner" | "editor" | "viewer";
 type AuthState = {
@@ -1194,6 +1194,13 @@ export function FileManager() {
       if (job.status === "done") notify(`${itemCount(items.length)} copied to ${server}`);
       else if (job.status === "failed") notify(job.error || `The copy to ${server} failed`, "error");
       else notify(`Copy to ${server} cancelled${items.length ? ` after ${itemCount(items.length)}` : ""}`);
+    } else if (job.kind === "access") {
+      const report = job.access;
+      if (job.status === "done" && report) {
+        const notes = [report.skipped ? `${itemCount(report.skipped)} left alone (links, special files, or changed meanwhile)` : "", !report.complete ? "stopped early: too many items" : ""].filter(Boolean).join(" · ");
+        notify(`${report.changed ? `${itemCount(report.changed)} updated` : "Nothing needed changing"}${notes ? ` · ${notes}` : ""}`, notes ? "error" : undefined);
+      } else if (job.status === "failed") notify(job.error || "The change failed", "error");
+      else notify(`Change cancelled${report?.changed ? ` after ${itemCount(report.changed)}` : ""}`);
     } else if (job.kind === "sync") {
       // Copies between compared folders: what they replaced is in the trash, so there's no undo here.
       const copied = job.transferred?.length ?? 0;
@@ -3051,7 +3058,7 @@ function FileSkeleton() {
 }
 
 function JobPanel({ job, onCancel }: { job: JobState; onCancel: () => void }) {
-  const icons: Record<JobState["kind"], ReactNode> = { compress: <FileArchive size={17} />, extract: <PackageOpen size={17} />, copy: <Copy size={17} />, move: <FolderInput size={17} />, restore: <History size={17} />, send: <Server size={17} />, sync: <GitCompareArrows size={17} /> };
+  const icons: Record<JobState["kind"], ReactNode> = { compress: <FileArchive size={17} />, extract: <PackageOpen size={17} />, copy: <Copy size={17} />, move: <FolderInput size={17} />, restore: <History size={17} />, send: <Server size={17} />, sync: <GitCompareArrows size={17} />, access: <KeyRound size={17} /> };
   const percent = job.progress.total ? Math.min(100, (job.progress.done / job.progress.total) * 100) : undefined;
   return (
     <div className="job-panel" role="status" aria-live="polite">
@@ -3107,8 +3114,8 @@ function DialogHost({ dialog, selected, currentPath, username, role, home, onClo
   if (dialog.kind === "link") return <LinkDialog entry={dialog.entry} home={home} onClose={onClose} onRun={onRun} />;
   if (dialog.kind === "relink") return <RelinkDialog entry={dialog.entry} home={home} onClose={onClose} onRun={onRun} />;
   if (dialog.kind === "delete") return <DeleteDialog entries={selected} onClose={onClose} onRun={onRun} />;
-  if (dialog.kind === "permissions") return <PermissionsDialog entries={selected} onClose={onClose} onRun={onRun} />;
-  if (dialog.kind === "ownership") return <OwnershipDialog entries={selected} onClose={onClose} onRun={onRun} />;
+  if (dialog.kind === "permissions") return <AccessDialog what="permissions" entries={selected} onClose={onClose} onJob={onJob} />;
+  if (dialog.kind === "ownership") return <AccessDialog what="ownership" entries={selected} onClose={onClose} onJob={onJob} />;
   if (dialog.kind === "transfer") return <TransferDialog mode={dialog.mode} entries={selected} startPath={currentPath} home={home} onClose={onClose} onTransfer={onTransfer} />;
   if (dialog.kind === "bulk") return <BulkRenameDialog entries={selected} onClose={onClose} notify={notify} onRefresh={onRefresh} />;
   if (dialog.kind === "preview") {
@@ -4347,19 +4354,90 @@ function DeleteDialog({ entries, onClose, onRun }: { entries: FileEntry[]; onClo
   return <Modal title={`Delete ${entries.length} ${entries.length === 1 ? "item" : "items"}?`} subtitle="Deleted items are protected by default" icon={<Trash2 size={19} />} onClose={onClose}><form onSubmit={submit}><div className="delete-list">{entries.slice(0, 4).map((entry) => <div key={entry.path}><span className={`file-icon ${entry.type}`}>{fileIcon(entry)}</span><span>{entry.name}</span></div>)}{entries.length > 4 && <p>and {entries.length - 4} more…</p>}</div><label className="switch-row"><input type="checkbox" checked={permanent} onChange={(event) => setPermanent(event.target.checked)} /><span className="switch" /><div><strong>Delete permanently</strong><small>This cannot be undone</small></div></label>{permanent && <div className="warning-box"><CircleAlert size={17} /> This bypasses FilesDude&apos;s protected trash.</div>}<ModalActions onClose={onClose} submitLabel={permanent ? "Delete permanently" : "Move to trash"} danger busy={busy} /></form></Modal>;
 }
 
-function PermissionsDialog({ entries, onClose, onRun }: { entries: FileEntry[]; onClose: () => void; onRun: (body: Record<string, unknown>, success: string) => Promise<boolean> }) {
-  const [mode, setMode] = useState(entries.length === 1 ? entries[0].mode : "755");
-  const [busy, setBusy] = useState(false);
-  const submit = async (event: FormEvent) => { event.preventDefault(); setBusy(true); await onRun({ action: "chmod", paths: entries.map((entry) => entry.path), mode }, "Permissions updated"); setBusy(false); };
-  return <Modal title="Change permissions" subtitle={`Apply POSIX permissions to ${entries.length} ${entries.length === 1 ? "item" : "items"}`} icon={<KeyRound size={19} />} onClose={onClose}><form onSubmit={submit}><FormField label="Octal mode" hint="Common values: 644 for files, 755 for folders"><input value={mode} onChange={(event) => setMode(event.target.value)} inputMode="numeric" pattern="[0-7]{3,4}" maxLength={4} required /><code className="mode-preview">chmod {mode || "…"}</code></FormField><div className="preset-row"><span>Presets</span>{["644", "664", "700", "755", "775"].map((value) => <button type="button" key={value} className={mode === value ? "active" : ""} onClick={() => setMode(value)}>{value}</button>)}</div><ModalActions onClose={onClose} submitLabel="Apply permissions" busy={busy} /></form></Modal>;
+const OCTAL = /^[0-7]{3,4}$/;
+const FILE_PRESETS = ["644", "664", "640", "600"];
+const FOLDER_PRESETS = ["755", "775", "750", "700"];
+
+function ModeField({ label, hint, value, presets, onChange }: { label: string; hint: string; value: string; presets: string[]; onChange: (value: string) => void }) {
+  return (
+    <div>
+      <FormField label={label} hint={hint}><input value={value} onChange={(event) => onChange(event.target.value.trim())} inputMode="numeric" pattern="[0-7]{3,4}" maxLength={4} required /><code className="mode-preview">chmod {value || "…"}</code></FormField>
+      <div className="preset-row"><span>Presets</span>{presets.map((preset) => <button type="button" key={preset} className={value === preset ? "active" : ""} onClick={() => onChange(preset)}>{preset}</button>)}</div>
+    </div>
+  );
 }
 
-function OwnershipDialog({ entries, onClose, onRun }: { entries: FileEntry[]; onClose: () => void; onRun: (body: Record<string, unknown>, success: string) => Promise<boolean> }) {
-  const [uid, setUid] = useState(entries.length === 1 ? String(entries[0].uid) : "");
-  const [gid, setGid] = useState(entries.length === 1 ? String(entries[0].gid) : "");
+// Permissions or ownership for the chosen items and, if asked, everything inside them, with what
+// would change counted first. Files and folders get their own modes (644 and 755, say).
+function AccessDialog({ what, entries, onClose, onJob }: { what: "permissions" | "ownership"; entries: FileEntry[]; onClose: () => void; onJob: (job: JobState) => Promise<boolean> }) {
+  const single = entries.length === 1 ? entries[0] : null;
+  const hasFolders = entries.some((entry) => entry.type === "directory");
+  const hasFiles = entries.some((entry) => entry.type !== "directory");
+  const [recursive, setRecursive] = useState(false);
+  const [fileMode, setFileMode] = useState(single && single.type !== "directory" ? single.mode : "644");
+  const [folderMode, setFolderMode] = useState(single?.type === "directory" ? single.mode : "755");
+  const [uid, setUid] = useState(single ? String(single.uid) : "");
+  const [gid, setGid] = useState(single ? String(single.gid) : "");
+  const [preview, setPreview] = useState<{ key: string; report: AccessReport } | null>(null);
+  const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
-  const submit = async (event: FormEvent) => { event.preventDefault(); setBusy(true); await onRun({ action: "chown", paths: entries.map((entry) => entry.path), uid: Number(uid), gid: Number(gid) }, "Ownership updated"); setBusy(false); };
-  return <Modal title="Change ownership" subtitle={`Apply a numeric user and group id to ${entries.length} ${entries.length === 1 ? "item" : "items"}`} icon={<UserRoundCog size={19} />} onClose={onClose}><form onSubmit={submit}><div className="field-pair"><FormField label="User ID (UID)"><input value={uid} onChange={(event) => setUid(event.target.value)} type="number" min="0" required /></FormField><FormField label="Group ID (GID)"><input value={gid} onChange={(event) => setGid(event.target.value)} type="number" min="0" required /></FormField></div><div className="info-box"><Info size={17} /> Use IDs from the Proxmox host or container, such as <code>0:0</code> for root.</div><ModalActions onClose={onClose} submitLabel="Apply ownership" busy={busy} /></form></Modal>;
+  const showFiles = hasFiles || recursive;
+  const ownership = what === "ownership";
+  const body = ownership
+    ? { paths: entries.map((entry) => entry.path), uid: uid === "" ? undefined : Number(uid), gid: gid === "" ? undefined : Number(gid), recursive }
+    : { paths: entries.map((entry) => entry.path), fileMode: showFiles ? fileMode : undefined, folderMode: hasFolders ? folderMode : undefined, recursive };
+  const key = JSON.stringify(body);
+  const valid = ownership ? (uid !== "" || gid !== "") && [uid, gid].every((value) => value === "" || /^\d{1,10}$/.test(value)) : (!showFiles || OCTAL.test(fileMode)) && (!hasFolders || OCTAL.test(folderMode));
+  const shown = preview?.key === key ? preview.report : null;
+  const post = (action: "preview" | "apply") => requestJson<{ report?: AccessReport; job?: JobState }>("/api/fs/permissions", { method: "POST", body: JSON.stringify({ action, ...body }) });
+  const check = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const { report } = await post("preview");
+      if (report) setPreview({ key, report });
+    } catch (caught) {
+      setError((caught as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!valid) return;
+    setBusy(true);
+    setError("");
+    try {
+      const { job } = await post("apply");
+      if (job) await onJob(job);
+      onClose();
+    } catch (caught) {
+      setError((caught as Error).message);
+      setBusy(false);
+    }
+  };
+  const count = `${entries.length} ${entries.length === 1 ? "item" : "items"}`;
+  return (
+    <Modal title={ownership ? "Change ownership" : "Change permissions"} subtitle={ownership ? `Set the numeric user and group of ${count}` : `Set the POSIX permissions of ${count}`} icon={ownership ? <UserRoundCog size={19} /> : <KeyRound size={19} />} onClose={onClose}>
+      <form onSubmit={submit}>
+        {ownership
+          ? <><div className="field-pair"><FormField label="User ID (UID)" hint="Leave empty to keep it"><input value={uid} onChange={(event) => setUid(event.target.value.trim())} inputMode="numeric" /></FormField><FormField label="Group ID (GID)" hint="Leave empty to keep it"><input value={gid} onChange={(event) => setGid(event.target.value.trim())} inputMode="numeric" /></FormField></div><div className="info-box"><Info size={17} /> Use IDs from the Proxmox host or container, such as <code>0:0</code> for root, or <code>100000</code> for root in an unprivileged container.</div></>
+          : <div className={showFiles && hasFolders ? "field-pair access-modes" : "access-modes"}>
+            {showFiles && <ModeField label={hasFolders ? "Files" : "Octal mode"} hint="644: you write, everyone reads" value={fileMode} presets={FILE_PRESETS} onChange={setFileMode} />}
+            {hasFolders && <ModeField label={showFiles ? "Folders" : "Octal mode"} hint="755: you change, everyone opens" value={folderMode} presets={FOLDER_PRESETS} onChange={setFolderMode} />}
+          </div>}
+        {hasFolders && <label className="access-recursive"><input type="checkbox" checked={recursive} onChange={(event) => setRecursive(event.target.checked)} /> Also everything inside {entries.filter((entry) => entry.type === "directory").length === 1 ? "the folder" : "the folders"}</label>}
+        <div className="access-preview">
+          {shown
+            ? <span><strong>{shown.changing.toLocaleString()} of {(shown.files + shown.folders).toLocaleString()}</strong> {shown.files + shown.folders === 1 ? "item" : "items"} will change ({shown.files.toLocaleString()} {shown.files === 1 ? "file" : "files"}, {shown.folders.toLocaleString()} {shown.folders === 1 ? "folder" : "folders"}){shown.skipped ? ` · ${shown.skipped.toLocaleString()} left alone (links and special files)` : ""}{!shown.complete ? " · counted only part: there are a great many" : ""}</span>
+            : <span className="muted">Check what will change before changing it{recursive ? ", as this reaches everything inside" : ""}.</span>}
+          <button type="button" className="button secondary" disabled={busy || !valid} onClick={() => void check()}>{busy ? <LoaderCircle className="spin" size={15} /> : <Search size={15} />} Check</button>
+        </div>
+        {error && <div className="form-error"><CircleAlert size={16} />{error}</div>}
+        <ModalActions onClose={onClose} submitLabel={ownership ? "Apply ownership" : "Apply permissions"} busy={busy} disabled={!valid || (shown?.changing === 0)} />
+      </form>
+    </Modal>
+  );
 }
 
 function TransferDialog({ mode, entries, startPath, home, onClose, onTransfer }: { mode: "copy" | "move"; entries: FileEntry[]; startPath: string; home: string; onClose: () => void; onTransfer: (mode: "copy" | "move", paths: string[], destination: string) => Promise<boolean> }) {
