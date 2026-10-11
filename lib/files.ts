@@ -168,6 +168,9 @@ export async function openVerifiedFile(relativePath: string, access: "read" | "w
   const handle = await fs.open(absolute, (access === "write" ? constants.O_RDWR : constants.O_RDONLY) | constants.O_NONBLOCK | constants.O_NOCTTY);
   try {
     const { openedPath, stat } = await verifyFileHandleWithinRoot(handle, absolute);
+    // Where it really is: a link elsewhere in the root can't open FilesDude's own files (the trash,
+    // or a state folder inside the root).
+    if (await isReservedLocation(openedPath)) throw new AppError("That path is reserved by FilesDude", 403, "RESERVED_PATH");
     return { absolute, handle, openedPath, stat };
   } catch (error) {
     await handle.close().catch(() => undefined);
@@ -923,9 +926,22 @@ async function linkTarget(targetPath: string) {
   await safeResolve(targetRelative);
   return withParent(targetRelative, async (parent, name) => {
     const real = path.join(parent.real, name);
-    if (await isReservedLocation(real)) throw new AppError("That path is reserved by FilesDude", 403, "RESERVED_PATH");
+    // Neither the item nor, if it's a link, where it leads may be FilesDude's own.
+    if (await isReservedLocation(real) || await isReservedLocation(await fs.realpath(real))) throw new AppError("That path is reserved by FilesDude", 403, "RESERVED_PATH");
     return real;
   });
+}
+
+/**
+ * Accounts other than the owner may only make links that point inside the link's own folder (no
+ * ".."): a link that climbs out of its folder would point somewhere else, perhaps outside their
+ * folder, once it's moved.
+ */
+function assertLinkStaysPut(stored: string) {
+  const scope = currentScope();
+  if (scope && scope.role !== "owner" && stored.split(path.sep).includes("..")) {
+    throw new AppError("Links can only point to items in the same folder as the link, or in folders inside it", 400, "LINK_CLIMBS");
+  }
 }
 
 /**
@@ -943,12 +959,16 @@ export async function createLink(targetPath: string, destinationPath: string, na
   await safeResolve(targetRelative);
   return withParent(targetRelative, async (targetParent, targetName) => {
     const targetReal = path.join(targetParent.real, targetName);
-    if (await isReservedLocation(targetReal)) throw new AppError("That path is reserved by FilesDude", 403, "RESERVED_PATH");
+    if (await isReservedLocation(targetReal) || await isReservedLocation(await fs.realpath(targetReal))) throw new AppError("That path is reserved by FilesDude", 403, "RESERVED_PATH");
     const target = await fs.lstat(inside(targetParent, targetName));
+    const scope = currentScope();
     if (kind === "hard") {
       if (!target.isFile()) throw new AppError("Hard links can only be made to files", 400, "NOT_A_FILE");
       // Another name for a setuid or setgid program would keep those bits, as a copy wouldn't.
       if (target.mode & 0o6000) throw new AppError("Hard links can't be made to programs that run as their owner", 400, "SPECIAL_PERMISSIONS");
+      // A hard link shares everything about the file, its permissions and any file capabilities
+      // included, so other accounts may only link plain files nobody else can write to.
+      if (scope && scope.role !== "owner" && !linkableMode(target.mode)) throw new AppError("Hard links can't be made to programs, or to files others can change", 400, "PERMISSIONS");
     } else if (!target.isFile() && !target.isDirectory() && !target.isSymbolicLink()) {
       throw new AppError("Links can only be made to files, folders, and links", 400, "SPECIAL_FILE");
     }
@@ -956,11 +976,18 @@ export async function createLink(targetPath: string, destinationPath: string, na
       const location = inside(directory, linkName);
       if (kind === "hard") {
         await fs.link(inside(targetParent, targetName), location).catch(linkFailure);
+        // The name linked may have been swapped for something else after it was checked: the new
+        // name must be the very file checked, or it goes.
+        const made = await fs.lstat(location).catch(missingAsNull);
+        if (!made || !made.isFile() || made.dev !== target.dev || made.ino !== target.ino || made.mode !== target.mode) {
+          if (made) await fs.unlink(location).catch(() => undefined);
+          throw new AppError("The file changed while it was being linked", 409, "PATH_CHANGED");
+        }
       } else {
-        await fs.symlink(path.relative(directory.real, targetReal) || ".", location).catch(linkFailure);
-        // A confined account's new link takes the folder's owner, as its other new items do.
-        const scope = currentScope();
-        if (scope && scope.role !== "owner" && canChangeOwnership()) await fs.lchown(location, directory.stat.uid, directory.stat.gid).catch(() => undefined);
+        // Links keep FilesDude's ownership: changing it would be by name, in a folder others may write to.
+        const stored = path.relative(directory.real, targetReal) || ".";
+        assertLinkStaysPut(stored);
+        await fs.symlink(stored, location).catch(linkFailure);
       }
       return toEntry(location, linkRelative, linkName);
     });
@@ -978,9 +1005,10 @@ export async function retargetLink(linkPath: string, targetPath: string) {
     const before = await fs.lstat(inside(parent, name));
     if (!before.isSymbolicLink()) throw new AppError("Only links can be pointed somewhere else", 400, "NOT_A_LINK");
     const temporary = `.filedude-link-${crypto.randomUUID()}`;
-    await fs.symlink(path.relative(parent.real, targetReal) || ".", inside(parent, temporary));
+    const stored = path.relative(parent.real, targetReal) || ".";
+    assertLinkStaysPut(stored);
+    await fs.symlink(stored, inside(parent, temporary));
     try {
-      if (canChangeOwnership()) await fs.lchown(inside(parent, temporary), before.uid, before.gid).catch(() => undefined);
       const current = await fs.lstat(inside(parent, name)).catch(missingAsNull);
       if (!current || identityOf(current) !== identityOf(before)) throw new AppError("The link changed while it was being changed", 409, "PATH_CHANGED");
       await fs.rename(inside(parent, temporary), inside(parent, name));
