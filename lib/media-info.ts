@@ -64,7 +64,7 @@ export function setProbeRunner(replacement: ProbeRunner | null | undefined) {
 
 async function probeRunner() {
   if (runner === undefined) {
-    const run = process.env.FILEDUDE_MEDIA_INFO === "false" ? null : await sandboxRunner(process.env.FILEDUDE_FFPROBE_PATH || "/usr/bin/ffprobe");
+    const run = process.env.FILEDUDE_MEDIA_INFO === "false" ? null : await sandboxRunner("ffprobe");
     runner = run && ((fd) => run([
       "-v", "error", ...inputLimits(MEDIA_FORMATS), "-fd", "0", "-i", "fd:",
       "-show_entries", "format=format_long_name,duration,bit_rate:format_tags=title,artist,album:stream=codec_type,codec_name,profile,width,height,avg_frame_rate,sample_rate,channels,channel_layout:stream_side_data=rotation",

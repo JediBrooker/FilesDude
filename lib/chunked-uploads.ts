@@ -13,6 +13,7 @@ import { claimLinkSlot } from "./link-slots";
 import { bytesInProgress as linkBytesInProgress, openUploadFolder, reserveUpload, type UploadShare } from "./shares";
 import type { UploadDestination } from "./upload-destination";
 import { addressGroup, applyOwnership, publicName, reservePublicTarget, reserveTarget, uploadName, withPublicNames } from "./upload-target";
+import { canChangeOwnership } from "./privileges";
 
 // Large files are uploaded in pieces, each its own request, so no request is larger than a proxy in
 // front of FilesDude allows (Cloudflare's is 100 MB) and an interrupted upload carries on where it
@@ -253,8 +254,8 @@ export async function startLinkUpload(share: UploadShare, address: string, rawNa
     // This upload's own room is already counted among those in progress.
     if ((await freeBytes(folder)) < LINK_KEEP_FREE_BYTES) throw new AppError("The server doesn't have room for this file", 507, "DISK_FULL");
     const opened = folder;
-    // When running as root, a stranger's file belongs to the folder's owner, like other new items.
-    const ownership = typeof process.getuid === "function" && process.getuid() === 0 ? { uid: opened.stat.uid, gid: opened.stat.gid } : null;
+    // When FilesDude can change owners, a stranger's file belongs to the folder's owner, like other new items.
+    const ownership = canChangeOwnership() ? { uid: opened.stat.uid, gid: opened.stat.gid } : null;
     const destination: PieceDestination = { into: opened, directory: share.path, ownership, batch: undefined, close: async () => { await opened.handle.close().catch(() => undefined); } };
     return await begin(owner, destination, name, size, { from, settle, releaseSlot, deadline: Date.now() + 60_000 + (size / SLOWEST_BYTES_PER_SECOND) * 1000 });
   } catch (error) {

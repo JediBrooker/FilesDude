@@ -9,10 +9,14 @@ import test from "node:test";
 import { createSession } from "../lib/auth";
 import { config } from "../lib/config";
 import { getCredentials } from "../lib/credentials";
-import { sandboxFileRunner, unitArguments } from "../lib/media-sandbox";
+import { sandboxFileRunner } from "../lib/media-sandbox";
 import { openPlayback, playbackStatus, preparePlayback, setPlaybackFreeSpace, setPlaybackRunners, waitForPlaybackJobs, type PlaybackRunners } from "../lib/playback";
 import { runInScope } from "../lib/scope";
 import { GET as playback } from "../app/api/fs/playback/route";
+import { HELPER, helperEnvironment, realSandbox as sandboxHost, startSandboxHelper, sandboxHelperForThisFile } from "./helpers/sandbox";
+
+// The real sandbox, where this host can have one, through a helper of the tests' own.
+sandboxHelperForThisFile();
 
 function scrypt(password: string, salt: Buffer) {
   return new Promise<Buffer>((resolve, reject) => {
@@ -192,16 +196,22 @@ test("pieces left by an earlier FilesDude are removed", async () => {
   }, { "h264-aac": { video: "h264", audio: "aac" } });
 });
 
+const unitArguments = (request: object, env: Record<string, string> = {}) => JSON.parse(execFileSync("python3", ["-I", HELPER, "--print-args", JSON.stringify(request)], { env: { ...helperEnvironment(), ...env } }).toString()) as string[];
+
 test("runs that write a file can't grow it past its limit or reserve space, and stop with FilesDude", () => {
-  const args = unitArguments("filesdude-media-x", ["/usr/bin/ffmpeg"], 600, [], { fileOutput: 1000.5 }, "filesdude.service");
-  for (const property of ["LimitFSIZE=1000", "SystemCallFilter=~fallocate ftruncate", "BindsTo=filesdude.service"]) assert.ok(args.includes(property), property);
-  const plain = unitArguments("filesdude-media-y", ["/usr/bin/ffprobe"], 15, [], {}, null);
+  const args = unitArguments({ tool: "ffmpeg", args: [], seconds: 9000, fileOutput: 1000 }, { FILEDUDE_SANDBOX_BIND: "filesdude.service" });
+  for (const property of ["LimitFSIZE=1000", "SystemCallFilter=~fallocate ftruncate", "BindsTo=filesdude.service", "RuntimeMaxSec=9000"]) assert.ok(args.includes(property), property);
+  const plain = unitArguments({ tool: "ffprobe", args: [], seconds: 9000 });
   assert.ok(!plain.some((arg) => arg.startsWith("LimitFSIZE") || arg.startsWith("BindsTo") || arg.includes("fallocate")));
+  // Only a run writing a file may last longer than ten minutes.
+  assert.ok(plain.includes("RuntimeMaxSec=600"));
+  // A fractional limit isn't one.
+  assert.throws(() => execFileSync("python3", ["-I", HELPER, "--print-args", JSON.stringify({ tool: "ffmpeg", args: [], fileOutput: 1000.5 })], { stdio: "ignore" }));
 });
 
-const realSandbox = process.platform === "linux" && process.getuid?.() === 0 && existsSync("/usr/bin/ffmpeg") && existsSync("/usr/bin/ffprobe") && existsSync("/usr/bin/systemd-run");
+const realSandbox = sandboxHost && existsSync("/usr/bin/ffmpeg") && existsSync("/usr/bin/ffprobe");
 
-test("a real video is repackaged by ffmpeg in its sandbox into an MP4 that plays", { skip: !realSandbox && "needs Linux, root, ffmpeg, and systemd" }, async () => {
+test("a real video is repackaged by ffmpeg in its sandbox into an MP4 that plays", { skip: !realSandbox && "needs Linux, root, ffmpeg, systemd, and Python" }, async () => {
   const base = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "filesdude-playback-real-")));
   const original = { root: config.root, stateDir: config.stateDir };
   Object.assign(config, { root: path.join(base, "root"), stateDir: path.join(base, "state") });
@@ -228,12 +238,15 @@ test("a real video is repackaged by ffmpeg in its sandbox into an MP4 that plays
   }
 });
 
-test("in the real sandbox, a file can't be given disk space beyond its size, or grown past its limit", { skip: (!realSandbox || !existsSync("/usr/bin/python3")) && "needs Linux, root, systemd, and Python" }, async () => {
+test("in the real sandbox, a file can't be given disk space beyond its size, or grown past its limit", { skip: !sandboxHost && "needs Linux, root, systemd, and Python" }, async () => {
   const base = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "filesdude-playback-limits-")));
-  const original = { root: config.root, stateDir: config.stateDir };
+  const original = { root: config.root, stateDir: config.stateDir, socket: process.env.FILEDUDE_SANDBOX_SOCKET };
   Object.assign(config, { root: path.join(base, "root"), stateDir: path.join(base, "state") });
+  // A helper whose "ffmpeg" is Python, standing in for an exploited ffmpeg.
+  const helper = await startSandboxHelper({ FILEDUDE_FFMPEG_PATH: "/usr/bin/python3" });
+  process.env.FILEDUDE_SANDBOX_SOCKET = helper.socket;
   try {
-    const run = (await sandboxFileRunner("/usr/bin/python3"))!;
+    const run = (await sandboxFileRunner("ffmpeg"))!;
     await fs.writeFile(path.join(base, "input"), "input");
     const input = await fs.open(path.join(base, "input"), "r");
     // Stands in for an exploited ffmpeg.
@@ -250,7 +263,9 @@ test("in the real sandbox, a file can't be given disk space beyond its size, or 
     await output.close();
     await input.close();
   } finally {
-    Object.assign(config, original);
+    process.env.FILEDUDE_SANDBOX_SOCKET = original.socket;
+    await helper.stop();
+    Object.assign(config, { root: original.root, stateDir: original.stateDir });
     await fs.rm(base, { recursive: true, force: true });
   }
 });

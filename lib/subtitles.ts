@@ -47,8 +47,8 @@ export function setSubtitleRunners(replacement: SubtitleRunners | null | undefin
 
 async function subtitleRunners() {
   if (runners === undefined) {
-    const probe = await sandboxRunner(process.env.FILEDUDE_FFPROBE_PATH || "/usr/bin/ffprobe");
-    const extract = await sandboxRunner(process.env.FILEDUDE_FFMPEG_PATH || "/usr/bin/ffmpeg");
+    const probe = await sandboxRunner("ffprobe");
+    const extract = await sandboxRunner("ffmpeg");
     runners = probe && extract ? {
       probe: (fd) => probe(["-v", "error", ...inputLimits(VIDEO_FORMATS), "-fd", "0", "-i", "fd:", "-select_streams", "s", "-show_entries", "stream=index,codec_name:stream_tags=language,title", "-of", "json"], fd, 1024 * 1024),
       extract: (fd, stream, signal) => extract(["-nostdin", "-hide_banner", "-loglevel", "error", ...inputLimits(VIDEO_FORMATS), "-fd", "0", "-i", "fd:", "-map", `0:${stream}`, "-f", "webvtt", "pipe:1"], fd, MAX_SUBTITLE_BYTES, EXTRACT_SECONDS, signal),

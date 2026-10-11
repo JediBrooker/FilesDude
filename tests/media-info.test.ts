@@ -8,6 +8,10 @@ import test from "node:test";
 import sharp from "sharp";
 import { config } from "../lib/config";
 import { mediaInfoFor, parseExif, parseProbe, setProbeRunner } from "../lib/media-info";
+import { realSandbox as sandboxHost, sandboxHelperForThisFile } from "./helpers/sandbox";
+
+// The real sandbox, where this host can have one, through a helper of the tests' own.
+sandboxHelperForThisFile();
 
 async function withRoot<T>(run: (root: string) => Promise<T>) {
   const base = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "filesdude-media-")));
@@ -194,9 +198,9 @@ test("other files have no media details, and disguised files aren't decoded", as
 });
 
 // On a Linux host with ffprobe and systemd, as root (like the deployed service): the real sandbox.
-const realSandbox = process.platform === "linux" && process.getuid?.() === 0 && existsSync("/usr/bin/ffprobe") && existsSync("/usr/bin/systemd-run");
+const realSandbox = sandboxHost && existsSync("/usr/bin/ffprobe");
 
-test("real videos and audio are read by ffprobe in its sandbox", { skip: !realSandbox && "needs Linux, root, ffprobe, and systemd" }, async () => {
+test("real videos and audio are read by ffprobe in its sandbox", { skip: !realSandbox && "needs Linux, root, ffprobe, systemd, and Python" }, async () => {
   await withRoot(async (root) => {
     const ffmpeg = (...args: string[]) => execFileSync("/usr/bin/ffmpeg", ["-loglevel", "error", "-y", ...args]);
     ffmpeg("-f", "lavfi", "-i", "testsrc=duration=4:size=640x360:rate=25", "-f", "lavfi", "-i", "sine=frequency=440:duration=4", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-metadata", "title=Test clip", path.join(root, "clip.mp4"));

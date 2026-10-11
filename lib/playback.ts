@@ -44,8 +44,8 @@ export function setPlaybackRunners(replacement: PlaybackRunners | null | undefin
 
 async function playbackRunners() {
   if (runners === undefined) {
-    const probe = await sandboxRunner(process.env.FILEDUDE_FFPROBE_PATH || "/usr/bin/ffprobe");
-    const remux = await sandboxFileRunner(process.env.FILEDUDE_FFMPEG_PATH || "/usr/bin/ffmpeg");
+    const probe = await sandboxRunner("ffprobe");
+    const remux = await sandboxFileRunner("ffmpeg");
     runners = probe && remux && process.env.FILEDUDE_PLAYBACK !== "false" ? {
       probe: (fd) => probe(["-v", "error", ...inputLimits(VIDEO_FORMATS), "-show_entries", "stream=codec_type,codec_name:format=format_name", "-of", "json", "fd:"], fd, 256 * 1024),
       remux,

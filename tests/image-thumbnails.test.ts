@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { existsSync, readSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { readSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -7,9 +8,13 @@ import test from "node:test";
 import sharp from "sharp";
 import { config } from "../lib/config";
 import { type ResizeJob, decodingMode, imageThumbnailsAvailable, resizeImage, setImageResizer } from "../lib/image-resize";
-import { MOUNT_DIR, runProgram, sandboxRunner, unitArguments } from "../lib/media-sandbox";
+import { MOUNT_DIR, runProgram, sandboxRunner } from "../lib/media-sandbox";
 import { thumbnailFor } from "../lib/thumbnails";
 import { setFrameRunner } from "../lib/video-frames";
+import { HELPER, environment, helperEnvironment, realSandbox as sandboxHost, sandboxHelperForThisFile } from "./helpers/sandbox";
+
+// The real sandbox, where this host can have one, through a helper of the tests' own.
+sandboxHelperForThisFile();
 
 async function withRoot<T>(run: (root: string) => Promise<T>) {
   const base = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "filesdude-images-")));
@@ -116,31 +121,42 @@ test("two images are decoded at a time", async () => {
   });
 });
 
-test("running as root, images are only ever decoded in the sandbox", () => {
-  assert.equal(decodingMode(0), "sandbox");
-  assert.equal(decodingMode(1000), "process");
-  assert.equal(decodingMode(undefined), "process");
+test("with privileges, images are only ever decoded in the sandbox", () => {
+  assert.equal(decodingMode({ sandbox: true, privileged: true }), "sandbox");
+  assert.equal(decodingMode({ sandbox: true, privileged: false }), "sandbox");
+  assert.equal(decodingMode({ sandbox: false, privileged: true }), "off");
+  assert.equal(decodingMode({ sandbox: false, privileged: false }), "process");
 });
 
+const unitArguments = (request: object, env: Record<string, string> = {}) => JSON.parse(execFileSync("python3", ["-I", HELPER, "--print-args", JSON.stringify(request)], { env: { ...helperEnvironment(), ...env } }).toString()) as string[];
+
 test("the sandbox shows Node.js and its packages read-only, and keeps hiding everything else", () => {
-  const args = unitArguments("filesdude-media-x", ["/usr/bin/env", `${MOUNT_DIR}/node`, "-e", "code"], 15, ["/opt", "/var"], {
-    mounts: [["/opt/node/bin/node", `${MOUNT_DIR}/node`], ["/opt/my app/node_modules", `${MOUNT_DIR}/node_modules`]],
-    inspectSockets: true,
-  });
+  const args = unitArguments({ tool: "node", args: ["-e", "code"], inspectSockets: true }, { FILEDUDE_SANDBOX_NODE: "/opt/node/bin/node", FILEDUDE_SANDBOX_MODULES: "/opt/my app/node_modules" });
   assert.ok(args.includes(`BindReadOnlyPaths=/opt/node/bin/node:${MOUNT_DIR}/node "/opt/my app/node_modules":${MOUNT_DIR}/node_modules`));
-  assert.ok(args.some((arg) => arg.startsWith("InaccessiblePaths=-/opt -/var ")));
+  assert.ok(args.some((arg) => arg.startsWith("InaccessiblePaths=-/")));
   for (const property of ["DynamicUser=yes", "PrivateNetwork=yes", "SystemCallFilter=~@network-io", "SystemCallFilter=getsockname getsockopt", "TemporaryFileSystem=/etc:ro /run:ro /dev/shm:size=16M", "MemorySwapMax=0", "SystemCallFilter=~io_uring_setup:EPERM io_uring_enter:EPERM io_uring_register:EPERM", "RuntimeMaxSec=15"]) assert.ok(args.includes(property), property);
   // Only the two harmless socket calls come back, after the rest are taken away.
   assert.ok(args.indexOf("SystemCallFilter=getsockname getsockopt") > args.indexOf("SystemCallFilter=~@network-io"));
-  assert.deepEqual(args.slice(-4), ["/usr/bin/env", `${MOUNT_DIR}/node`, "-e", "code"]);
+  assert.deepEqual(args.slice(-5), ["/usr/bin/env", "-i", `${MOUNT_DIR}/node`, "-e", "code"]);
   // Other tools (ffmpeg) get neither.
-  const plain = unitArguments("filesdude-media-y", ["/usr/bin/ffmpeg"], 15, []);
+  const plain = unitArguments({ tool: "ffmpeg", args: ["-i", "pipe:0"] });
   assert.ok(!plain.some((arg) => arg.includes(MOUNT_DIR) || arg === "SystemCallFilter=getsockname getsockopt"));
+  assert.deepEqual(plain.slice(-3), ["/usr/bin/ffmpeg", "-i", "pipe:0"]);
 });
 
-test("mounts outside the sandbox's own folder are refused", async () => {
-  assert.equal(await sandboxRunner(process.execPath, { mounts: [[process.execPath, "/usr/bin/node"]] }), null);
-  assert.equal(await sandboxRunner(process.execPath, { mounts: [["/a:b", `${MOUNT_DIR}/x`]] }), null);
+test("the sandbox helper only runs its own three tools, with plain arguments", () => {
+  const refused = (request: unknown) => assert.throws(() => execFileSync("python3", ["-I", HELPER, "--print-args", JSON.stringify(request)], { stdio: "ignore", env: helperEnvironment() }), JSON.stringify(request));
+  refused({ tool: "/bin/sh", args: [] });
+  refused({ tool: "python", args: [] });
+  refused({ tool: "ffmpeg", args: "-version" });
+  refused({ tool: "ffmpeg", args: [1] });
+  refused({ tool: "ffmpeg", args: ["$HOME"] });
+  refused({ tool: "ffmpeg", args: ["a\u0000b"] });
+  refused(["ffmpeg"]);
+  // Paths and properties aren't FilesDude's to choose: anything else in the request is ignored.
+  const args = unitArguments({ tool: "ffprobe", args: [], mounts: [["/etc", "/run/filesdude/etc"]], properties: ["PrivateNetwork=no"], seconds: "forever" });
+  assert.ok(!args.some((arg) => arg.includes("/run/filesdude/etc") || arg.includes("PrivateNetwork=no")));
+  assert.ok(args.includes("RuntimeMaxSec=15"));
 });
 
 test("a stuck or overly talkative decoder is stopped", async () => {
@@ -178,9 +194,9 @@ test("Next.js's own image optimizer, which would decode images in FilesDude, is 
 });
 
 // On a Linux host with systemd, as root (like the deployed service): the real sandbox.
-const realSandbox = process.platform === "linux" && process.getuid?.() === 0 && existsSync("/usr/bin/systemd-run");
+const realSandbox = sandboxHost;
 
-test("a real image gets a thumbnail from its sandbox", { skip: !realSandbox && "needs Linux, root, and systemd" }, async () => {
+test("a real image gets a thumbnail from its sandbox", { skip: !realSandbox && "needs Linux, root, systemd, and Python" }, async () => {
   await withRoot(async (root) => {
     setImageResizer(undefined);
     assert.equal(await imageThumbnailsAvailable(), true);
@@ -197,12 +213,11 @@ test("a real image gets a thumbnail from its sandbox", { skip: !realSandbox && "
   });
 });
 
-test("Node.js in the sandbox sees nothing of FilesDude and has no network", { skip: !realSandbox && "needs Linux, root, and systemd" }, async () => {
+test("Node.js in the sandbox sees nothing of FilesDude and has no network", { skip: !realSandbox && "needs Linux, root, systemd, and Python" }, async () => {
   await withRoot(async (root) => {
     await fs.writeFile(path.join(root, "secret.txt"), "secret");
     await fs.mkdir(config.stateDir, { recursive: true });
-    const node = await fs.realpath(process.execPath);
-    const run = await sandboxRunner(node, { mounts: [[node, `${MOUNT_DIR}/node`], [await fs.realpath("node_modules"), `${MOUNT_DIR}/node_modules`]], inspectSockets: true });
+    const run = await sandboxRunner("node", { inspectSockets: true });
     assert.ok(run);
     const probe = `
       const fs = require("fs");
@@ -227,4 +242,57 @@ test("Node.js in the sandbox sees nothing of FilesDude and has no network", { sk
     // Any socket call ends the process.
     assert.equal(await run(["-e", "require('net').connect(80, '1.1.1.1'); setTimeout(() => require('fs').writeSync(1, 'connected'), 2000)"], Buffer.alloc(0), 100), null);
   });
+});
+
+// The units still running whose command includes this marker.
+function unitsWith(marker: string) {
+  const units = execFileSync("systemctl", ["list-units", "--all", "--plain", "--no-legend", "filesdude-media-*"]).toString().split("\n").map((line) => line.split(/\s+/)[0]).filter(Boolean);
+  return units.filter((unit) => {
+    try {
+      const show = execFileSync("systemctl", ["show", "-p", "ExecStart", "-p", "ActiveState", unit]).toString();
+      return show.includes(marker) && !/ActiveState=(inactive|failed)/.test(show);
+    } catch {
+      return false;
+    }
+  });
+}
+
+test("the sandbox helper stops a run when FilesDude gives up on it, and serves no other account", { skip: !realSandbox && "needs Linux, root, systemd, and Python" }, async () => {
+  const run = (await sandboxRunner("node", { inspectSockets: true }))!;
+  const marker = `marker-${process.pid}-${Date.now()}`;
+  const controller = new AbortController();
+  const running = run(["-e", `setInterval(() => {}, 1000) // ${marker}`], Buffer.alloc(0), 100, 300, controller.signal);
+  let started = false;
+  for (let tries = 0; tries < 100 && !started; tries += 1) {
+    started = unitsWith(marker).length > 0;
+    if (!started) await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  assert.ok(started, "the run started");
+  controller.abort();
+  assert.equal(await running, null);
+  let stopped = false;
+  for (let tries = 0; tries < 100 && !stopped; tries += 1) {
+    stopped = unitsWith(marker).length === 0;
+    if (!stopped) await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  assert.ok(stopped, "its unit stopped");
+
+  // Another account reaching the socket gets nothing run (the installed socket only lets FilesDude's
+  // own account reach it at all).
+  const socket = process.env.FILEDUDE_SANDBOX_SOCKET!;
+  await fs.chmod(path.dirname(socket), 0o755);
+  await fs.chmod(socket, 0o666);
+  const client = path.join(process.cwd(), "scripts", "sandbox-client.py");
+  const request = JSON.stringify({ tool: "node", args: ["-e", "require('fs').writeSync(1, 'ran')"] });
+  let output = "";
+  let failed = false;
+  try {
+    output = execFileSync("setpriv", ["--reuid=65534", "--regid=65534", "--clear-groups", "/usr/bin/python3", "-I", client, request], { input: "", env: environment({ FILEDUDE_SANDBOX_SOCKET: socket }) }).toString();
+  } catch {
+    failed = true;
+  } finally {
+    await fs.chmod(socket, 0o600);
+    await fs.chmod(path.dirname(socket), 0o700);
+  }
+  assert.ok(failed && output === "", "refused");
 });

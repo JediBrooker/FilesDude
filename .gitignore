@@ -47,3 +47,6 @@ next-env.d.ts
 # macOS/iCloud conflict copies
 * 2
 * 2.*
+
+# Python bytecode (the sandbox helper scripts)
+__pycache__/

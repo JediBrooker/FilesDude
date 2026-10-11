@@ -1,18 +1,19 @@
 import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { MOUNT_DIR, runProgram, sandboxRunner } from "./media-sandbox";
+import { MOUNT_DIR, runProgram, sandboxAvailable, sandboxRunner } from "./media-sandbox";
+import { privileged } from "./privileges";
 
 // Makes thumbnails from images, and reads their details (dimensions, format, EXIF) for Properties.
 // sharp (libvips and the decoders under it) parses files that other people control, anyone with an
 // upload link included, so it never reads them inside FilesDude: a separate Node.js process does,
 // given the already-verified open file (or a video frame's bytes) as standard input, never a path,
-// and returning the thumbnail, or the details as JSON, on standard output. When FilesDude
-// runs as root, that process runs in the same throwaway sandbox as ffmpeg (see media-sandbox.ts),
-// with Node.js and its packages shown to it read-only, and without that sandbox images get no
-// thumbnails. Otherwise (a development machine, or a service running as an unprivileged account) it
-// runs as this account with this account's access, which only keeps a crash or runaway decode from
-// taking FilesDude down. Either way only the decoders for the allowed formats can run at all.
+// and returning the thumbnail, or the details as JSON, on standard output. Wherever the media
+// sandbox is available, that process runs in the same throwaway sandbox as ffmpeg (see
+// media-sandbox.ts), with Node.js and its packages shown to it read-only. Without it, a FilesDude
+// with privileges (root, or the file capabilities a production install has) gives images no
+// thumbnails; otherwise (a development machine) the process runs as this account with this
+// account's access, which only keeps a crash or runaway decode from taking FilesDude down. Either way only the decoders for the allowed formats can run at all.
 
 export interface ResizeJob {
   /** The formats sharp may find in the input, from its contents (whatever the file is called). */
@@ -131,15 +132,18 @@ export function isWebp(data: Buffer | null): data is Buffer {
   return !!data && data.length > 12 && data.toString("latin1", 0, 4) === "RIFF" && data.toString("latin1", 8, 12) === "WEBP";
 }
 
-/** How images are decoded for this account: only ever in the sandbox for root. */
-export function decodingMode(uid: number | undefined) {
-  return uid === 0 ? "sandbox" : "process";
+/**
+ * How images are decoded: in the sandbox wherever there is one, never in a process of FilesDude's
+ * own if it has privileges (root, or capabilities its children would inherit), and otherwise in a
+ * process running as FilesDude's ordinary account.
+ */
+export function decodingMode({ sandbox, privileged }: { sandbox: boolean; privileged: boolean }) {
+  return sandbox ? "sandbox" : privileged ? "off" : "process";
 }
 
-/** Node.js and sharp (with the packages it needs) shown to the sandbox, where they run from. */
-async function sandboxedWorker(modules: string): Promise<Worker | null> {
-  const node = await fs.realpath(process.execPath);
-  const run = await sandboxRunner(node, { mounts: [[node, `${MOUNT_DIR}/node`], [modules, `${MOUNT_DIR}/node_modules`]], inspectSockets: true });
+/** Node.js and sharp (with the packages it needs), which the sandbox helper shows to the sandbox. */
+async function sandboxedWorker(): Promise<Worker | null> {
+  const run = await sandboxRunner("node", { inspectSockets: true });
   if (!run) return null;
   return (input, job, maxOutput) => run(workerArguments(`${MOUNT_DIR}/node_modules/sharp`, job), input, maxOutput, RUN_SECONDS);
 }
@@ -162,16 +166,18 @@ async function works(candidate: Worker) {
 }
 
 async function workingWorker(): Promise<Worker | null> {
-  const mode = decodingMode(typeof process.getuid === "function" ? process.getuid() : undefined);
+  const mode = decodingMode({ sandbox: await sandboxAvailable(), privileged: privileged() });
   // The packages FilesDude itself runs with (a release's own, in production).
   const modules = path.join(process.cwd(), "node_modules");
   const found = existsSync(path.join(modules, "sharp", "package.json")) ? await fs.realpath(modules) : null;
-  const candidate = !found ? null : mode === "sandbox" ? await sandboxedWorker(found) : processWorker(found);
+  const candidate = mode === "sandbox" ? await sandboxedWorker() : mode === "process" && found ? processWorker(found) : null;
   // A sandbox that can't read Node.js or sharp, for example, fails this.
   if (candidate && (await works(candidate))) return candidate;
   console.error(mode === "sandbox"
-    ? "Image thumbnails and details are off: running as root, FilesDude only reads images in a sandbox, which needs Linux, systemd, and Node.js and its node_modules readable by other users"
-    : "Image thumbnails and details are off: sharp couldn't be run");
+    ? "Image thumbnails and details are off: the media sandbox couldn't run Node.js and sharp (they and node_modules must be readable by other users)"
+    : mode === "off"
+      ? "Image thumbnails and details are off: FilesDude has privileges, so it only reads images in the media sandbox, and its helper (filesdude-sandbox.socket) isn't running"
+      : "Image thumbnails and details are off: sharp couldn't be run");
   return null;
 }
 

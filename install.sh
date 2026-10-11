@@ -16,6 +16,10 @@ ROOT_PATH=""
 INSTALL_USERNAME=""
 SERVICE_ACCOUNT=""
 ROTATE_SECRET="false"
+ALLOW_FROM=""
+ALLOW_FROM_REQUESTED="false"
+ALLOW_INTERFACES=""
+ALLOW_INTERFACES_REQUESTED="false"
 
 say() { printf '\n\033[1;36mFilesDude\033[0m  %s\n' "$*"; }
 fail() { printf '\n\033[1;31mFilesDude error:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -29,7 +33,11 @@ Options:
   --username NAME         Initial login username (default: admin)
   --bind ADDRESS          Listening address (default: 127.0.0.1)
   --port NUMBER           Listening port (default: 3000)
-  --service-user USER     'filesdude' (safer) or 'root' (full chown access)
+  --service-user USER     'filesdude' (default: its own account, with just the file capabilities
+                          it needs) or 'root' (older installs); an update can switch between them
+  --allow-from LIST       Only these addresses (comma-separated, e.g. your reverse proxy or
+                          tunnel) may reach the port; 'any' removes the filter
+  --allow-interfaces LIST Network interfaces that may also reach it (e.g. tailscale0)
   --update                Update the application and keep all settings
   --reset-credentials     Replace the bootstrap login, clear saved credentials and passkeys,
                           and sign everyone out (other settings are kept)
@@ -49,6 +57,8 @@ while (($#)); do
     --bind) BIND_ADDRESS="${2:?Missing address}"; LISTEN_REQUESTED="true"; shift 2 ;;
     --port) PORT="${2:?Missing port}"; LISTEN_REQUESTED="true"; shift 2 ;;
     --service-user) SERVICE_ACCOUNT="${2:?Missing user}"; shift 2 ;;
+    --allow-from) ALLOW_FROM="${2:?Missing addresses}"; ALLOW_FROM_REQUESTED="true"; shift 2 ;;
+    --allow-interfaces) ALLOW_INTERFACES="${2:?Missing interfaces}"; ALLOW_INTERFACES_REQUESTED="true"; shift 2 ;;
     --update) MODE="update"; shift ;;
     --reset-credentials) MODE="reset"; shift ;;
     --rotate-secret) ROTATE_SECRET="true"; shift ;;
@@ -64,7 +74,7 @@ export DEBIAN_FRONTEND=noninteractive
 export npm_config_update_notifier=false
 say "Installing operating-system prerequisites"
 apt-get update -qq
-apt-get install -y -qq ca-certificates curl openssl tar xz-utils >/dev/null
+apt-get install -y -qq ca-certificates curl openssl tar xz-utils python3 >/dev/null
 
 ensure_node() {
   local current_major="0"
@@ -96,7 +106,7 @@ ensure_node() {
   runtime="${APP_HOME}/runtimes/${filename%.tar.xz}"
   mkdir -p "${APP_HOME}/runtimes"
   rm -rf "${runtime}"
-  tar -xJf "${archive}" -C "${APP_HOME}/runtimes"
+  tar --no-same-owner -xJf "${archive}" -C "${APP_HOME}/runtimes"
   rm -f "${archive}"
   ln -sfn "${runtime}" "${APP_HOME}/node"
 }
@@ -139,12 +149,18 @@ FILEDUDE_BUILD_COMMIT="${BUILD_COMMIT}" NEXT_TELEMETRY_DISABLED=1 npm run build 
 RELEASE="${APP_HOME}/releases/$(date -u +%Y%m%d%H%M%S)"
 mkdir -p "${RELEASE}/.next"
 cp -a .next/standalone/. "${RELEASE}/"
-# Images are decoded by Node.js and sharp in a sandbox, as a temporary user who must be able to read
-# the packages (and nothing else of the release).
-chmod -R a+rX "${RELEASE}/node_modules"
 cp -a .next/static "${RELEASE}/.next/static"
 cp -a public "${RELEASE}/public"
 install -m 0755 install.sh "${RELEASE}/install.sh"
+# The media sandbox helper (run as root) and the client FilesDude reaches it with.
+install -d -m 0755 "${RELEASE}/scripts"
+install -m 0644 scripts/sandbox-helper.py scripts/sandbox-client.py "${RELEASE}/scripts/"
+# Releases belong to root: FilesDude's account (its group, set below) can read them but never change
+# them. Images are decoded by Node.js and sharp in a sandbox, as a temporary user who must be able to
+# read the packages (and nothing else of the release).
+chmod -R u+rwX,go-w,o-rx "${RELEASE}"
+chmod -R a+rX "${RELEASE}/node_modules"
+chmod 0755 "${APP_HOME}" "${APP_HOME}/releases"
 ln -sfn "${RELEASE}" "${APP_HOME}/current.new"
 mv -Tf "${APP_HOME}/current.new" "${APP_HOME}/current"
 
@@ -268,65 +284,119 @@ fi
 # Read the configured root without executing the environment file.
 ROOT_PATH="$(env_value FILEDUDE_ROOT)"
 [[ -n ${ROOT_PATH} && ${ROOT_PATH} != "/" ]] || fail "Invalid FILEDUDE_ROOT in ${ENV_FILE}."
+case "${ROOT_PATH}" in *[[:cntrl:]]*) fail "The managed folder's path can't contain control characters." ;; esac
+
+# FilesDude can read and write everything in its folder, so a folder holding the system, its own
+# release or state, or root's files would let anyone who took over FilesDude take over the host.
+ROOT_REAL="$(realpath -m "${ROOT_PATH}")"
+for sensitive in /etc /usr /bin /sbin /lib /lib32 /lib64 /libx32 /boot /root /proc /sys /dev /run /var/spool "${APP_HOME}" "${STATE_DIR}" "${CONFIG_DIR}"; do
+  sensitive_real="$(realpath -m "${sensitive}")"
+  if [[ ${ROOT_REAL} == "${sensitive_real}" || ${ROOT_REAL} == "${sensitive_real}/"* || ${sensitive_real} == "${ROOT_REAL}/"* ]]; then
+    fail "FilesDude can't manage ${ROOT_PATH}: it holds or is inside ${sensitive}. Choose a data folder."
+  fi
+done
 
 if [[ -z ${SERVICE_ACCOUNT} ]]; then
   if [[ ${MODE} != "install" && -f ${UNIT_FILE} ]]; then
     SERVICE_ACCOUNT="$(sed -n 's/^User=//p' "${UNIT_FILE}" | head -n 1)"
-  elif [[ -r /dev/tty ]]; then
-    answer=""
-    IFS= read -r -p "Enable full ownership/permission administration by running as root? [y/N]: " answer </dev/tty || true
-    [[ ${answer} =~ ^[Yy]$ ]] && SERVICE_ACCOUNT="root" || SERVICE_ACCOUNT="filesdude"
-  else
-    SERVICE_ACCOUNT="filesdude"
   fi
+  SERVICE_ACCOUNT="${SERVICE_ACCOUNT:-filesdude}"
 fi
 [[ ${SERVICE_ACCOUNT} == "root" || ${SERVICE_ACCOUNT} == "filesdude" ]] || fail "--service-user must be root or filesdude."
 
 if [[ ${SERVICE_ACCOUNT} == "filesdude" ]]; then
   getent group filesdude >/dev/null 2>&1 || groupadd --system filesdude
   id filesdude >/dev/null 2>&1 || useradd --system --gid filesdude --home-dir "${STATE_DIR}" --shell /usr/sbin/nologin filesdude
-  install -d -o filesdude -g filesdude -m 0700 "${STATE_DIR}"
-  if ! runuser -u filesdude -- test -r "${ROOT_PATH}" || ! runuser -u filesdude -- test -w "${ROOT_PATH}"; then
-    printf '\nWarning: the filesdude service account cannot currently read and write %s.\n' "${ROOT_PATH}" >&2
-    printf 'Adjust that folder\x27s group/ACL permissions or reinstall with --service-user root.\n' >&2
-  fi
-else
-  install -d -o root -g root -m 0700 "${STATE_DIR}"
 fi
+SERVICE_GROUP="${SERVICE_ACCOUNT}"
+install -d -m 0700 "${STATE_DIR}"
+chgrp -R "${SERVICE_GROUP}" "${RELEASE}"
+chmod -R g+rX "${RELEASE}"
 
-quote_unit() { local value="${1//\\/\\\\}"; value="${value//\"/\\\"}"; printf '"%s"' "${value}"; }
-ROOT_UNIT="$(quote_unit "${ROOT_PATH}")"
-STATE_UNIT="$(quote_unit "${STATE_DIR}")"
+# The account's capabilities: changing owners, and reading and writing files whatever their
+# permissions (FilesDude keeps its own accounts to their folders). Root is held to the same.
+CAPABILITY_LIST="CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_FSETID"
 
-CAPABILITIES=""
-if [[ ${SERVICE_ACCOUNT} == "root" ]]; then
-  CAPABILITIES=$'CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_FSETID\nAmbientCapabilities=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_FSETID'
-fi
+# Paths in unit files: quoted, with backslashes, quotes, and systemd's % specifiers escaped.
+quote_unit() { local value="${1//\\/\\\\}"; value="${value//\"/\\\"}"; value="${value//%/%%}"; printf '"%s"' "${value}"; }
 
-# ZFS snapshots: when the service runs as root over a folder on ZFS, it gets /dev/zfs (bound into
-# its otherwise private /dev) and only the ZFS permissions snapshots need on that one dataset,
-# delegated with zfs allow, instead of the broad CAP_SYS_ADMIN capability.
+# ZFS snapshots: over a folder on ZFS, the service gets /dev/zfs (bound into its otherwise private
+# /dev) and only the ZFS permissions snapshots need on that one dataset, delegated with zfs allow,
+# instead of the broad CAP_SYS_ADMIN capability.
 ZFS_UNIT=""
-if [[ ${SERVICE_ACCOUNT} == "root" && -c /dev/zfs ]] && command -v zfs >/dev/null 2>&1; then
+if [[ -c /dev/zfs ]] && command -v zfs >/dev/null 2>&1; then
   ZFS_DATASET="$(zfs list -H -o name "${ROOT_PATH}" 2>/dev/null | head -n 1 || true)"
   if [[ -n ${ZFS_DATASET} ]]; then
     say "Allowing ZFS snapshots of ${ZFS_DATASET}"
-    zfs allow -u root snapshot,destroy,mount "${ZFS_DATASET}"
+    zfs allow -u "${SERVICE_ACCOUNT}" snapshot,destroy,mount "${ZFS_DATASET}"
     ZFS_UNIT=$'BindPaths=/dev/zfs\nDeviceAllow=/dev/zfs rw'
+    # Snapshots are read from the dataset's .zfs folder, which a folder below its mountpoint doesn't
+    # include: it is shown too (read-only; FilesDude keeps to its folder inside each snapshot).
+    ZFS_MOUNTPOINT="$(zfs get -H -o value mountpoint "${ZFS_DATASET}" 2>/dev/null || true)"
+    if [[ ${ZFS_MOUNTPOINT} == /* && ${ZFS_MOUNTPOINT} != "${ROOT_REAL}" && -d ${ZFS_MOUNTPOINT}/.zfs/snapshot ]]; then
+      ZFS_UNIT+=$'\n'"BindReadOnlyPaths=$(quote_unit "-${ZFS_MOUNTPOINT}/.zfs/snapshot")"
+    fi
   fi
 fi
+ROOT_UNIT="$(quote_unit "${ROOT_PATH}")"
+STATE_UNIT="$(quote_unit "${STATE_DIR}")"
 
-say "Installing the systemd service"
+# What FilesDude can see of the host: the system's programs and libraries, its own release, its
+# folder, its state, and the few files in /etc it needs (accounts and groups, name resolution, time
+# zone, certificates). Everything else is replaced with an empty folder or hidden: the rest of /etc
+# (Proxmox's cluster configuration and keys, SSH host keys, password hashes, any other service's
+# secrets), /var, other storage, kernel debugging, and the sockets in /run, which its capabilities
+# would otherwise let it use.
+top_of() { local rest="${1#/}"; printf '/%s' "${rest%%/*}"; }
+HIDDEN="-/boot -/lost+found -/sys/kernel/debug -/sys/kernel/security -/sys/firmware"
+EMPTIED="/etc:ro /run:ro /opt:ro /var:ro"
+ETC_SHOWN=""
+for file in passwd group hosts host.conf resolv.conf nsswitch.conf gai.conf services protocols localtime timezone ssl/certs ca-certificates ld.so.cache alternatives hostid zfs; do
+  ETC_SHOWN+=" -/etc/${file}"
+done
+for entry in /*; do
+  name="${entry#/}"
+  [[ -d ${entry} && ! -L ${entry} ]] || continue
+  case "${name}" in
+    usr|bin|sbin|lib|lib32|lib64|libx32|etc|proc|sys|dev|run|tmp|var|opt|home|root|boot|lost+found) continue ;;
+  esac
+  if [[ ${entry} == "$(top_of "${ROOT_PATH}")" || ${entry} == "$(top_of "${STATE_DIR}")" ]]; then
+    # The folder holding FilesDude's own is emptied, apart from it (unless it is FilesDude's folder).
+    [[ ${entry} == "${ROOT_PATH}" || ${entry} == "${STATE_DIR}" ]] || EMPTIED+=" $(quote_unit "${entry}"):ro"
+  else
+    HIDDEN+=" $(quote_unit "-${entry}")"
+  fi
+done
+
+# Who may reach FilesDude's port: with addresses (or interfaces) set, only those (and this host)
+# can, so nobody else on the network signs in over plain HTTP. Kept in the environment file.
+if [[ ${ALLOW_FROM_REQUESTED} == "true" ]]; then
+  [[ ${ALLOW_FROM} == "any" ]] && ALLOW_FROM=""
+  set_env_value FILEDUDE_ALLOW_FROM "${ALLOW_FROM}"
+fi
+if [[ ${ALLOW_INTERFACES_REQUESTED} == "true" ]]; then
+  set_env_value FILEDUDE_ALLOW_INTERFACES "${ALLOW_INTERFACES}"
+fi
+ALLOW_FROM="$(env_value FILEDUDE_ALLOW_FROM)"
+ALLOW_INTERFACES="$(env_value FILEDUDE_ALLOW_INTERFACES)"
+# FilesDude doesn't start without its port filter, so a filter that fails leaves it closed, not open.
+FIREWALL_DEPENDENCY=""
+if [[ -n ${ALLOW_FROM} || -n ${ALLOW_INTERFACES} ]]; then
+  FIREWALL_DEPENDENCY=$'Requires=filesdude-firewall.service\nAfter=filesdude-firewall.service'
+fi
+
+say "Installing the systemd services"
 cat >"${UNIT_FILE}" <<EOF
 [Unit]
 Description=FilesDude secure web file manager
-After=network-online.target
-Wants=network-online.target
+After=network-online.target filesdude-sandbox.socket
+Wants=network-online.target filesdude-sandbox.socket
+${FIREWALL_DEPENDENCY}
 
 [Service]
 Type=simple
 User=${SERVICE_ACCOUNT}
-Group=${SERVICE_ACCOUNT}
+Group=${SERVICE_GROUP}
 WorkingDirectory=${APP_HOME}/current
 EnvironmentFile=${ENV_FILE}
 ExecStart=${APP_HOME}/node/bin/node server.js
@@ -338,6 +408,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
+ProtectHome=tmpfs
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectKernelLogs=true
@@ -348,14 +419,83 @@ ProtectProc=invisible
 ProcSubset=pid
 RestrictRealtime=true
 RestrictSUIDSGID=true
+RestrictNamespaces=true
 LockPersonality=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=${CAPABILITY_LIST}
+AmbientCapabilities=${CAPABILITY_LIST}
+TemporaryFileSystem=${EMPTIED}
+InaccessiblePaths=${HIDDEN}
+BindReadOnlyPaths=${APP_HOME} -/run/filesdude-sandbox -/run/systemd/resolve${ETC_SHOWN}
+BindPaths=${ROOT_UNIT} ${STATE_UNIT}
 ReadWritePaths=${ROOT_UNIT} ${STATE_UNIT}
-${CAPABILITIES}
 ${ZFS_UNIT}
 
 [Install]
 WantedBy=multi-user.target
+EOF
+
+# The media sandbox helper: the one part of FilesDude that runs as root, reached only through this
+# socket, which only FilesDude's account can use. It starts ffmpeg, ffprobe, and the image decoder in
+# throwaway sandboxed units (see scripts/sandbox-helper.py), and nothing else.
+cat >/etc/systemd/system/filesdude-sandbox.socket <<EOF
+[Unit]
+Description=FilesDude media sandbox helper socket
+
+[Socket]
+ListenStream=/run/filesdude-sandbox/sandbox.sock
+SocketUser=root
+SocketGroup=${SERVICE_GROUP}
+SocketMode=0660
+DirectoryMode=0755
+
+[Install]
+WantedBy=sockets.target
+EOF
+
+# Only what the helper needs from the configuration (never the secrets).
+helper_setting() {
+  local value
+  value="$(env_value "$1")"
+  [[ -n ${value} ]] && printf 'Environment=%s\n' "$(quote_unit "$1=${value}")"
+  return 0
+}
+cat >/etc/systemd/system/filesdude-sandbox.service <<EOF
+[Unit]
+Description=FilesDude media sandbox helper
+Requires=filesdude-sandbox.socket
+After=filesdude-sandbox.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -I ${APP_HOME}/current/scripts/sandbox-helper.py
+Environment=$(quote_unit "FILEDUDE_ROOT=${ROOT_PATH}")
+Environment=$(quote_unit "FILEDUDE_STATE_DIR=${STATE_DIR}")
+Environment=FILEDUDE_SANDBOX_USER=${SERVICE_ACCOUNT}
+Environment=FILEDUDE_SANDBOX_NODE=${APP_HOME}/node/bin/node
+Environment=FILEDUDE_SANDBOX_MODULES=${APP_HOME}/current/node_modules
+$(helper_setting FILEDUDE_FFMPEG_PATH)
+$(helper_setting FILEDUDE_FFPROBE_PATH)
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+PrivateNetwork=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+MemoryMax=256M
+TasksMax=128
 EOF
 
 # Every media sandbox run (ffmpeg, ffprobe, image decoding) goes in this slice, so together they can
@@ -378,8 +518,90 @@ exec /opt/filesdude/current/install.sh --update "$@"
 EOF
 chmod 755 /usr/local/sbin/filesdude-update
 
+FIREWALL_FILE="${CONFIG_DIR}/firewall.nft"
+FIREWALL_UNIT="/etc/systemd/system/filesdude-firewall.service"
+if [[ -n ${ALLOW_FROM} || -n ${ALLOW_INTERFACES} ]]; then
+  command -v nft >/dev/null 2>&1 || apt-get install -y -qq nftables >/dev/null
+  IPV4="" IPV6="" INTERFACES=""
+  IFS=',' read -r -a entries <<<"${ALLOW_FROM}"
+  for address in "${entries[@]}"; do
+    address="${address// /}"
+    [[ -z ${address} ]] && continue
+    if [[ ${address} =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?$ ]]; then IPV4+="${IPV4:+, }${address}"
+    elif [[ ${address} =~ ^[0-9A-Fa-f:]+(/[0-9]{1,3})?$ && ${address} == *:* ]]; then IPV6+="${IPV6:+, }${address}"
+    else fail "--allow-from: '${address}' isn't an IP address or network."
+    fi
+  done
+  IFS=',' read -r -a entries <<<"${ALLOW_INTERFACES}"
+  for interface in "${entries[@]}"; do
+    interface="${interface// /}"
+    [[ -z ${interface} ]] && continue
+    [[ ${interface} =~ ^[A-Za-z0-9_.-]{1,15}$ ]] || fail "--allow-interfaces: '${interface}' isn't an interface name."
+    INTERFACES+="    tcp dport ${PORT} iifname \"${interface}\" accept"$'\n'
+  done
+  {
+    printf '#!/usr/sbin/nft -f\n'
+    printf '# FilesDude: only these may reach port %s. Written by the FilesDude installer (see --allow-from).\n' "${PORT}"
+    printf 'table inet filesdude\ndelete table inet filesdude\ntable inet filesdude {\n  chain input {\n'
+    printf '    type filter hook input priority -10; policy accept;\n'
+    printf '    tcp dport %s iifname "lo" accept\n' "${PORT}"
+    [[ -n ${IPV4} ]] && printf '    tcp dport %s ip saddr { %s } accept\n' "${PORT}" "${IPV4}"
+    [[ -n ${IPV6} ]] && printf '    tcp dport %s ip6 saddr { %s } accept\n' "${PORT}" "${IPV6}"
+    printf '%s' "${INTERFACES}"
+    printf '    tcp dport %s counter reject with tcp reset\n  }\n}\n' "${PORT}"
+  } >"${FIREWALL_FILE}"
+  nft -c -f "${FIREWALL_FILE}" || fail "The port filter in ${FIREWALL_FILE} isn't valid."
+  cat >"${FIREWALL_UNIT}" <<EOF
+[Unit]
+Description=FilesDude port filter (only the allowed addresses reach FilesDude)
+Before=filesdude.service
+After=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f ${FIREWALL_FILE}
+ExecStop=/usr/sbin/nft delete table inet filesdude
+
+[Install]
+WantedBy=multi-user.target
+EOF
+elif [[ ${ALLOW_FROM_REQUESTED} == "true" && -f ${FIREWALL_UNIT} ]]; then
+  # Only removed when asked to (--allow-from any), never because the setting is missing.
+  systemctl disable --now filesdude-firewall.service >/dev/null 2>&1 || true
+  rm -f "${FIREWALL_UNIT}" "${FIREWALL_FILE}"
+fi
+
 systemctl daemon-reload
-systemctl enable --now filesdude.service >/dev/null
+if [[ -f ${FIREWALL_UNIT} ]]; then
+  systemctl enable filesdude-firewall.service >/dev/null
+  systemctl restart filesdude-firewall.service
+fi
+
+# FilesDude's own files belong to its account: its state, and, when switching between root and its
+# own account, its folders in the managed folder. Only folders the previous account owned that nobody
+# else can write to are handed over (other users may write to the managed folder); the trash's items
+# keep their owners.
+systemctl stop filesdude.service filesdude-sandbox.service 2>/dev/null || true
+find "${STATE_DIR}" -xdev ! -user "${SERVICE_ACCOUNT}" -exec chown -h "${SERVICE_ACCOUNT}:${SERVICE_GROUP}" {} +
+PREVIOUS_ACCOUNT="filesdude"
+[[ ${SERVICE_ACCOUNT} == "filesdude" ]] && PREVIOUS_ACCOUNT="root"
+if id "${PREVIOUS_ACCOUNT}" >/dev/null 2>&1; then
+  for internal in "${ROOT_PATH}/.filedude" "${ROOT_PATH}/.filedude/trash" "${ROOT_PATH}/.filedude/trash-info"; do
+    if [[ -n $(find "${internal}" -maxdepth 0 -type d -user "${PREVIOUS_ACCOUNT}" ! -perm /022 2>/dev/null) ]]; then
+      chown -h "${SERVICE_ACCOUNT}:${SERVICE_GROUP}" "${internal}"
+    fi
+  done
+  INFO="${ROOT_PATH}/.filedude/trash-info"
+  if [[ -n $(find "${INFO}" -maxdepth 0 -type d -user "${SERVICE_ACCOUNT}" ! -perm /022 2>/dev/null) ]]; then
+    find "${INFO}" -mindepth 1 -maxdepth 1 -type f -user "${PREVIOUS_ACCOUNT}" -exec chown -h "${SERVICE_ACCOUNT}:${SERVICE_GROUP}" {} +
+  fi
+fi
+
+systemctl enable --now filesdude-sandbox.socket >/dev/null
+systemctl restart filesdude-sandbox.socket
+systemctl enable filesdude.service >/dev/null
 systemctl restart filesdude.service
 
 # Keep the three newest immutable releases.
@@ -396,4 +618,12 @@ printf 'Update later: sudo filesdude-update\n'
 if [[ -n ${HAD_GITHUB_TOKEN:-} ]]; then
   printf 'Private-repo update: sudo GITHUB_TOKEN="$(gh auth token)" filesdude-update\n'
 fi
-printf '\nFor remote access, place an HTTPS reverse proxy or VPN in front of FilesDude.\n'
+if [[ ${SERVICE_ACCOUNT} == "root" ]]; then
+  printf '\nFilesDude runs as root. To run it as its own account instead: sudo filesdude-update --service-user filesdude\n'
+fi
+if [[ -z ${ALLOW_FROM} && -z ${ALLOW_INTERFACES} ]]; then
+  printf '\nFor remote access, place an HTTPS reverse proxy or VPN in front of FilesDude, and limit the\n'
+  printf 'port to it with: sudo filesdude-update --allow-from ADDRESS\n'
+else
+  printf 'Port %s is reachable only from: %s\n' "${PORT}" "${ALLOW_FROM:-}${ALLOW_FROM:+${ALLOW_INTERFACES:+, }}${ALLOW_INTERFACES:+${ALLOW_INTERFACES}}"
+fi

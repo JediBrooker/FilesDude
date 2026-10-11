@@ -12,6 +12,7 @@ import { config } from "./config";
 import { AppError } from "./http";
 import { acquireFilesystemLock, ensureRoot, INTERNAL_NAMES, measureTree, openVerifiedFile, relativeFromAbsolute, safeResolve, validateName, verifyFileHandleWithinRoot } from "./files";
 import type { ArchiveFormat, ArchiveResult, JobProgress } from "./types";
+import { canChangeOwnership } from "./privileges";
 
 // Threat model: the service usually runs as root over a folder that other users (for example an
 // LXC container's users) can also change. A path that was checked can be swapped for a symlink a
@@ -75,9 +76,9 @@ function inside(directory: AnchoredDirectory, ...names: string[]) {
 }
 
 // New output takes the owner of the folder it is created in rather than root, matching what that
-// folder's users can work with. Only applies when the service runs as root.
+// folder's users can work with. Only applies when FilesDude can change owners.
 function ownerFor(directory: AnchoredDirectory) {
-  return typeof process.getuid === "function" && process.getuid() === 0 ? { uid: directory.stat.uid, gid: directory.stat.gid } : null;
+  return canChangeOwnership() ? { uid: directory.stat.uid, gid: directory.stat.gid } : null;
 }
 
 // Removes `name` from `directory` only if it is still the same file that was created there.
