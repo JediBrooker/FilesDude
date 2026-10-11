@@ -1,6 +1,7 @@
 import path from "node:path";
 import { audit } from "./audit";
 import { rewriteFavoritePaths } from "./favorites";
+import { rewriteSearchFolders } from "./saved-searches";
 import { copyOrMove, type CopiedItems } from "./files";
 import { startJob } from "./jobs";
 import { rewriteSharePaths } from "./shares";
@@ -16,6 +17,7 @@ export async function rewriteLinkedPaths(changes: Array<{ from: string; to?: str
   const revoked = await rewriteSharePaths(changes, copies);
   if (revoked.length) await audit("share.revoke", { username, ids: revoked, reason: "item deleted" });
   await rewriteFavoritePaths(changes).catch((error: Error) => console.error("Favourites couldn't follow a change:", error.message));
+  await rewriteSearchFolders(changes).catch((error: Error) => console.error("Saved searches couldn't follow a change:", error.message));
   await rewriteTagPaths(changes).catch((error: Error) => console.error("Tags couldn't follow a change:", error.message));
 }
 

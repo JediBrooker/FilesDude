@@ -100,6 +100,7 @@ import { browserSupportsWebAuthn, startAuthentication, startRegistration, type P
 import { ACTIVITY_CATEGORIES, activityCategory, activityUser, describeActivity, groupUploads, SHARE_LINK_ACTOR, SYSTEM_ACTOR, visibleText, type ActivityCategory } from "@/lib/activity-text";
 import { isNewerBuild as differsFrom, type BuildIdentity } from "@/lib/build";
 import { CopyToServerDialog, RemoteBrowserDialog, ServerSettingsDialog, type ServerConnection } from "./remote-servers";
+import { SavedSearchesMenu } from "./saved-searches";
 import { DiskMapDialog } from "./disk-map";
 import { TextDiffDialog, type DiffSource } from "./text-diff";
 import { FolderCompareDialog } from "./folder-compare";
@@ -108,6 +109,7 @@ import { closeTab, MAX_TABS, openTab, parseTabs, shownTabs, type FolderTabs } fr
 import { moveCursor, selectionRange } from "@/lib/selection";
 import { INITIAL_DIRECTION, nextSort, parseSort, sortEntries, type SortKey, type SortState } from "@/lib/sort";
 import type { ContentSearchHit, ContentSearchResult, ShareLink } from "@/lib/types";
+import type { SavedSearch } from "@/lib/saved-searches";
 import type { AccessReport, ArchiveFormat, BulkRenameRule, DeleteResult, DiskInfo, FileEntry, JobState, TransferResult, IdentityOption, LargestFilesProgress, LargestFilesReady, LargestFilesResult, OwnershipPair, RenamePreview, TrashItem, TrashListing, TrashRestoreResult, UploadOwnershipOptions, UploadOwnershipPreference } from "@/lib/types";
 
 type Role = "owner" | "editor" | "viewer";
@@ -2113,6 +2115,20 @@ export function FileManager() {
               {searchMode === "contents" && <button type="button" className={`match-case ${matchCase ? "active" : ""}`} aria-pressed={matchCase} title="Match case" aria-label="Match case" onClick={() => setMatchCase(!matchCase)}>Aa</button>}
             </div>
             {searchMode === "names" && <button type="button" className={`toolbar-button ${filtersOpen || filtersActive ? "active" : ""}`} aria-expanded={filtersOpen} onClick={() => setFiltersOpen(!filtersOpen)}><SlidersHorizontal size={16} /> Filters{filterCount ? <em className="nav-count">{filterCount}</em> : null}</button>}
+            <SavedSearchesMenu
+              current={activeSearch || filtersActive ? { folder: currentPath, query: activeSearch, mode: searchMode, matchCase: searchMode === "contents" && matchCase, kind: (searchMode === "names" ? filters.kind : "any") as SavedSearch["kind"], modifiedDays: searchMode === "names" ? filters.modifiedDays : 0, minBytes: searchMode === "names" ? filters.minBytes : 0 } : null}
+              onApply={(saved) => {
+                // Opens the search's folder, then runs it there.
+                navigate(saved.folder);
+                setSearchMode(saved.mode);
+                setMatchCase(saved.matchCase);
+                setFilters({ kind: saved.kind, modifiedDays: saved.modifiedDays, minBytes: saved.minBytes });
+                setFiltersOpen(saved.mode === "names" && (saved.kind !== "any" || saved.modifiedDays > 0 || saved.minBytes > 0));
+                setSearch(saved.query);
+                setActiveSearch(saved.query);
+                setSearchRun((run) => run + 1);
+              }}
+            />
             <div className="toolbar-spacer" />
             <div className={`sort-control ${view === "grid" ? "grid-mode" : ""}`}>
               <select aria-label="Sort by" value={sort.key} onChange={(event) => { const key = event.target.value as SortKey; applySort({ key, direction: INITIAL_DIRECTION[key] }); }}>
