@@ -163,7 +163,8 @@ export async function childFolderSizes(relativePath: string, signal?: AbortSigna
   return fromFolder(relativePath, async (start, counter) => {
     const top = emptySize();
     const { folders } = await counter.list(start, top);
-    const sizes: Record<string, FolderSize> = {};
+    // No prototype, so a folder named "__proto__" is just another key.
+    const sizes: Record<string, FolderSize> = Object.create(null);
     for (const name of folders) {
       if (counter.ended) break;
       const result = emptySize();

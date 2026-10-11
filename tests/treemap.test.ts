@@ -31,8 +31,10 @@ test("nothing to draw gives no rectangles, and empty or odd values are left out"
 
 test("many small items are gathered into one", () => {
   const items = [{ value: 900, data: "big" }, ...Array.from({ length: 50 }, (_, index) => ({ value: 2, data: `small${index}` }))];
-  const gathered = gatherSmall(items, 0.01, (count) => `${count} more`);
-  assert.deepEqual(gathered.map((item) => [item.data, item.value]), [["big", 900], ["50 more", 100]]);
+  const gathered = gatherSmall(items, 0.01, (count, value) => `${count} more (${value})`);
+  assert.deepEqual(gathered.map((item) => [item.data, item.value]), [["big", 900], ["50 more (100)", 100]]);
+  // Values that aren't numbers are left out rather than spoiling the rest.
+  assert.deepEqual(gatherSmall([{ value: 5, data: "a" }, { value: Number.NaN, data: "b" }, { value: undefined as unknown as number, data: "c" }], 0.01, () => "rest").map((item) => item.data), ["a"]);
   // A single small item stays itself.
   assert.deepEqual(gatherSmall([{ value: 99, data: "a" }, { value: 1, data: "b" }], 0.05, () => "rest").map((item) => item.data), ["a", "b"]);
 });

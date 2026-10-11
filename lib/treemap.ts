@@ -66,10 +66,13 @@ export function squarify<T>(items: Array<{ value: number; data: T }>, width: num
  * into one (`rest`), so a folder of thousands of tiny files still draws as something readable.
  */
 export function gatherSmall<T>(items: Array<{ value: number; data: T }>, share: number, rest: (count: number, value: number) => T) {
-  const total = items.reduce((sum, item) => sum + Math.max(0, item.value), 0);
-  const kept = items.filter((item) => item.value >= total * share);
-  const small = items.filter((item) => item.value > 0 && item.value < total * share);
-  if (small.length > 1) kept.push({ value: small.reduce((sum, item) => sum + item.value, 0), data: rest(small.length, 0) });
-  else kept.push(...small);
+  const usable = items.filter((item) => Number.isFinite(item.value) && item.value > 0);
+  const total = usable.reduce((sum, item) => sum + item.value, 0);
+  const kept = usable.filter((item) => item.value >= total * share);
+  const small = usable.filter((item) => item.value < total * share);
+  if (small.length > 1) {
+    const value = small.reduce((sum, item) => sum + item.value, 0);
+    kept.push({ value, data: rest(small.length, value) });
+  } else kept.push(...small);
   return kept;
 }
