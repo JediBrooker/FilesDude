@@ -349,6 +349,13 @@ function rememberTabs(account: string, tabs: FolderTabs | null) {
 
 const tabLabel = (tabPath: string) => (tabPath ? tabPath.split("/").at(-1)! : "All files");
 
+/** Forgets every account's remembered folders (tree, split view, tabs) in this browser. */
+function forgetRememberedFolders() {
+  for (const key of Object.keys(window.localStorage)) {
+    if (key.startsWith(TREE_STORAGE_PREFIX) || key.startsWith(SPLIT_STORAGE_PREFIX) || key.startsWith(TABS_STORAGE_PREFIX)) window.localStorage.removeItem(key);
+  }
+}
+
 // The split view only shows on screens wide enough for both sides (as in globals.css).
 const SPLIT_MEDIA = "(min-width: 1200px)";
 function subscribeSplitMedia(onChange: () => void) {
@@ -635,6 +642,8 @@ export function FileManager() {
   const splitPath = account === null ? null : split?.account === account ? split.path : storedSplit(account);
   // The signed-in account's folder tabs (null with just one folder open).
   const [tabState, setTabState] = useState<{ account: string; tabs: FolderTabs | null } | null>(null);
+  const tabsRef = useRef<FolderTabs | null>(null);
+  const accountRef = useRef<string | null>(null);
   const tabs = account === null ? null : tabState?.account === account ? tabState.tabs : storedTabs(account);
   const wideScreen = useSyncExternalStore(subscribeSplitMedia, () => window.matchMedia(SPLIT_MEDIA).matches, () => false);
   const splitShown = splitPath !== null && wideScreen;
@@ -754,7 +763,7 @@ export function FileManager() {
       // go too, on a computer someone else may use next.
       if (!result.authenticated) {
         try {
-          for (const key of Object.keys(window.localStorage)) if (key.startsWith(TREE_STORAGE_PREFIX) || key.startsWith(SPLIT_STORAGE_PREFIX)) window.localStorage.removeItem(key);
+          forgetRememberedFolders();
         } catch {
           // Nothing was remembered.
         }
@@ -961,8 +970,18 @@ export function FileManager() {
 
   useEffect(() => {
     function onPopState(event: PopStateEvent) {
-      const state = event.state as { path: string; index: number } | null;
+      const state = event.state as { path: string; index: number; tab?: number } | null;
       if (!state) return;
+      // Going back into another tab's history shows that tab (if it's still open). An entry from
+      // before it was recorded (such as the page's first) goes to a tab showing that folder, if any.
+      const open = tabsRef.current;
+      const signedIn = accountRef.current;
+      const tab = typeof state.tab === "number" ? state.tab : open?.paths.indexOf(state.path) ?? -1;
+      if (open && signedIn !== null && tab >= 0 && tab < open.paths.length && tab !== open.active) {
+        const next = { paths: open.paths, active: tab };
+        setTabState({ account: signedIn, tabs: next });
+        rememberTabs(signedIn, next);
+      }
       setCurrentPath(state.path);
       setHistoryIndex(state.index);
       setActiveSearch("");
@@ -972,7 +991,9 @@ export function FileManager() {
     return () => window.removeEventListener("popstate", onPopState);
   }, []);
 
-  const navigate = useCallback((nextPath: string, record = true) => {
+  // Each history entry records the tab it was in (`tab`), so Back and Forward go back to that tab
+  // rather than taking another tab's folder into the one showing.
+  const navigate = useCallback((nextPath: string, record = true, tab?: number) => {
     setCurrentPath(nextPath);
     setActiveSearch("");
     setSearch("");
@@ -982,12 +1003,17 @@ export function FileManager() {
       const nextIndex = nextHistory.length - 1;
       setHistory(nextHistory);
       setHistoryIndex(nextIndex);
-      window.history.pushState({ path: nextPath, index: nextIndex }, "", buildUrl(nextPath));
+      window.history.pushState({ path: nextPath, index: nextIndex, tab: tab ?? tabsRef.current?.active }, "", buildUrl(nextPath));
     }
   }, [history, historyIndex]);
 
   // The tab showing is always the folder open: wherever you go, it goes.
   const tabsShown = shownTabs(tabs, currentPath);
+  // The latest tabs and account, for history entries and Back/Forward.
+  useEffect(() => {
+    tabsRef.current = tabsShown;
+    accountRef.current = account;
+  });
   const saveTabs = (next: FolderTabs | null) => {
     if (account === null) return;
     setTabState({ account, tabs: next });
@@ -1004,18 +1030,18 @@ export function FileManager() {
       return;
     }
     saveTabs(next);
-    navigate(tabPath);
+    navigate(tabPath, true, next.active);
   };
   const switchTab = (index: number) => {
     if (!tabsShown || index === tabsShown.active || index >= tabsShown.paths.length) return;
     saveTabs({ paths: tabsShown.paths, active: index });
-    navigate(tabsShown.paths[index]);
+    navigate(tabsShown.paths[index], true, index);
   };
   const endTab = (index: number) => {
     if (!tabsShown) return;
     const { tabs: next, show } = closeTab(tabsShown, index);
     saveTabs(next);
-    if (show !== null) navigate(show);
+    if (show !== null) navigate(show, true, next?.active ?? 0);
   };
 
   const changeHistory = (direction: -1 | 1) => {
@@ -1817,9 +1843,10 @@ export function FileManager() {
     // Whatever was playing or open belongs to this account: it goes (saving where it got to first).
     setNowPlaying(null);
     setDialog(null);
-    // So do the folders remembered for the tree and the split view, on a computer someone else may use next.
+    // So do the folders remembered for the tree, the split view, and tabs, on a computer someone else may use next.
+    setTabState(null);
     try {
-      for (const key of Object.keys(window.localStorage)) if (key.startsWith(TREE_STORAGE_PREFIX) || key.startsWith(SPLIT_STORAGE_PREFIX)) window.localStorage.removeItem(key);
+      forgetRememberedFolders();
     } catch {
       // Nothing was remembered.
     }
@@ -1998,7 +2025,9 @@ export function FileManager() {
           <nav className="folder-tabs" role="tablist" aria-label="Folder tabs">
             {tabsShown.paths.map((tabPath, index) => {
               const active = index === tabsShown.active;
-              const label = tabLabel(tabPath);
+              // Tabs for different folders of the same name show the folder above too.
+              const clash = tabsShown.paths.some((other) => other !== tabPath && tabLabel(other) === tabLabel(tabPath));
+              const label = clash && tabPath.includes("/") ? tabPath.split("/").slice(-2).join("/") : tabLabel(tabPath);
               return (
                 <div key={index} role="presentation" className={`folder-tab ${active ? "active" : ""} ${!active && dropTarget === tabPath ? "drop-target" : ""}`} title={`/${tabPath}${index < 9 ? ` (${altLabel()}${index + 1})` : ""}`} {...(canWrite && !active ? { "data-drop-path": tabPath, ...dropHandlers } : {})} onAuxClick={(event) => { if (event.button === 1) { event.preventDefault(); endTab(index); } }}>
                   <button role="tab" aria-selected={active} className="folder-tab-open" onClick={() => switchTab(index)}><Folder size={14} /><bdi>{label}</bdi></button>
