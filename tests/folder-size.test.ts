@@ -52,6 +52,15 @@ test("each folder inside a folder is counted for the Size column", async () => {
     const { sizes, complete } = await childFolderSizes("top");
     assert.equal(complete, true);
     assert.deepEqual(Object.fromEntries(Object.entries(sizes).map(([name, size]) => [name, [size.bytes, size.files]])), { films: [1500, 2], music: [20, 1], empty: [0, 0] });
+    // Any folder name is just a name, "__proto__" included.
+    await write(root, { "top/__proto__/p.txt": "proto", "top/constructor/c.txt": "ctor" });
+    const named = await childFolderSizes("top");
+    const parsed = JSON.parse(JSON.stringify(named)) as typeof named;
+    assert.equal(Object.hasOwn(parsed.sizes, "__proto__"), true);
+    const named2 = (key: string) => parsed.sizes[key].bytes;
+    assert.deepEqual([named2("__proto__"), named2("constructor")], [5, 4]);
+    await fs.rm(path.join(root, "top/__proto__"), { recursive: true });
+    await fs.rm(path.join(root, "top/constructor"), { recursive: true });
     // Out of budget, the folders not reached are left out and the result says so.
     const short = await childFolderSizes("top", undefined, { entries: 4, milliseconds: 60_000 });
     assert.equal(short.complete, false);

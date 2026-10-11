@@ -67,6 +67,7 @@ import {
   RefreshCw,
   Route,
   Waypoints,
+  PieChart,
   GitCompareArrows,
   History,
   RotateCcw,
@@ -98,6 +99,7 @@ import { browserSupportsWebAuthn, startAuthentication, startRegistration, type P
 import { ACTIVITY_CATEGORIES, activityCategory, activityUser, describeActivity, groupUploads, SHARE_LINK_ACTOR, SYSTEM_ACTOR, visibleText, type ActivityCategory } from "@/lib/activity-text";
 import { isNewerBuild as differsFrom, type BuildIdentity } from "@/lib/build";
 import { CopyToServerDialog, RemoteBrowserDialog, ServerSettingsDialog, type ServerConnection } from "./remote-servers";
+import { DiskMapDialog } from "./disk-map";
 import { FolderCompareDialog } from "./folder-compare";
 import { ArchiveBrowserDialog } from "./archive-browser";
 import { closeTab, MAX_TABS, openTab, parseTabs, shownTabs, type FolderTabs } from "@/lib/folder-tabs";
@@ -132,6 +134,8 @@ type DialogState =
   // `folders` lists every folder in the upload, so empty ones are made too.
   | { kind: "upload"; items: UploadItem[]; folders: string[]; destination?: string }
   | { kind: "storage" }
+  // The map of where a folder's space goes.
+  | { kind: "usage"; path: string }
   | { kind: "trash" }
   | { kind: "compress" }
   | { kind: "share"; entry: FileEntry }
@@ -179,12 +183,12 @@ type SnapshotEntry = { name: string; path: string; type: "file" | "directory" | 
 type SnapshotVersion = { snapshot: string; snapshotCreatedAt: string; type: SnapshotEntry["type"]; size: number; modified: string };
 const SNAPSHOT_KIND_LABELS: Record<SnapshotInfo["kind"], string> = { auto: "Scheduled", manual: "Manual", other: "Other" };
 
-type EntryAction = "versions" | "open" | "edit" | "download" | "favorite" | "openOther" | "openTab" | "link" | "relink" | "rename" | "cut" | "clipboard" | "paste" | "copy" | "move" | "compress" | "extract" | "share" | "permissions" | "ownership" | "details" | "delete";
+type EntryAction = "versions" | "open" | "edit" | "download" | "favorite" | "openOther" | "usage" | "openTab" | "link" | "relink" | "rename" | "cut" | "clipboard" | "paste" | "copy" | "move" | "compress" | "extract" | "share" | "permissions" | "ownership" | "details" | "delete";
 type FavoriteLocation = { path: string; name: string; createdAt: string };
 type SelectOptions = { additive?: boolean; range?: boolean };
 type MenuPosition = { top: number; left: number };
 type MenuState = ({ kind: "entry"; entry: FileEntry } | { kind: "background" }) & MenuPosition;
-type BackgroundChoice = "new" | "upload" | "uploadFolder" | "paste" | "selectAll" | "refresh";
+type BackgroundChoice = "new" | "upload" | "uploadFolder" | "paste" | "selectAll" | "refresh" | "usage";
 type SearchFilters = { kind: string; modifiedDays: number; minBytes: number };
 const NO_FILTERS: SearchFilters = { kind: "any", modifiedDays: 0, minBytes: 0 };
 const SEARCH_KIND_OPTIONS = [["any", "Any kind"], ["folders", "Folders"], ["images", "Images"], ["videos", "Videos"], ["audio", "Audio"], ["documents", "Documents"], ["archives", "Archives and disk images"]] as const;
@@ -1520,6 +1524,7 @@ export function FileManager() {
     if (choice === "paste") void pasteInto(currentPath);
     if (choice === "selectAll") setSelected(new Set(sortedEntries.map((entry) => entry.path)));
     if (choice === "refresh") void loadDirectory();
+    if (choice === "usage") setDialog({ kind: "usage", path: currentPath });
   };
 
   // The main side shows the folder it's on (not a search, and not still loading or failed), so the
@@ -1672,6 +1677,9 @@ export function FileManager() {
         break;
       case "openOther":
         openSplit(entry.path);
+        break;
+      case "usage":
+        setDialog({ kind: "usage", path: entry.path });
         break;
       case "openTab":
         newTab(entry.path);
@@ -2252,6 +2260,7 @@ export function FileManager() {
           onPlayer={(playing) => { setDialog(null); setNowPlaying({ ...playing, session: ++playerSessions.current, account: auth.username ?? "" }); }}
           onNavigate={(target) => { setDialog(null); navigate(target); }}
           onTagsChanged={() => setTagsVersion((version) => version + 1)}
+          onUsage={(usagePath) => setDialog({ kind: "usage", path: usagePath })}
         />
       )}
       {menu && createPortal(menu.kind === "entry"
@@ -2853,6 +2862,7 @@ function FileActionMenu({ entry, targets, position, menuRef, favoritePaths, canW
         {!multiple && entry.type === "directory" && item("favorite", favoritePaths.has(entry.path) ? "Remove from favourites" : "Add to favourites", <Star size={16} fill={favoritePaths.has(entry.path) ? "currentColor" : "none"} />)}
         {!multiple && entry.type === "directory" && item("openTab", "Open in new tab", <AppWindow size={16} />)}
         {!multiple && entry.type === "directory" && item("openOther", "Open in split view", <Columns2 size={16} />)}
+        {!multiple && entry.type === "directory" && item("usage", "Show disk usage", <PieChart size={16} />)}
         {canWrite && item("cut", "Cut", <Scissors size={16} />)}
         {canWrite && item("clipboard", "Copy", <ClipboardCopy size={16} />)}
         {!multiple && canPaste && item("paste", "Paste into folder", <ClipboardPaste size={16} />)}
@@ -2901,6 +2911,7 @@ function BackgroundMenu({ canWrite, position, menuRef, folder, clipboardCount, c
       <div className="file-menu-section">
         {item("selectAll", "Select all", <ListChecks size={16} />, !canSelectAll)}
         {item("refresh", "Refresh", <RefreshCw size={16} />)}
+        {item("usage", "Show disk usage", <PieChart size={16} />)}
       </div>
     </div>
   );
@@ -3028,7 +3039,7 @@ function JobPanel({ job, onCancel }: { job: JobState; onCancel: () => void }) {
   );
 }
 
-function DialogHost({ dialog, selected, currentPath, username, role, home, onClose, onRun, notify, onRefresh, onStartJob, onTransfer, onJob, canWrite, onSharesChanged, onCredentialsUpdated, onTwoFactor, onPasskeys, onNotifications, onReveal, onPreview, onPlayer, onNavigate, onTagsChanged, uploadInPieces }: {
+function DialogHost({ dialog, selected, currentPath, username, role, home, onClose, onRun, notify, onRefresh, onStartJob, onTransfer, onJob, canWrite, onSharesChanged, onCredentialsUpdated, onTwoFactor, onPasskeys, onNotifications, onReveal, onPreview, onPlayer, onNavigate, onTagsChanged, onUsage, uploadInPieces }: {
   dialog: NonNullable<DialogState>;
   selected: FileEntry[];
   currentPath: string;
@@ -3054,13 +3065,15 @@ function DialogHost({ dialog, selected, currentPath, username, role, home, onClo
   onPlayer: (playing: NowPlaying) => void;
   onNavigate: (path: string) => void;
   onTagsChanged: () => void;
+  onUsage: (path: string) => void;
 }) {
   // The server dialogs are shown by FileManager, which holds the list of servers.
   if (dialog.kind === "server" || dialog.kind === "serverSettings" || dialog.kind === "copyToServer" || dialog.kind === "compare") return null;
   if (dialog.kind === "upload") return <UploadDialog items={dialog.items} folders={dialog.folders} currentPath={dialog.destination ?? currentPath} chooseOwnership={role === "owner"} inPieces={uploadInPieces} onClose={onClose} notify={notify} onComplete={onRefresh} />;
   if (dialog.kind === "users") return <UsersDialog onClose={onClose} notify={notify} />;
   if (dialog.kind === "duplicates") return <DuplicatesDialog startPath={currentPath} onClose={onClose} notify={notify} onRefresh={onRefresh} onReveal={onReveal} />;
-  if (dialog.kind === "storage") return <StorageDialog onClose={onClose} onReveal={onReveal} onPreview={onPreview} notify={notify} />;
+  if (dialog.kind === "storage") return <StorageDialog onClose={onClose} onReveal={onReveal} onPreview={onPreview} notify={notify} onUsage={() => onUsage(home)} />;
+  if (dialog.kind === "usage") return <DiskMapDialog startPath={dialog.path} home={home} onClose={onClose} onOpenFolder={(folderPath) => { onClose(); onNavigate(folderPath); }} />;
   if (dialog.kind === "trash") return <TrashDialog onClose={onClose} notify={notify} onRefresh={onRefresh} />;
   if (dialog.kind === "compress") return <CompressDialog entries={selected} currentPath={currentPath} onClose={onClose} onStart={onStartJob} />;
   if (dialog.kind === "share") return <ShareDialog entry={dialog.entry} onClose={onClose} notify={notify} onChanged={onSharesChanged} />;
@@ -3103,7 +3116,7 @@ export function ModalActions({ onClose, submitLabel, danger = false, busy = fals
   return <div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className={`button ${danger ? "danger" : "primary"}`} disabled={busy || disabled}>{busy && <LoaderCircle className="spin" size={16} />}{submitLabel}</button></div>;
 }
 
-function StorageDialog({ onClose, onReveal, onPreview, notify }: { onClose: () => void; onReveal: (entry: FileEntry) => void; onPreview: (entry: FileEntry) => void; notify: (message: string, tone?: "error") => void }) {
+function StorageDialog({ onClose, onReveal, onPreview, notify, onUsage }: { onClose: () => void; onReveal: (entry: FileEntry) => void; onPreview: (entry: FileEntry) => void; notify: (message: string, tone?: "error") => void; onUsage: () => void }) {
   const [result, setResult] = useState<LargestFilesReady | null>(null);
   const [scanProgress, setScanProgress] = useState<LargestFilesProgress | null>(null);
   const [loading, setLoading] = useState(true);
@@ -3242,7 +3255,7 @@ function StorageDialog({ onClose, onReveal, onPreview, notify }: { onClose: () =
       <div className="storage-browser">
         <div className="storage-scan-bar">
           <div>{scanProgress ? <><strong>Scanning…</strong><span>Scanned {scanProgress.scannedFiles.toLocaleString()} files in {scanProgress.scannedDirectories.toLocaleString()} folders · {(scanProgress.elapsedMs / 1000).toFixed(0)}s so far</span></> : result ? <><strong>{result.totalMatching.toLocaleString()} matching files · {formatBytes(result.matchingBytes)}</strong><span>Showing {result.entries.length.toLocaleString()} · scanned {result.scannedFiles.toLocaleString()} files in {result.scannedDirectories.toLocaleString()} folders · {(result.durationMs / 1000).toFixed(1)}s{result.cached ? " · cached" : ""}</span></> : <><strong>Whole-tree storage scan</strong><span>Every accessible folder under the configured root</span></>}</div>
-          <div className="storage-scan-actions"><button className="button secondary" disabled={!result?.entries.length} onClick={exportCurrentList}><ArrowDownToLine size={15} /> Export CSV</button><button className="button secondary" disabled={loading} onClick={() => void load({ refresh: true, minBytes: minBytesRef.current, limit: pageSizeRef.current })}><RefreshCw size={15} className={loading ? "spin" : ""} /> Refresh</button></div>
+          <div className="storage-scan-actions"><button className="button secondary" onClick={onUsage} title="See where the space goes, folder by folder"><PieChart size={15} /> Space by folder</button><button className="button secondary" disabled={!result?.entries.length} onClick={exportCurrentList}><ArrowDownToLine size={15} /> Export CSV</button><button className="button secondary" disabled={loading} onClick={() => void load({ refresh: true, minBytes: minBytesRef.current, limit: pageSizeRef.current })}><RefreshCw size={15} className={loading ? "spin" : ""} /> Refresh</button></div>
         </div>
         <form className="storage-filter" onSubmit={applyMinimum}>
           <label><span>Minimum file size</span><div><input type="number" min="0" step="0.1" value={minimumGb} onChange={(event) => setMinimumGb(event.target.value)} /><strong>GB</strong></div></label>
