@@ -941,15 +941,18 @@ button.snapshot-entry-name { cursor: pointer; font-weight: 700; }
 .diff-count-removed { color: var(--danger); font-weight: 800; }
 .diff-count-added { color: var(--brand-strong); font-weight: 800; }
 .text-diff-rows { max-height: min(56vh, 520px); overflow: auto; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); font: 11px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-.diff-row { display: grid; grid-template-columns: 44px minmax(0, 1fr) 44px minmax(0, 1fr); min-width: 640px; }
+.diff-row { display: grid; grid-template-columns: 16px 44px minmax(0, 1fr) 44px minmax(0, 1fr); min-width: 660px; }
+.diff-mark { color: var(--ink-faint); font-weight: 800; text-align: center; user-select: none; }
+.diff-row.removed .diff-mark, .diff-row.changed .diff-mark { color: var(--danger); }
+.diff-row.added .diff-mark { color: var(--brand-strong); }
 .diff-number { padding: 0 8px; color: var(--ink-faint); text-align: right; user-select: none; }
 .diff-text { padding: 0 10px 0 6px; white-space: pre-wrap; word-break: break-word; }
 .diff-text.empty { background: repeating-linear-gradient(-45deg, transparent 0 5px, color-mix(in srgb, var(--line) 60%, transparent) 5px 6px); }
-.diff-row.removed > :nth-child(-n+2), .diff-row.changed > :nth-child(-n+2) { background: color-mix(in srgb, var(--danger) 10%, transparent); }
-.diff-row.added > :nth-child(n+3), .diff-row.changed > :nth-child(n+3) { background: color-mix(in srgb, var(--brand) 12%, transparent); }
+.diff-row.removed > :nth-child(3), .diff-row.removed > :nth-child(4), .diff-row.changed > :nth-child(3), .diff-row.changed > :nth-child(4) { background: color-mix(in srgb, var(--danger) 10%, transparent); }
+.diff-row.added > :nth-child(5), .diff-row.added > :nth-child(6), .diff-row.changed > :nth-child(5), .diff-row.changed > :nth-child(6) { background: color-mix(in srgb, var(--brand) 12%, transparent); }
 .diff-removed-part { border-radius: 3px; background: color-mix(in srgb, var(--danger) 30%, transparent); color: inherit; }
 .diff-added-part { border-radius: 3px; background: color-mix(in srgb, var(--brand) 32%, transparent); color: inherit; }
-.diff-fold { display: block; width: 100%; min-width: 640px; padding: 3px 0; border: 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); background: var(--panel-soft); color: var(--brand); cursor: pointer; font: 600 10px/1.6 var(--font-sans, inherit); }
+.diff-fold { display: block; width: 100%; min-width: 660px; padding: 3px 0; border: 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); background: var(--panel-soft); color: var(--brand); cursor: pointer; font: 600 10px/1.6 var(--font-sans, inherit); }
 .snapshot-empty { display: flex; flex: 1; flex-direction: column; align-items: center; justify-content: center; gap: 6px; padding: 30px 16px; color: var(--ink-soft); text-align: center; font-size: 11px; }
 .snapshot-empty strong { color: var(--ink); font-size: 12px; }
 @media (max-width: 720px) { .snapshots-layout { grid-template-columns: 1fr; } .snapshot-list { max-height: 200px; } .snapshot-entry { grid-template-columns: 24px minmax(0, 1fr) 64px 64px; } .snapshot-entry > span:nth-child(4) { display: none; } }

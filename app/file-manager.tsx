@@ -284,7 +284,7 @@ type TagColor = "red" | "orange" | "yellow" | "green" | "blue" | "purple" | "gra
 const TAG_COLORS: Array<[TagColor, string]> = [["red", "Red"], ["orange", "Orange"], ["yellow", "Yellow"], ["green", "Green"], ["blue", "Blue"], ["purple", "Purple"], ["gray", "Grey"]];
 type TaggedEntry = { path: string; name: string; type: "file" | "directory"; size: number; modified: string; mime: string; colors: TagColor[] };
 const MENU_WIDTH = 224;
-const MULTI_ITEM_ACTIONS: EntryAction[] = ["download", "cut", "clipboard", "copy", "move", "compress", "permissions", "ownership", "delete"];
+const MULTI_ITEM_ACTIONS: EntryAction[] = ["download", "cut", "clipboard", "copy", "move", "compress", "compare", "permissions", "ownership", "delete"];
 const ARCHIVE_NAME = /\.(zip|tar\.gz|tgz|tar)$/i;
 // Mirrors lib/thumbnails.ts: which images the server makes thumbnails for.
 const THUMBNAIL_MIME = new Set(["image/jpeg", "image/png", "image/gif", "image/webp", "image/avif"]);
@@ -435,11 +435,14 @@ export function extension(name: string) {
 }
 
 function isEditable(entry: FileEntry) {
-  return isTextFile(entry) && entry.size <= 2 * 1024 * 1024;
+  const textType = entry.mime.startsWith("text/") || entry.mime.includes("json") || entry.mime.includes("javascript") || entry.mime.includes("typescript");
+  return entry.type === "file" && textType && entry.size <= 2 * 1024 * 1024;
 }
 
+// Files worth offering to compare as text: text types, and files of no known type (source code,
+// logs, config files); the comparison itself refuses anything that turns out not to be text.
 function isTextFile(entry: Pick<FileEntry, "type" | "mime">) {
-  return entry.type === "file" && (entry.mime.startsWith("text/") || entry.mime.includes("json") || entry.mime.includes("javascript") || entry.mime.includes("typescript") || entry.mime.includes("xml"));
+  return entry.type === "file" && (entry.mime.startsWith("text/") || entry.mime.includes("json") || entry.mime.includes("javascript") || entry.mime.includes("typescript") || entry.mime.includes("xml") || entry.mime === "application/octet-stream");
 }
 
 /** Two files chosen to compare: the earlier-named on the left. */

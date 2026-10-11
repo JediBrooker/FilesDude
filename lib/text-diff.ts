@@ -11,7 +11,7 @@ export type DiffRow =
   | { kind: "same" | "changed" | "removed" | "added"; left?: DiffCell; right?: DiffCell }
   | { kind: "fold"; count: number; from: number };
 
-export const MAX_EDITS = 2_000;
+export const MAX_EDITS = 5_000;
 
 /** The lines of a text (a final newline doesn't make an empty last line). */
 export function lines(text: string) {
@@ -37,6 +37,8 @@ export function diffLines(a: string[], b: string[], maxEdits = MAX_EDITS): DiffO
   const n = endA - start;
   const m = endB - start;
   const middle: DiffOp[] = [];
+  // Lines only added or only removed count against the limit too.
+  if ((n === 0 || m === 0) && n + m > maxEdits) return null;
   if (n === 0 || m === 0) {
     for (let i = 0; i < n; i += 1) middle.push({ type: "removed", left: start + i, text: a[start + i] });
     for (let j = 0; j < m; j += 1) middle.push({ type: "added", right: start + j, text: b[start + j] });
@@ -96,27 +98,33 @@ export function diffLines(a: string[], b: string[], maxEdits = MAX_EDITS): DiffO
       y -= 1;
       backwards.push({ type: "same", left: start + x, right: start + y, text: a[start + x] });
     }
-    middle.push(...backwards.reverse());
+    // One at a time: spreading a long list into push() goes past what a call can take.
+    for (let index = backwards.length - 1; index >= 0; index -= 1) middle.push(backwards[index]);
   }
-  const head = a.slice(0, start).map((text, index): DiffOp => ({ type: "same", left: index, right: index, text }));
-  const tail = a.slice(endA).map((text, index): DiffOp => ({ type: "same", left: endA + index, right: endB + index, text }));
-  return [...head, ...middle, ...tail];
+  const out: DiffOp[] = [];
+  for (let index = 0; index < start; index += 1) out.push({ type: "same", left: index, right: index, text: a[index] });
+  for (const op of middle) out.push(op);
+  for (let index = endA; index < a.length; index += 1) out.push({ type: "same", left: index, right: endB + (index - endA), text: a[index] });
+  return out;
 }
 
 /** Where two versions of a line differ: the stretch between what they share at each end. */
 function changedParts(left: string, right: string): [[number, number], [number, number]] {
   let start = 0;
   while (start < left.length && start < right.length && left[start] === right[start]) start += 1;
+  // Never between the two halves of a character (an emoji, say).
+  if (start > 0 && isHighSurrogate(left.charCodeAt(start - 1))) start -= 1;
   let end = 0;
   while (end < left.length - start && end < right.length - start && left[left.length - 1 - end] === right[right.length - 1 - end]) end += 1;
+  if (end > 0 && isLowSurrogate(left.charCodeAt(left.length - end))) end -= 1;
   return [[start, left.length - end], [start, right.length - end]];
 }
 
-/**
- * Side-by-side rows: removed and added lines next to each other pair up as changed lines, and
- * unchanged stretches longer than twice `context` fold down to `context` lines either side.
- */
-export function sideBySide(ops: DiffOp[], context = 3): DiffRow[] {
+const isHighSurrogate = (code: number) => code >= 0xd800 && code <= 0xdbff;
+const isLowSurrogate = (code: number) => code >= 0xdc00 && code <= 0xdfff;
+
+/** Every row side by side: removed and added lines next to each other pair up as changed lines. */
+export function allRows(ops: DiffOp[]): DiffRow[] {
   const rows: DiffRow[] = [];
   for (let index = 0; index < ops.length;) {
     if (ops[index].type === "same") {
@@ -141,7 +149,16 @@ export function sideBySide(ops: DiffOp[], context = 3): DiffRow[] {
       else rows.push({ kind: "added", right: { line: r.right! + 1, text: r.text } });
     }
   }
-  // Fold long unchanged stretches.
+  return rows;
+}
+
+/**
+ * The rows with unchanged stretches longer than twice `context` folded down to `context` lines
+ * either side (a fold's `from` and `count` say which of `rows` it stands for). Texts with nothing
+ * changed have no rows at all.
+ */
+export function foldRows(rows: DiffRow[], context = 3): DiffRow[] {
+  if (rows.every((row) => row.kind === "same")) return [];
   const folded: DiffRow[] = [];
   for (let index = 0; index < rows.length;) {
     if (rows[index].kind !== "same") {
@@ -156,16 +173,16 @@ export function sideBySide(ops: DiffOp[], context = 3): DiffRow[] {
     const keepBefore = first ? 0 : context;
     const keepAfter = last ? 0 : context;
     if (end - index > keepBefore + keepAfter + 1) {
-      folded.push(...rows.slice(index, index + keepBefore));
+      for (let row = index; row < index + keepBefore; row += 1) folded.push(rows[row]);
       folded.push({ kind: "fold", count: end - index - keepBefore - keepAfter, from: index + keepBefore });
-      folded.push(...rows.slice(end - keepAfter, end));
-    } else folded.push(...rows.slice(index, end));
+      for (let row = end - keepAfter; row < end; row += 1) folded.push(rows[row]);
+    } else for (let row = index; row < end; row += 1) folded.push(rows[row]);
     index = end;
   }
   return folded;
 }
 
-/** The rows a fold stands for, from the unfolded rows (to show them when asked). */
-export function unfold(ops: DiffOp[], from: number, count: number) {
-  return sideBySide(ops, Number.MAX_SAFE_INTEGER).slice(from, from + count);
+/** Side-by-side rows with long unchanged stretches folded. */
+export function sideBySide(ops: DiffOp[], context = 3): DiffRow[] {
+  return foldRows(allRows(ops), context);
 }

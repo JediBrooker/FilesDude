@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { diffLines, lines, sideBySide, unfold, type DiffOp } from "../lib/text-diff";
+import { allRows, diffLines, foldRows, lines, sideBySide, type DiffOp } from "../lib/text-diff";
 
 // Applies the edits to the left lines, which must give the right ones.
 function apply(left: string[], ops: DiffOp[]) {
@@ -36,6 +36,25 @@ test("empty texts, identical texts, and line endings", () => {
   assert.ok(diffLines(lines("same\ntext"), lines("same\ntext"))!.every((op) => op.type === "same"));
 });
 
+test("very long texts are compared without running out of room, and big pure additions are capped too", () => {
+  const a = Array.from({ length: 200_000 }, (_, index) => `l${index}`);
+  const b = [...a];
+  b[0] = "first changed";
+  b[b.length - 1] = "last changed";
+  const ops = diffLines(a, b)!;
+  assert.equal(ops.filter((op) => op.type !== "same").length, 4);
+  assert.equal(sideBySide(ops).filter((row) => row.kind === "changed").length, 2);
+  // A log that grew by a great deal is too much to show line by line.
+  assert.equal(diffLines(a.slice(0, 10), a, 5_000), null);
+  assert.ok(diffLines(a.slice(0, 10), a.slice(0, 1000), 5_000));
+});
+
+test("the changed part of a line never splits a character in two", () => {
+  const [row] = sideBySide(diffLines(["mood \u{1F600} ok"], ["mood \u{1F601} ok"])!, 0) as Array<{ left?: { changed?: [number, number] } }>;
+  const [start, end] = row.left!.changed!;
+  assert.equal("mood \u{1F600} ok".slice(start, end), "\u{1F600}");
+});
+
 test("texts too different to compare cheaply say so", () => {
   const a = Array.from({ length: 3000 }, (_, index) => `left ${index}`);
   const b = Array.from({ length: 3000 }, (_, index) => `right ${index}`);
@@ -54,7 +73,9 @@ test("side by side, changed lines pair up with their changed part marked, and un
   assert.deepEqual([changed.left?.line, changed.right?.line, changed.right?.changed], [16, 16, [7, 14]]);
   const fold = rows[0] as Extract<typeof rows[number], { kind: "fold" }>;
   assert.equal(fold.count, 12);
-  assert.deepEqual(unfold(ops, fold.from, fold.count).map((row) => (row as { left?: { line: number } }).left?.line), Array.from({ length: 12 }, (_, index) => index + 1));
+  assert.deepEqual(allRows(ops).slice(fold.from, fold.from + fold.count).map((row) => (row as { left?: { line: number } }).left?.line), Array.from({ length: 12 }, (_, index) => index + 1));
+  // Identical texts have nothing to show.
+  assert.deepEqual(foldRows(allRows(diffLines(["a", "b"], ["a", "b"])!)), []);
   // Lines only on one side stand alone.
   assert.deepEqual(sideBySide(diffLines(["a"], ["a", "b"])!).map((row) => row.kind), ["same", "added"]);
 });
