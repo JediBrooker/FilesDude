@@ -15,7 +15,9 @@ function visible(job: Job) {
   const scope = currentScope();
   return !scope || scope.role === "owner" || scope.accountKey === job.accountKey;
 }
-type JobRunner = (report: (progress: JobProgress) => void, signal: AbortSignal) => Promise<ArchiveResult | TransferResult[]>;
+// A transfer's results may carry the items it left alone (`skipped`), as a sync's do.
+type Transferred = TransferResult[] & { skipped?: JobState["skipped"] };
+type JobRunner = (report: (progress: JobProgress) => void, signal: AbortSignal) => Promise<ArchiveResult | Transferred>;
 
 // Each account runs one archive job at a time, so large archives don't compete for the disk, and a
 // few copies or moves, so a long copy doesn't block a quick move. Copies and moves that a request
@@ -30,7 +32,7 @@ function snapshot(job: Job): JobState {
   const { id, kind, label, status, startedAt, finishedAt, result, error } = job;
   const scope = currentScope();
   const own = !scope || scope.accountKey === job.accountKey;
-  return { id, kind, label, status, startedAt, finishedAt, progress: { ...job.progress }, result, transferred: job.transferred && [...job.transferred], error, own };
+  return { id, kind, label, status, startedAt, finishedAt, progress: { ...job.progress }, result, transferred: job.transferred && [...job.transferred], skipped: job.skipped && [...job.skipped], error, own };
 }
 
 // Finished jobs are kept for a while so the browser can collect their outcome, but each account
@@ -64,14 +66,19 @@ export function startJob(kind: JobState["kind"], label: string, initial: JobProg
   void run((progress) => { job.progress = progress; }, job.controller.signal)
     .then((result) => {
       job.status = "done";
-      if (Array.isArray(result)) job.transferred = result;
-      else job.result = result;
+      if (Array.isArray(result)) {
+        job.transferred = [...result];
+        if (result.skipped) job.skipped = result.skipped;
+      } else job.result = result;
     })
     .catch((error: unknown) => {
       if (error instanceof AppError) Object.assign(job, { errorStatus: error.status, errorCode: error.code });
       // A transfer that stops part-way reports what it already finished.
       const completed = (error as { completed?: unknown }).completed;
-      if (Array.isArray(completed)) job.transferred = completed as TransferResult[];
+      if (Array.isArray(completed)) {
+        job.transferred = [...completed] as TransferResult[];
+        if ((completed as Transferred).skipped) job.skipped = (completed as Transferred).skipped;
+      }
       if (job.controller.signal.aborted) {
         job.status = "cancelled";
         return;
