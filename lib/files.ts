@@ -380,7 +380,10 @@ async function copyContents(input: FileHandle, output: FileHandle, context: Copy
 async function applyCopiedAttributes(handle: FileHandle, source: Stats) {
   if (canChangeOwnership()) await handle.chown(source.uid, source.gid);
   await handle.chmod(source.mode & 0o1777);
-  await handle.utimes(source.atimeMs / 1000, source.mtimeMs / 1000);
+  // Times are kept where the filesystem allows; some network filesystems don't.
+  await handle.utimes(source.atimeMs / 1000, source.mtimeMs / 1000).catch((error: NodeJS.ErrnoException) => {
+    if (!["EPERM", "ENOTSUP", "EOPNOTSUPP", "EROFS", "EACCES"].includes(error.code ?? "")) throw error;
+  });
 }
 
 async function copyEntry(from: AnchoredDirectory, name: string, to: AnchoredDirectory, targetName: string, context: CopyContext, depth = 0) {
@@ -1516,6 +1519,68 @@ export async function copyOrMove(requested: string[], destinationPath: string, m
 }
 
 type LockControl = { unlock: () => void; relock: () => Promise<void> };
+
+/** A folder for syncItem: its path, and the real location it must be at (no link on the way). */
+export type SyncFolder = { relative: string; real: string };
+
+export class SyncChanged extends AppError {
+  constructor() {
+    super("It changed since the comparison", 409, "CHANGED");
+  }
+}
+
+/**
+ * Copies `name` from one folder into another under the same name (for comparing folders),
+ * replacing what is there only once the copy is complete. Both folders must still be at their real
+ * locations, and the source and what's at the target must pass `unchanged` (given each's lstat, or
+ * null for nothing) both before copying and, for the target, again under the lock just before it
+ * is moved to the trash and the copy put in its place. Throws SyncChanged if anything changed.
+ */
+export async function syncItem(from: SyncFolder, to: SyncFolder, name: string, unchanged: { source: (stat: Stats | null) => boolean; target: (stat: Stats | null) => boolean }, signal?: AbortSignal): Promise<{ result: TransferResult; trashed?: string }> {
+  let release: (() => void) | null = await acquireFilesystemLock();
+  const unlock = () => {
+    release?.();
+    release = null;
+  };
+  const relock = async () => {
+    if (!release) release = await acquireFilesystemLock();
+  };
+  const opened: AnchoredDirectory[] = [];
+  try {
+    for (const folder of [from, to]) {
+      const directory = await openDirectory(folder.relative).catch((error: unknown) => {
+        if (error instanceof AppError && ["NOT_FOUND", "NOT_A_DIRECTORY", "PATH_CHANGED"].includes(error.code ?? "")) throw new SyncChanged();
+        throw error;
+      });
+      opened.push(directory);
+      if (directory.real !== folder.real) throw new SyncChanged();
+    }
+    const [source, destination] = opened;
+    const at = async (directory: AnchoredDirectory) => fs.lstat(inside(directory, name)).catch(missingAsNull);
+    const sourceStat = await at(source);
+    if (!sourceStat || !unchanged.source(sourceStat) || !unchanged.target(await at(destination))) throw new SyncChanged();
+    const trash = (await at(destination)) && config.trashEnabled ? await trashDirectories(true) : null;
+    let trashed: string | undefined;
+    const context: CopyContext = { made: new Set(), signal };
+    await copyThroughPlaceholder(source, name, destination, context, { unlock, relock }, {
+      holdLock: false,
+      // Under the lock, once the copy is complete: what's there is checked again, then replaced.
+      chooseName: async () => {
+        const current = await at(destination);
+        if (!unchanged.target(current)) throw new SyncChanged();
+        if (current) {
+          if (!trash) throw new AppError("Protected trash is turned off, so nothing can be replaced", 409, "TRASH_DISABLED");
+          trashed = await moveToTrash(destination, name, childOf(to.relative, name), trash);
+        }
+        return { name, renamed: false };
+      },
+    });
+    return { result: { source: childOf(from.relative, name), path: childOf(to.relative, name), renamed: false }, trashed };
+  } finally {
+    unlock();
+    for (const directory of opened) await directory.handle.close().catch(() => undefined);
+  }
+}
 
 /**
  * Copies `name` from `from` into `destination`, called with the filesystem lock held. The copy is

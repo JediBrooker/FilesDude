@@ -156,10 +156,10 @@ export function FolderCompareDialog({ left, right, canWrite, trashEnabled, onClo
   const impossible = plan.filter(({ item, to }) => !(to === "right" ? item.left : item.right)).length;
 
   const sync = async () => {
-    if (!plan.length || impossible || plan.length > MAX_SYNC) return;
+    if (!result || !plan.length || impossible || plan.length > MAX_SYNC) return;
     try {
       const items = plan.map(({ item, to }) => ({ path: item.path, to, left: item.left ?? null, right: item.right ?? null }));
-      const { job } = await requestJson<{ job: JobState }>("/api/fs/compare", { method: "POST", body: JSON.stringify({ action: "sync", left, right, items }) });
+      const { job } = await requestJson<{ job: JobState }>("/api/fs/compare", { method: "POST", body: JSON.stringify({ action: "sync", left, right, items, bases: { left: result!.leftId, right: result!.rightId } }) });
       setSyncing(job);
       await onJob(job);
     } catch (caught) {

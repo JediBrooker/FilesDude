@@ -4,10 +4,11 @@ import path from "node:path";
 import { reservedPathCheck } from "./archives";
 import { audit } from "./audit";
 import { config } from "./config";
-import { acquireFilesystemLock, copyOrMove, deleteEntries, INTERNAL_NAMES, normalizeRelative, openDirectory, safeResolve } from "./files";
+import { acquireFilesystemLock, INTERNAL_NAMES, normalizeRelative, openDirectory, SyncChanged, syncItem } from "./files";
 import { AppError } from "./http";
 import { startJob } from "./jobs";
 import { rewriteLinkedPaths } from "./transfers";
+import type { Stats } from "node:fs";
 import type { TransferResult } from "./types";
 
 // Compares two folders (the two sides of the split view) and copies differences from one to the
@@ -17,8 +18,8 @@ import type { TransferResult } from "./types";
 
 export type CompareItemType = "file" | "directory" | "symlink";
 
-/** One side of a difference: what is there, as it was when compared. */
-export type CompareSide = { type: CompareItemType; size: number; mtimeMs: number; modified: string };
+/** One side of a difference: what is there (`id` is its device and inode), as it was when compared. */
+export type CompareSide = { type: CompareItemType; size: number; mtimeMs: number; modified: string; id: string };
 
 export type CompareStatus = "onlyLeft" | "onlyRight" | "changed" | "typeMismatch";
 
@@ -37,6 +38,9 @@ export type CompareDifference = {
 export type FolderComparison = {
   left: string;
   right: string;
+  /** The two folders' identities: copying across checks they're still the folders compared. */
+  leftId: string;
+  rightId: string;
   contents: boolean;
   differences: CompareDifference[];
   counts: Record<CompareStatus, number> & { identical: number; skipped: number };
@@ -51,6 +55,8 @@ export type FolderComparison = {
 type Limits = { entries: number; milliseconds: number; differences: number };
 const DEFAULT_LIMITS: Limits = { entries: 1_000_000, milliseconds: 60_000, differences: 10_000 };
 const MAX_DEPTH = 256;
+// Longer paths aren't listed (nor could they be copied), so the results stay small.
+const MAX_PATH_BYTES = 4096;
 const STAT_BATCH = 32;
 const CHUNK = 1024 * 1024;
 // File systems keep times at different precisions (FAT to two seconds), so times this close match.
@@ -62,7 +68,8 @@ type Item = CompareSide & { target?: string };
 
 class Stop extends Error {}
 
-const sideOf = ({ type, size, mtimeMs, modified }: Item): CompareSide => ({ type, size, mtimeMs, modified });
+const sideOf = ({ type, size, mtimeMs, modified, id }: Item): CompareSide => ({ type, size, mtimeMs, modified, id });
+const identity = (stat: { dev: number; ino: number }) => `${stat.dev}:${stat.ino}`;
 
 class Comparer {
   private entries = 0;
@@ -71,7 +78,7 @@ class Comparer {
 
   constructor(left: string, right: string, contents: boolean, private readonly isReserved: (real: string) => boolean, private readonly limits: Limits, private readonly signal?: AbortSignal) {
     this.result = {
-      left, right, contents, differences: [], truncated: false, complete: true, elapsedMs: 0,
+      left, right, leftId: "", rightId: "", contents, differences: [], truncated: false, complete: true, elapsedMs: 0,
       counts: { onlyLeft: 0, onlyRight: 0, changed: 0, typeMismatch: 0, identical: 0, skipped: 0 },
     };
   }
@@ -127,7 +134,7 @@ class Comparer {
           return;
         }
         const target = type === "symlink" ? await fs.readlink(location).catch(() => "") : undefined;
-        items.set(name, { type, size: type === "directory" ? 0 : stat.size, mtimeMs: stat.mtimeMs, modified: stat.mtime.toISOString(), target });
+        items.set(name, { type, size: type === "directory" ? 0 : stat.size, mtimeMs: stat.mtimeMs, modified: stat.mtime.toISOString(), id: identity(stat), target });
       }));
     }
     return items;
@@ -179,6 +186,10 @@ class Comparer {
     for (const name of names) {
       this.check();
       const itemPath = relative ? `${relative}/${name}` : name;
+      if (Buffer.byteLength(itemPath, "utf8") > MAX_PATH_BYTES) {
+        this.result.counts.skipped += 1;
+        continue;
+      }
       const l = leftItems.get(name);
       const r = rightItems.get(name);
       if (l && !r) this.add({ path: itemPath, status: "onlyLeft", left: sideOf(l) });
@@ -263,6 +274,7 @@ export async function compareFolders(leftPath: string, rightPath: string, { cont
   const realRight = rightFolder.real;
   try {
     const comparer = new Comparer(left, right, contents, await reservedPathCheck(), limits, signal);
+    Object.assign(comparer.result, { leftId: identity(leftFolder.stat), rightId: identity(rightFolder.stat) });
     try {
       await comparer.compare({ base: leftFolder.base, real: realLeft }, { base: rightFolder.base, real: realRight }, "", 0);
     } catch (error) {
@@ -279,20 +291,16 @@ export async function compareFolders(leftPath: string, rightPath: string, { cont
 export type SyncItem = { path: string; to: "left" | "right"; left: CompareSide | null; right: CompareSide | null };
 export type SyncSkip = { path: string; reason: "changed" | "failed"; message?: string };
 
-// What is at this path now, to check nothing changed since the comparison.
-async function current(relative: string): Promise<CompareSide | null> {
-  const location = await safeResolve(relative, { mustExist: false, followSymlink: false });
-  const stat = await fs.lstat(location).catch(() => null);
-  if (!stat) return null;
-  const type: CompareItemType | null = stat.isFile() ? "file" : stat.isDirectory() ? "directory" : stat.isSymbolicLink() ? "symlink" : null;
-  if (!type) return { type: "file", size: -1, mtimeMs: -1, modified: "" };
-  return { type, size: type === "directory" ? 0 : stat.size, mtimeMs: stat.mtimeMs, modified: stat.mtime.toISOString() };
-}
+const typeOf = (stat: Stats): CompareItemType | null => (stat.isFile() ? "file" : stat.isDirectory() ? "directory" : stat.isSymbolicLink() ? "symlink" : null);
 
-// A folder's own time changes whenever something inside it does, so only its kind is checked.
-const unchanged = (now: CompareSide | null, then: CompareSide | null) => now === null || then === null
-  ? now === then
-  : now.type === then.type && (now.type === "directory" || (now.size === then.size && now.mtimeMs === then.mtimeMs));
+/**
+ * Whether what's there now is what the comparison saw: nothing for nothing, else the same item
+ * (device and inode) of the same kind and, unless a folder (whose time changes with its contents),
+ * the same size and modified time.
+ */
+const matches = (stat: Stats | null, then: CompareSide | null) => (stat === null || then === null
+  ? stat === then
+  : typeOf(stat) === then.type && identity(stat) === then.id && (then.type === "directory" || (stat.size === then.size && stat.mtimeMs === then.mtimeMs)));
 
 const join = (base: string, relative: string) => (base ? `${base}/${relative}` : relative);
 
@@ -300,49 +308,59 @@ const join = (base: string, relative: string) => (base ? `${base}/${relative}` :
 export const replacesAny = (items: SyncItem[]) => items.some((item) => (item.to === "left" ? item.left : item.right) !== null);
 
 /**
- * Copies the chosen differences across as a background job. Each item is first checked against the
- * comparison: anything changed since (on either side) is left alone. Something already on the side
- * it's copied to goes to the trash first, so nothing is lost; without the trash nothing is replaced.
+ * Copies the chosen differences across as a background job. The two folders must still be the ones
+ * compared (`bases`, their identities). Each item is reached without following links, and checked
+ * against the comparison: anything changed since, on either side, is left alone. Something already
+ * on the side it's copied to goes to the trash, only once the copy is complete; without the trash
+ * nothing is replaced.
  */
-export async function startSyncJob(username: string, leftPath: string, rightPath: string, items: SyncItem[]) {
-  // Both folders must exist inside the account's folder; each item is checked again as it's copied.
-  const { left, right, close } = await openPair(leftPath, rightPath);
+export async function startSyncJob(username: string, leftPath: string, rightPath: string, items: SyncItem[], bases: { left: string; right: string }) {
+  const { left, right, leftFolder, rightFolder, close } = await openPair(leftPath, rightPath);
+  const real = { left: leftFolder.real, right: rightFolder.real };
+  const same = identity(leftFolder.stat) === bases.left && identity(rightFolder.stat) === bases.right;
   await close();
+  if (!same) throw new AppError("The folders changed since they were compared; compare them again", 409, "CHANGED");
   if (replacesAny(items) && !config.trashEnabled) throw new AppError("Protected trash is turned off, so nothing can be replaced", 409, "TRASH_DISABLED");
   const subject = items.length === 1 ? path.posix.basename(items[0].path) : `${items.length} items`;
+  const replaced: Array<{ path: string; trashId: string }> = [];
   return startJob("sync", `Syncing ${subject}`, { done: 0, total: items.length, unit: "entries" }, async (report, signal) => {
     const copied: TransferResult[] & { skipped?: SyncSkip[] } = [];
     const skipped: SyncSkip[] = [];
+    const stopped = () => Object.assign(new AppError("The sync was cancelled", 409, "JOB_CANCELLED"), { completed: Object.assign(copied, { skipped }) });
     for (const [index, item] of items.entries()) {
-      if (signal.aborted) throw Object.assign(new AppError("The sync was cancelled", 409, "JOB_CANCELLED"), { completed: Object.assign(copied, { skipped }) });
+      if (signal.aborted) throw stopped();
       report({ done: index, total: items.length, unit: "entries" });
       let relative = item.path;
       try {
         relative = normalizeRelative(item.path);
         if (!relative) throw new AppError("Choose items inside the folders", 400, "INVALID_PATH");
-        const [fromBase, toBase] = item.to === "right" ? [left, right] : [right, left];
-        const source = join(fromBase, relative);
-        const target = join(toBase, relative);
-        const [fromThen, toThen] = item.to === "right" ? [item.left, item.right] : [item.right, item.left];
-        if (!fromThen || !unchanged(await current(source), fromThen) || !unchanged(await current(target), toThen)) {
-          skipped.push({ path: relative, reason: "changed" });
-          continue;
+        const [fromSide, toSide] = item.to === "right" ? ["left", "right"] as const : ["right", "left"] as const;
+        const bases = { left, right };
+        const parts = relative.split("/");
+        const name = parts.pop()!;
+        // Each folder on the way must be a real folder, where the comparison found it.
+        const folder = (side: "left" | "right") => ({ relative: join(bases[side], parts.join("/")).replace(/\/$/, ""), real: path.join(real[side], ...parts) });
+        const { result, trashed } = await syncItem(folder(fromSide), folder(toSide), name, {
+          source: (stat) => matches(stat, item[fromSide]),
+          target: (stat) => matches(stat, item[toSide]),
+        }, signal);
+        copied.push(result);
+        if (trashed) {
+          replaced.push({ path: result.path, trashId: trashed });
+          await rewriteLinkedPaths([{ from: result.path }], username);
         }
-        if (toThen) {
-          await deleteEntries([target]);
-          await rewriteLinkedPaths([{ from: target }], username);
-        }
-        const parent = path.posix.dirname(target);
-        copied.push(...await copyOrMove([source], parent === "." ? "" : parent, false, { signal }));
       } catch (error) {
-        if (signal.aborted) throw Object.assign(new AppError("The sync was cancelled", 409, "JOB_CANCELLED"), { completed: Object.assign(copied, { skipped }) });
-        skipped.push({ path: relative, reason: "failed", message: error instanceof AppError ? error.message : "It couldn't be copied" });
-        if (!(error instanceof AppError)) console.error("A sync item failed", error);
+        if (signal.aborted) throw stopped();
+        if (error instanceof SyncChanged) skipped.push({ path: relative, reason: "changed" });
+        else {
+          skipped.push({ path: relative, reason: "failed", message: error instanceof AppError ? error.message : "It couldn't be copied" });
+          if (!(error instanceof AppError)) console.error("A sync item failed", error);
+        }
       }
     }
     report({ done: items.length, total: items.length, unit: "entries" });
     return Object.assign(copied, { skipped });
   }, async (job) => {
-    await audit("fs.sync", { username, left, right, items: items.length, copied: job.transferred?.length ?? 0, skipped: job.skipped?.length || undefined, status: job.status, error: job.error });
+    await audit("fs.sync", { username, left, right, items: items.length, copied: job.transferred?.map((item) => item.path), replaced: replaced.length ? replaced : undefined, skipped: job.skipped?.length ? job.skipped : undefined, status: job.status, error: job.error });
   });
 }

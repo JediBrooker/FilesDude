@@ -34,6 +34,7 @@ async function write(root: string, files: Record<string, string>, mtime?: Date) 
 const OLD = new Date("2024-01-01T10:00:00Z");
 const NEW = new Date("2025-06-01T10:00:00Z");
 const summary = (result: FolderComparison) => Object.fromEntries(result.differences.map((item) => [item.path, item.status === "changed" ? `changed:${item.newer ?? ""}${item.contentsDiffer ? ":contents" : ""}` : item.status]));
+const bases = (result: FolderComparison) => ({ left: result.leftId, right: result.rightId });
 const plan = (result: FolderComparison, choices: Record<string, "left" | "right">): SyncItem[] => Object.entries(choices).map(([itemPath, to]) => {
   const item = result.differences.find((difference) => difference.path === itemPath) as CompareDifference;
   assert.ok(item, itemPath);
@@ -118,7 +119,7 @@ test("syncing copies the chosen differences, replacing older files through the t
     await write(root, { "a/new/deep/x.txt": "x", "a/edited.txt": "version 2", "b/only-right.txt": "r", "a/left-alone.txt": "skip me" }, NEW);
     await write(root, { "b/edited.txt": "version 1" }, OLD);
     const before = await compareFolders("a", "b");
-    const job = await startSyncJob("owner", "a", "b", plan(before, { new: "right", "edited.txt": "right", "only-right.txt": "left" }));
+    const job = await startSyncJob("owner", "a", "b", plan(before, { new: "right", "edited.txt": "right", "only-right.txt": "left" }), bases(before));
     const { state } = await waitForJob(job.id);
     assert.equal(state.status, "done");
     assert.deepEqual(state.skipped, []);
@@ -142,7 +143,7 @@ test("items changed since the comparison are left alone, and without the trash n
     const before = await compareFolders("a", "b");
     // Someone edits one side of each of two items meanwhile, and adds the third on the other side.
     await write(root, { "a/one.txt": "newer still", "b/two.txt": "edited here", "b/three.txt": "made meanwhile" });
-    const { state } = await waitForJob((await startSyncJob("owner", "a", "b", plan(before, { "one.txt": "right", "two.txt": "right", "three.txt": "right" }))).id);
+    const { state } = await waitForJob((await startSyncJob("owner", "a", "b", plan(before, { "one.txt": "right", "two.txt": "right", "three.txt": "right" }), bases(before))).id);
     assert.deepEqual(state.skipped?.map((item) => [item.path, item.reason]), [["one.txt", "changed"], ["two.txt", "changed"], ["three.txt", "changed"]]);
     assert.equal(await fs.readFile(path.join(root, "b/two.txt"), "utf8"), "edited here");
     assert.equal(await fs.readFile(path.join(root, "b/three.txt"), "utf8"), "made meanwhile");
@@ -152,7 +153,7 @@ test("items changed since the comparison are left alone, and without the trash n
     await write(root, { "a/f.txt": "new" }, NEW);
     await write(root, { "b/f.txt": "old" }, OLD);
     const before = await compareFolders("a", "b");
-    await assert.rejects(startSyncJob("owner", "a", "b", plan(before, { "f.txt": "right" })), /trash is turned off/);
+    await assert.rejects(startSyncJob("owner", "a", "b", plan(before, { "f.txt": "right" }), bases(before)), /trash is turned off/);
     assert.equal(await fs.readFile(path.join(root, "b/f.txt"), "utf8"), "old");
   }, false);
 });
@@ -161,20 +162,21 @@ test("sync items stay inside the compared folders and the account's folder", asy
   await withRoot(async (root) => {
     await write(root, { "home/bob/a/f.txt": "f", "home/bob/secret.txt": "s", "home/alice/x.txt": "x" });
     await fs.mkdir(path.join(root, "home/bob/b"));
-    const side = { type: "file" as const, size: 1, mtimeMs: 0, modified: "" };
+    const side = { type: "file" as const, size: 1, mtimeMs: 0, modified: "", id: "1:1" };
     await runInScope({ accountKey: "bob", username: "bob", role: "editor", root: "home/bob" }, async () => {
       const items: SyncItem[] = [
         { path: "../secret.txt", to: "right", left: side, right: null },
         { path: "../../alice/x.txt", to: "right", left: side, right: null },
         { path: ".filedude/trash", to: "right", left: side, right: null },
       ];
-      const { state } = await waitForJob((await startSyncJob("bob", "home/bob/a", "home/bob/b", items)).id);
+      const compared = await compareFolders("home/bob/a", "home/bob/b");
+      const { state } = await waitForJob((await startSyncJob("bob", "home/bob/a", "home/bob/b", items, bases(compared))).id);
       assert.equal(state.status, "done", JSON.stringify(state));
       assert.deepEqual(state.transferred, []);
       assert.equal(state.skipped?.length, 3);
       assert.deepEqual(await fs.readdir(path.join(root, "home/bob/b")), []);
-      await assert.rejects(startSyncJob("bob", "home/bob/a", "home/alice", items));
-      await assert.rejects(startSyncJob("bob", "home/bob/a", "home/bob/a", items), /neither inside the other/);
+      await assert.rejects(startSyncJob("bob", "home/bob/a", "home/alice", items, bases(compared)));
+      await assert.rejects(startSyncJob("bob", "home/bob/a", "home/bob/a", items, bases(compared)), /neither inside the other/);
     });
   });
 });
@@ -187,5 +189,39 @@ test("copies keep each item's modified time, folders included", async () => {
     await copyOrMove(["src/folder"], "dest", false);
     assert.equal((await fs.stat(path.join(root, "dest/folder/file.txt"))).mtimeMs, OLD.getTime());
     assert.equal((await fs.stat(path.join(root, "dest/folder"))).mtimeMs, OLD.getTime());
+  });
+});
+
+test("a folder swapped for a link after comparing is never written through", async () => {
+  await withRoot(async (root) => {
+    await write(root, { "a/cfg/app.conf": "mine", "a/top.txt": "t", "elsewhere/cfg/keep.txt": "theirs" }, NEW);
+    await fs.mkdir(path.join(root, "b/cfg"), { recursive: true });
+    const before = await compareFolders("a", "b");
+    // Another user swaps the right side's folder for a link to somewhere else.
+    await fs.rename(path.join(root, "b/cfg"), path.join(root, "b/cfg-moved"));
+    await fs.symlink(path.join(root, "elsewhere/cfg"), path.join(root, "b/cfg"));
+    const { state } = await waitForJob((await startSyncJob("owner", "a", "b", plan(before, { "cfg/app.conf": "right", "top.txt": "right" }), bases(before))).id);
+    assert.deepEqual(state.skipped?.map((item) => [item.path, item.reason]), [["cfg/app.conf", "changed"]]);
+    assert.deepEqual(await fs.readdir(path.join(root, "elsewhere/cfg")), ["keep.txt"]);
+    assert.equal(await fs.readFile(path.join(root, "b/top.txt"), "utf8"), "t");
+    // The whole right folder swapped for a link: nothing starts at all.
+    await fs.rename(path.join(root, "b"), path.join(root, "b-real"));
+    await fs.symlink(path.join(root, "elsewhere"), path.join(root, "b"));
+    await assert.rejects(startSyncJob("owner", "a", "b", plan(before, { "top.txt": "right" }), bases(before)), /changed since they were compared/);
+  });
+});
+
+test("a file swapped for another of the same size and time isn't replaced", async () => {
+  await withRoot(async (root) => {
+    await write(root, { "a/f.txt": "newer" }, NEW);
+    await write(root, { "b/f.txt": "older" }, OLD);
+    const before = await compareFolders("a", "b");
+    // A different file, made to look the same.
+    await fs.rm(path.join(root, "b/f.txt"));
+    await write(root, { "b/f.txt": "other" }, OLD);
+    const { state } = await waitForJob((await startSyncJob("owner", "a", "b", plan(before, { "f.txt": "right" }), bases(before))).id);
+    assert.deepEqual(state.skipped?.map((item) => item.reason), ["changed"]);
+    assert.equal(await fs.readFile(path.join(root, "b/f.txt"), "utf8"), "other");
+    assert.equal((await listTrash()).items.length, 0);
   });
 });
