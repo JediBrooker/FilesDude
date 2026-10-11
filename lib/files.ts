@@ -22,7 +22,7 @@ function trashItemVisible(originalPath: string | null) {
   if (!scope || scope.role === "owner") return true;
   return originalPath !== null && withinScope(originalPath, scope.root);
 }
-import type { BulkRenameRule, DeleteResult, DiskInfo, EntryType, FileEntry, IdentityOption, JobProgress, LargestFilesResult, LargestFilesScanning, OwnershipPair, RenamePreview, TransferResult, TrashItem, TrashListing, TrashRestoreResult } from "./types";
+import type { AccessReport, BulkRenameRule, DeleteResult, DiskInfo, EntryType, FileEntry, IdentityOption, JobProgress, LargestFilesResult, LargestFilesScanning, OwnershipPair, RenamePreview, TransferResult, TrashItem, TrashListing, TrashRestoreResult } from "./types";
 import { canChangeOwnership } from "./privileges";
 
 export const INTERNAL_NAMES = new Set([".filedude"]);
@@ -1894,19 +1894,172 @@ function startRecovery() {
   void runUnscoped(() => recoverInterruptedCopies()).catch((error: unknown) => console.error("Could not clean up interrupted copies", error));
 }
 
-export async function changeMode(paths: string[], mode: string) {
-  if (!/^[0-7]{3,4}$/.test(mode)) throw new AppError("Permissions must be an octal value such as 755", 400);
-  // Set-user-id and set-group-id bits are never set from here (copies drop them too); the sticky bit is.
-  const bits = Number.parseInt(mode, 8) & 0o1777;
-  for (const relativePath of paths) await fs.chmod(await safeResolve(relativePath), bits);
+/**
+ * Permissions and ownership to set: a mode for files and one for folders, an owner, a group (null:
+ * as is). With `keepSpecial`, a folder keeps its set-group-id and sticky bits (as chmod does for a
+ * three-digit mode).
+ */
+export type AccessChange = { fileMode: number | null; folderMode: number | null; uid: number | null; gid: number | null; recursive: boolean; keepSpecial?: boolean };
+
+const ACCESS_LIMITS = { entries: 500_000, milliseconds: 10 * 60_000 };
+// Opening a path this way never opens the item itself (a device swapped in can't be set off).
+const O_PATH = 0o10000000;
+const SPECIAL_FOLDER_BITS = 0o3000;
+
+/**
+ * Sets permissions and ownership on items, and with `recursive` on everything inside folders,
+ * files and folders each getting their own mode. The walk goes through open folders, never follows
+ * links, and stays on the first item's filesystem; links, special files, FilesDude's own folders,
+ * snapshot folders (.zfs), and, inside folders, files with other hard links (which would change
+ * elsewhere too) are left alone and counted. Each change is made through the item itself, once it's
+ * confirmed to be the item looked at. Files never get set-user-id or set-group-id; folders may get
+ * set-group-id. Without `apply`, it only counts what would change.
+ */
+export async function changeAccess(paths: string[], change: AccessChange, { apply, signal, report, limits = ACCESS_LIMITS }: { apply: boolean; signal?: AbortSignal; report?: (progress: JobProgress) => void; limits?: typeof ACCESS_LIMITS }): Promise<AccessReport> {
+  if (change.fileMode !== null && (!Number.isInteger(change.fileMode) || change.fileMode < 0 || change.fileMode > 0o1777)) throw new AppError("Files can't be given set-user-id or set-group-id here; use a mode such as 644", 400, "INVALID_MODE");
+  if (change.folderMode !== null && (!Number.isInteger(change.folderMode) || change.folderMode < 0 || change.folderMode > 0o3777)) throw new AppError("Folders can't be given set-user-id; use a mode such as 755 or 2775", 400, "INVALID_MODE");
+  for (const id of [change.uid, change.gid]) {
+    if (id !== null && (!Number.isInteger(id) || id < 0 || id > 4_294_967_294)) throw new AppError("Owner and group must be numeric ids", 400, "INVALID_OWNER");
+  }
+  const result: AccessReport = { files: 0, folders: 0, changing: 0, changed: 0, skipped: 0, linked: 0, elsewhere: 0, complete: true };
+  const startedAt = Date.now();
+  let seen = 0;
+  const cancelled = () => new AppError("The change was cancelled", 409, "JOB_CANCELLED");
+  const stopShort = (reason: NonNullable<AccessReport["reason"]>) => {
+    result.complete = false;
+    result.reason = reason;
+    throw new AccessStop();
+  };
+  const wanted = (stat: Stats, folder: boolean) => {
+    const mode = folder ? change.folderMode : change.fileMode;
+    if (mode === null) return null;
+    return folder && change.keepSpecial ? (mode & 0o777) | (stat.mode & SPECIAL_FOLDER_BITS) | (mode & 0o1000) : mode;
+  };
+
+  async function applyTo(parent: AnchoredDirectory, name: string, before: Stats, folder: boolean) {
+    const flags = ON_LINUX
+      ? O_PATH | constants.O_NOFOLLOW | (folder ? constants.O_DIRECTORY : 0)
+      : constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK | constants.O_NOCTTY | (folder ? constants.O_DIRECTORY : 0);
+    const handle = await fs.open(inside(parent, name), flags).catch(() => null);
+    if (!handle) {
+      result.skipped += 1;
+      return;
+    }
+    try {
+      const now = await handle.stat();
+      // Swapped for something else since it was looked at: left alone.
+      if (now.dev !== before.dev || now.ino !== before.ino || (folder ? !now.isDirectory() : !now.isFile())) {
+        result.skipped += 1;
+        return;
+      }
+      const mode = wanted(now, folder);
+      const ownerChanges = (change.uid !== null && now.uid !== change.uid) || (change.gid !== null && now.gid !== change.gid);
+      if (ON_LINUX) {
+        // Through the open item (it was checked to be this file or folder, not a link).
+        const target = `/proc/self/fd/${handle.fd}`;
+        if (ownerChanges) await fs.chown(target, change.uid ?? now.uid, change.gid ?? now.gid);
+        if (mode !== null) await fs.chmod(target, mode);
+      } else {
+        if (ownerChanges) await handle.chown(change.uid ?? now.uid, change.gid ?? now.gid);
+        if (mode !== null) await handle.chmod(mode);
+      }
+      result.changed += 1;
+    } catch {
+      // Read-only, immutable, and the like: left as it is, and counted.
+      result.skipped += 1;
+    } finally {
+      await handle.close();
+    }
+  }
+
+  async function visit(parent: AnchoredDirectory, name: string, depth: number, device: number | null): Promise<void> {
+    if (signal?.aborted) throw cancelled();
+    seen += 1;
+    if (seen > limits.entries) stopShort("limit");
+    if (Date.now() - startedAt > limits.milliseconds) stopShort("time");
+    if (seen % 200 === 0) report?.({ done: seen, unit: "entries" });
+    const stat = await fs.lstat(inside(parent, name)).catch(() => null);
+    if (!stat) return;
+    const folder = stat.isDirectory();
+    if ((!folder && !stat.isFile()) || name === ".zfs" || (folder && (await isReservedLocation(path.join(parent.real, name))))) {
+      result.skipped += 1;
+      return;
+    }
+    // Other filesystems mounted inside are left alone.
+    if (device !== null && stat.dev !== device) {
+      result.elsewhere += 1;
+      return;
+    }
+    // Inside folders, a file with other names would change wherever those are too.
+    if (depth > 0 && !folder && stat.nlink > 1) {
+      result.linked += 1;
+      return;
+    }
+    if (folder) result.folders += 1;
+    else result.files += 1;
+    const mode = wanted(stat, folder);
+    const changes = (mode !== null && (stat.mode & 0o7777) !== mode) || (change.uid !== null && stat.uid !== change.uid) || (change.gid !== null && stat.gid !== change.gid);
+    if (changes) {
+      result.changing += 1;
+      if (apply) await applyTo(parent, name, stat, folder);
+    }
+    if (!folder || !change.recursive) return;
+    if (depth >= MAX_TREE_DEPTH) {
+      result.skipped += 1;
+      return;
+    }
+    let opened: AnchoredDirectory;
+    try {
+      opened = await openChild(parent, name);
+    } catch {
+      // Gone, or swapped for a link or a file: left alone.
+      result.skipped += 1;
+      return;
+    }
+    try {
+      // Only the folder looked at, not one swapped in under its name.
+      if (identityOf(opened.stat) !== identityOf(stat)) {
+        result.skipped += 1;
+        return;
+      }
+      const directory = await fs.opendir(opened.base).catch(() => null);
+      if (!directory) {
+        result.skipped += 1;
+        return;
+      }
+      try {
+        for await (const entry of directory) {
+          if (INTERNAL_NAMES.has(entry.name)) continue;
+          try {
+            await visit(opened, entry.name, depth + 1, device ?? stat.dev);
+          } catch (error) {
+            if (error instanceof AccessStop || (error instanceof AppError && error.code === "JOB_CANCELLED")) throw error;
+            result.skipped += 1;
+          }
+        }
+      } finally {
+        await directory.close().catch(() => undefined);
+      }
+    } finally {
+      await opened.handle.close().catch(() => undefined);
+    }
+  }
+
+  try {
+    for (const relativePath of [...new Set(paths.map(cleanRelative))]) {
+      await withParent(relativePath, async (parent, name) => {
+        const top = await fs.lstat(inside(parent, name)).catch(() => null);
+        await visit(parent, name, 0, top?.dev ?? null);
+      });
+    }
+  } catch (error) {
+    if (!(error instanceof AccessStop)) throw error;
+  }
+  report?.({ done: seen, unit: "entries" });
+  return result;
 }
 
-export async function changeOwner(paths: string[], uid: number, gid: number) {
-  if (!Number.isInteger(uid) || uid < 0 || !Number.isInteger(gid) || gid < 0) {
-    throw new AppError("Owner and group must be numeric ids", 400);
-  }
-  for (const relativePath of paths) await fs.chown(await safeResolve(relativePath), uid, gid);
-}
+class AccessStop extends Error {}
 
 export async function writeTextFile(relativePath: string, content: string) {
   const maxBytes = 2 * 1024 * 1024;

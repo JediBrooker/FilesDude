@@ -4,8 +4,7 @@ import { audit } from "@/lib/audit";
 import { assertMutationRequest, AppError, jsonError, readJsonBody } from "@/lib/http";
 import {
   applyBulkRename,
-  changeMode,
-  changeOwner,
+  changeAccess,
   createEntry,
   createLink,
   deleteEntries,
@@ -149,12 +148,13 @@ export async function POST(request: Request) {
         await rewriteLinked(paths.map((favoritePath) => ({ from: favoritePath })));
         break;
       case "chmod":
-        if (!body.mode) throw new AppError("Permissions are required");
-        await changeMode(paths, body.mode);
+        // Through the same careful walk as the permissions dialog: one item, no links followed.
+        if (typeof body.mode !== "string" || !/^[0-7]{3,4}$/.test(body.mode)) throw new AppError("Permissions must be an octal value such as 755", 400, "INVALID_MODE");
+        await changeAccess(paths, { fileMode: Number.parseInt(body.mode, 8) & 0o1777, folderMode: Number.parseInt(body.mode, 8) & 0o3777, uid: null, gid: null, recursive: false, keepSpecial: body.mode.length === 3 }, { apply: true });
         break;
       case "chown":
         if (body.uid === undefined || body.gid === undefined) throw new AppError("Owner and group ids are required");
-        await changeOwner(paths, Number(body.uid), Number(body.gid));
+        await changeAccess(paths, { fileMode: null, folderMode: null, uid: Number(body.uid), gid: Number(body.gid), recursive: false }, { apply: true });
         break;
       case "bulkRename":
         if (!body.rule) throw new AppError("Bulk rename rules are required");
