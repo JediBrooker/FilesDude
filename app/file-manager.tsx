@@ -1197,7 +1197,7 @@ export function FileManager() {
     } else if (job.kind === "access") {
       const report = job.access;
       if (job.status === "done" && report) {
-        const notes = [report.skipped ? `${itemCount(report.skipped)} left alone (links, special files, or changed meanwhile)` : "", !report.complete ? "stopped early: too many items" : ""].filter(Boolean).join(" · ");
+        const notes = [report.skipped ? `${itemCount(report.skipped)} left alone (links, special files, or changed meanwhile)` : "", report.linked ? `${report.linked.toLocaleString()} hard-linked ${report.linked === 1 ? "file" : "files"} left alone` : "", report.elsewhere ? `${report.elsewhere.toLocaleString()} on other disks left alone` : "", !report.complete ? "stopped early: too many items" : ""].filter(Boolean).join(" · ");
         notify(`${report.changed ? `${itemCount(report.changed)} updated` : "Nothing needed changing"}${notes ? ` · ${notes}` : ""}`, notes ? "error" : undefined);
       } else if (job.status === "failed") notify(job.error || "The change failed", "error");
       else notify(`Change cancelled${report?.changed ? ` after ${itemCount(report.changed)}` : ""}`);
@@ -4356,7 +4356,7 @@ function DeleteDialog({ entries, onClose, onRun }: { entries: FileEntry[]; onClo
 
 const OCTAL = /^[0-7]{3,4}$/;
 const FILE_PRESETS = ["644", "664", "640", "600"];
-const FOLDER_PRESETS = ["755", "775", "750", "700"];
+const FOLDER_PRESETS = ["755", "775", "2775", "700"];
 
 function ModeField({ label, hint, value, presets, onChange }: { label: string; hint: string; value: string; presets: string[]; onChange: (value: string) => void }) {
   return (
@@ -4424,12 +4424,12 @@ function AccessDialog({ what, entries, onClose, onJob }: { what: "permissions" |
           ? <><div className="field-pair"><FormField label="User ID (UID)" hint="Leave empty to keep it"><input value={uid} onChange={(event) => setUid(event.target.value.trim())} inputMode="numeric" /></FormField><FormField label="Group ID (GID)" hint="Leave empty to keep it"><input value={gid} onChange={(event) => setGid(event.target.value.trim())} inputMode="numeric" /></FormField></div><div className="info-box"><Info size={17} /> Use IDs from the Proxmox host or container, such as <code>0:0</code> for root, or <code>100000</code> for root in an unprivileged container.</div></>
           : <div className={showFiles && hasFolders ? "field-pair access-modes" : "access-modes"}>
             {showFiles && <ModeField label={hasFolders ? "Files" : "Octal mode"} hint="644: you write, everyone reads" value={fileMode} presets={FILE_PRESETS} onChange={setFileMode} />}
-            {hasFolders && <ModeField label={showFiles ? "Folders" : "Octal mode"} hint="755: you change, everyone opens" value={folderMode} presets={FOLDER_PRESETS} onChange={setFolderMode} />}
+            {hasFolders && <ModeField label={showFiles ? "Folders" : "Octal mode"} hint="755: you change, everyone opens; 2775 keeps new items in the folder's group" value={folderMode} presets={FOLDER_PRESETS} onChange={setFolderMode} />}
           </div>}
         {hasFolders && <label className="access-recursive"><input type="checkbox" checked={recursive} onChange={(event) => setRecursive(event.target.checked)} /> Also everything inside {entries.filter((entry) => entry.type === "directory").length === 1 ? "the folder" : "the folders"}</label>}
         <div className="access-preview">
           {shown
-            ? <span><strong>{shown.changing.toLocaleString()} of {(shown.files + shown.folders).toLocaleString()}</strong> {shown.files + shown.folders === 1 ? "item" : "items"} will change ({shown.files.toLocaleString()} {shown.files === 1 ? "file" : "files"}, {shown.folders.toLocaleString()} {shown.folders === 1 ? "folder" : "folders"}){shown.skipped ? ` · ${shown.skipped.toLocaleString()} left alone (links and special files)` : ""}{!shown.complete ? " · counted only part: there are a great many" : ""}</span>
+            ? <span><strong>{shown.changing.toLocaleString()} of {(shown.files + shown.folders).toLocaleString()}</strong> {shown.files + shown.folders === 1 ? "item" : "items"} will change ({shown.files.toLocaleString()} {shown.files === 1 ? "file" : "files"}, {shown.folders.toLocaleString()} {shown.folders === 1 ? "folder" : "folders"}){shown.skipped ? ` · ${shown.skipped.toLocaleString()} left alone (links and special files)` : ""}{shown.linked ? ` · ${shown.linked.toLocaleString()} hard-linked ${shown.linked === 1 ? "file" : "files"} left alone (they'd change elsewhere too)` : ""}{shown.elsewhere ? ` · ${shown.elsewhere.toLocaleString()} on other disks left alone` : ""}{!shown.complete ? " · counted only part: there are a great many" : ""}</span>
             : <span className="muted">Check what will change before changing it{recursive ? ", as this reaches everything inside" : ""}.</span>}
           <button type="button" className="button secondary" disabled={busy || !valid} onClick={() => void check()}>{busy ? <LoaderCircle className="spin" size={15} /> : <Search size={15} />} Check</button>
         </div>

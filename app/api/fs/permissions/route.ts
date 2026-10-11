@@ -12,10 +12,11 @@ export const dynamic = "force-dynamic";
 // A preview only counts, so it stops sooner than the change itself.
 const PREVIEW_LIMITS = { entries: 200_000, milliseconds: 30_000 };
 
+// Given as octal text; the walk refuses set-user-id on anything and set-group-id on files.
 function mode(value: unknown) {
   if (value === undefined || value === null || value === "") return null;
   if (typeof value !== "string" || !/^[0-7]{3,4}$/.test(value)) throw new AppError("Permissions must be an octal value such as 755", 400, "INVALID_MODE");
-  return Number.parseInt(value, 8) & 0o1777;
+  return Number.parseInt(value, 8);
 }
 
 function id(value: unknown) {
@@ -37,7 +38,8 @@ export async function POST(request: Request) {
       const paths = Array.isArray(body.paths) ? body.paths : [];
       if (!paths.length || paths.length > 1_000 || paths.some((item) => typeof item !== "string" || !item || item.length > 4096)) throw new AppError("Choose between 1 and 1,000 items", 400, "INVALID_PATHS");
       if (body.recursive !== undefined && typeof body.recursive !== "boolean") throw new AppError("Request body is invalid", 400, "INVALID_REQUEST");
-      const change: AccessChange = { fileMode: mode(body.fileMode), folderMode: mode(body.folderMode), uid: id(body.uid), gid: id(body.gid), recursive: Boolean(body.recursive) };
+      // A three-digit folder mode keeps folders' set-group-id and sticky bits, as chmod does.
+      const change: AccessChange = { fileMode: mode(body.fileMode), folderMode: mode(body.folderMode), uid: id(body.uid), gid: id(body.gid), recursive: Boolean(body.recursive), keepSpecial: typeof body.folderMode === "string" && body.folderMode.length === 3 };
       if (change.fileMode === null && change.folderMode === null && change.uid === null && change.gid === null) throw new AppError("Choose permissions or an owner to set", 400, "NOTHING_TO_CHANGE");
       if (body.action === "preview") {
         const report = await changeAccess(paths as string[], change, { apply: false, signal: request.signal, limits: PREVIEW_LIMITS });

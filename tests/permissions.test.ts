@@ -61,7 +61,9 @@ test("links aren't followed, special files and FilesDude's own folders are left 
     await fs.symlink("../.filedude", path.join(root, "tree/internal"));
     execFileSync("mkfifo", [path.join(root, "tree/pipe")]);
     await fs.chmod(path.join(root, "tree/tool"), 0o4755);
-    const report = await changeAccess(["tree"], { fileMode: 0o4777, folderMode: 0o755, uid: null, gid: null, recursive: true }, { apply: true });
+    await assert.rejects(changeAccess(["tree"], { fileMode: 0o4777, folderMode: 0o755, uid: null, gid: null, recursive: true }, { apply: true }), /set-user-id/);
+    await assert.rejects(changeAccess(["tree"], { fileMode: 0o644, folderMode: 0o4755, uid: null, gid: null, recursive: true }, { apply: true }), /set-user-id/);
+    const report = await changeAccess(["tree"], { fileMode: 0o777, folderMode: 0o755, uid: null, gid: null, recursive: true }, { apply: true });
     assert.equal(report.skipped, 3);
     assert.equal(await modeOf(path.join(root, "outside/secret.txt")), "600");
     assert.equal(await modeOf(path.join(root, ".filedude/trash/x")), "600");
@@ -72,6 +74,27 @@ test("links aren't followed, special files and FilesDude's own folders are left 
   });
 });
 
+test("hard-linked files inside folders are left alone, and folders can keep or get set-group-id", async () => {
+  await withRoot(async (root) => {
+    await write(root, { "elsewhere/private.txt": "p", "shared/plain.txt": "x" });
+    await fs.chmod(path.join(root, "elsewhere/private.txt"), 0o600);
+    await fs.link(path.join(root, "elsewhere/private.txt"), path.join(root, "shared/planted.txt"));
+    const report = await changeAccess(["shared"], { fileMode: 0o644, folderMode: 0o2775, uid: null, gid: null, recursive: true }, { apply: true });
+    assert.equal(report.linked, 1);
+    assert.equal(await modeOf(path.join(root, "elsewhere/private.txt")), "600");
+    assert.equal(await modeOf(path.join(root, "shared/plain.txt")), "644");
+    assert.equal(await modeOf(path.join(root, "shared")), "2775");
+    // A three-digit mode keeps a folder's set-group-id, as chmod does; four digits set it exactly.
+    await changeAccess(["shared"], { fileMode: null, folderMode: 0o750, uid: null, gid: null, recursive: false, keepSpecial: true }, { apply: true });
+    assert.equal(await modeOf(path.join(root, "shared")), "2750");
+    await changeAccess(["shared"], { fileMode: null, folderMode: 0o750, uid: null, gid: null, recursive: false }, { apply: true });
+    assert.equal(await modeOf(path.join(root, "shared")), "750");
+    // Chosen directly, a hard-linked file is changed.
+    await changeAccess(["shared/planted.txt"], { fileMode: 0o640, folderMode: null, uid: null, gid: null, recursive: false }, { apply: true });
+    assert.equal(await modeOf(path.join(root, "elsewhere/private.txt")), "640");
+  });
+});
+
 test("counting stops at its limits and says so, and bad values are refused", async () => {
   await withRoot(async (root) => {
     const files: Record<string, string> = {};
@@ -79,8 +102,8 @@ test("counting stops at its limits and says so, and bad values are refused", asy
     await write(root, files);
     const short = await changeAccess(["many"], { ...modes, recursive: true }, { apply: false, limits: { entries: 5, milliseconds: 60_000 } });
     assert.deepEqual([short.complete, short.reason], [false, "limit"]);
-    await assert.rejects(changeAccess(["many"], { ...modes, fileMode: 0o17777, recursive: false }, { apply: false }), /octal/);
-    await assert.rejects(changeAccess(["many"], { ...modes, fileMode: 1.5, recursive: false }, { apply: false }), /octal/);
+    await assert.rejects(changeAccess(["many"], { ...modes, fileMode: 0o17777, recursive: false }, { apply: false }), /mode such as/);
+    await assert.rejects(changeAccess(["many"], { ...modes, fileMode: 1.5, recursive: false }, { apply: false }), /mode such as/);
     await assert.rejects(changeAccess(["many"], { ...modes, uid: -1, recursive: false }, { apply: false }), /numeric/);
     await assert.rejects(changeAccess(["../outside"], { ...modes, recursive: false }, { apply: false }));
   });

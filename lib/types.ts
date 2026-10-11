@@ -197,8 +197,12 @@ export interface AccessReport {
   changing: number;
   /** Items changed (when applied). */
   changed: number;
-  /** Links, special files, FilesDude's own folders, and items that changed meanwhile. */
+  /** Links, special files, FilesDude's own folders, and items that changed meanwhile or couldn't be changed. */
   skipped: number;
+  /** Files inside folders with other hard links (changing them would change them elsewhere too). */
+  linked: number;
+  /** Items on other filesystems mounted inside. */
+  elsewhere: number;
   complete: boolean;
   reason?: "limit" | "time";
 }
