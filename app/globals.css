@@ -805,6 +805,22 @@ kbd { padding: 3px 5px; border: 1px solid var(--line); border-bottom-width: 2px;
 .share-link-actions input { min-width: 0; height: 32px; flex: 1; padding: 0 9px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--panel); color: var(--ink); font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; font-size: 9px; }
 .share-link-actions .button { min-height: 32px; padding: 0 10px; font-size: 9px; }
 .button.danger-text { color: var(--danger); }
+.saved-searches { position: relative; }
+.saved-searches-menu { position: absolute; top: calc(100% + 6px); left: 0; z-index: 40; display: flex; width: min(360px, 86vw); flex-direction: column; gap: 8px; padding: 10px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); box-shadow: 0 14px 40px rgb(0 0 0 / 16%); }
+.saved-searches-save { display: flex; flex-direction: column; gap: 6px; padding-bottom: 8px; border-bottom: 1px solid var(--line); }
+.saved-searches-save small { color: var(--ink-soft); font-size: 10px; }
+.saved-searches-save > div { display: flex; gap: 6px; }
+.saved-searches-save input { min-width: 0; flex: 1; min-height: 32px; }
+.saved-searches-save .button { min-height: 32px; padding: 0 10px; }
+.saved-searches-hint { display: flex; align-items: center; gap: 6px; margin: 0; color: var(--ink-soft); font-size: 11px; }
+.saved-searches-list { display: flex; max-height: 300px; flex-direction: column; gap: 2px; margin: 0; padding: 0; overflow-y: auto; list-style: none; }
+.saved-searches-list li { display: flex; align-items: center; gap: 4px; border-radius: 8px; }
+.saved-searches-list li:hover { background: var(--panel-soft); }
+.saved-search-run { display: flex; min-width: 0; flex: 1; align-items: flex-start; gap: 8px; padding: 6px 8px; border: 0; background: transparent; color: inherit; cursor: pointer; text-align: left; }
+.saved-search-run svg { flex: 0 0 auto; margin-top: 2px; color: var(--brand); }
+.saved-search-run span { display: flex; min-width: 0; flex-direction: column; }
+.saved-search-run strong { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.saved-search-run small { overflow: hidden; color: var(--ink-soft); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .search-mode { display: flex; height: 39px; align-items: center; gap: 2px; padding: 3px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel); }
 .search-mode button { height: 100%; padding: 0 10px; border: 0; border-radius: 6px; background: transparent; color: var(--ink-faint); cursor: pointer; font-size: 10px; font-weight: 700; }
 .search-mode button.active { background: var(--panel-strong); color: var(--brand-strong); }

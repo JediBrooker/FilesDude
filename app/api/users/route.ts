@@ -8,6 +8,7 @@ import { removeAccountPasskeys } from "@/lib/passkeys";
 import { forgetAccountWatching } from "@/lib/watching";
 import { forgetAccountTags } from "@/lib/tags";
 import { forgetAccountFavorites } from "@/lib/favorites";
+import { forgetAccountSearches } from "@/lib/saved-searches";
 import { resetTwoFactor } from "@/lib/two-factor";
 import { createUser, deleteUser, listUsers, updateUser } from "@/lib/users";
 
@@ -70,6 +71,7 @@ export async function POST(request: Request) {
           await forgetAccountWatching(id);
           await forgetAccountTags(id);
           await forgetAccountFavorites(id);
+          await forgetAccountSearches(id);
           await audit("users.delete", { username: session.username, account: user.username });
           break;
         default:
