@@ -46,10 +46,11 @@ const nextConfig: NextConfig = {
       },
       // The pages (not API routes or share downloads, which set their own stricter sandbox policy,
       // and which a header here would replace): no plugins, no changing the base address, no framing,
-      // and forms only send here.
+      // forms only send here, and pictures only come from here (so no file's preview can load a
+      // tracking picture from elsewhere).
       {
         source: "/:path((?!api/|s/[^/]+/download).*)",
-        headers: [{ key: "Content-Security-Policy", value: "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'" }],
+        headers: [{ key: "Content-Security-Policy", value: "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data: blob:" }],
       },
     ];
   },

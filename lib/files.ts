@@ -27,7 +27,8 @@ import { canChangeOwnership } from "./privileges";
 
 export const INTERNAL_NAMES = new Set([".filedude"]);
 const mimeTypes: Record<string, string> = {
-  ".txt": "text/plain", ".md": "text/markdown", ".json": "application/json",
+  ".txt": "text/plain", ".md": "text/markdown", ".markdown": "text/markdown", ".json": "application/json", ".geojson": "application/geo+json",
+  ".csv": "text/csv", ".tsv": "text/tab-separated-values",
   ".js": "text/javascript", ".ts": "text/typescript", ".tsx": "text/typescript",
   ".css": "text/css", ".html": "text/html", ".log": "text/plain",
   ".xml": "text/xml", ".yml": "text/yaml", ".yaml": "text/yaml", ".sh": "text/x-shellscript",
