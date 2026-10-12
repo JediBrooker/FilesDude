@@ -351,21 +351,28 @@ export function clearLoginFailures(key: string) {
 }
 
 // Checks of the current password from a signed-in session (before adding a passkey or changing
-// two-factor sign-in) are limited per account, so a session left open can't be used to guess it.
-// A try is counted as it starts; the right password clears the count.
+// two-factor sign-in, say) are limited per device, so a session left open can't be used to guess it.
+// A device is its account and when it signed in, which renewing a session keeps: wrong guesses from
+// a session someone else holds lock only that session, never its owner's other devices, which they
+// need to sign it out. A try is counted as it starts; the right password clears the count.
 const CURRENT_PASSWORD_LIMIT = 10;
+const MAX_CURRENT_PASSWORD_KEYS = 10_000;
 const currentPasswordChecks = new Map<string, { count: number; resetAt: number }>();
 
-export async function verifyCurrentPassword(accountKey: string, password: unknown, encoded: string) {
+export async function verifyCurrentPassword(session: Pick<Session, "accountKey" | "signedInAt">, password: unknown, encoded: string) {
+  const key = `${session.accountKey}\u0000${session.signedInAt}`;
   const now = Date.now();
-  let attempt = currentPasswordChecks.get(accountKey);
+  if (currentPasswordChecks.size >= MAX_CURRENT_PASSWORD_KEYS) {
+    for (const [checked, attempt] of currentPasswordChecks) if (attempt.resetAt <= now) currentPasswordChecks.delete(checked);
+  }
+  let attempt = currentPasswordChecks.get(key);
   if (!attempt || attempt.resetAt <= now) {
     attempt = { count: 0, resetAt: now + 15 * 60 * 1000 };
-    currentPasswordChecks.set(accountKey, attempt);
+    currentPasswordChecks.set(key, attempt);
   }
   if (attempt.count >= CURRENT_PASSWORD_LIMIT) throw new AppError("Too many wrong passwords. Try again in 15 minutes.", 429, "PASSWORD_LOCKED");
   attempt.count += 1;
   const valid = typeof password === "string" && password.length <= 512 && (await verifyPassword(password, encoded));
-  if (valid) currentPasswordChecks.delete(accountKey);
+  if (valid) currentPasswordChecks.delete(key);
   return valid;
 }

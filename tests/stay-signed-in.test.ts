@@ -276,6 +276,20 @@ test("with two-factor sign-in on, turning on staying signed in also needs a code
   });
 });
 
+test("wrong passwords from one session lock only that session, not its owner's other devices", async () => {
+  await withAccounts(async ({ bobId }) => {
+    const stolen = `fd_session=${createSession("bob", 1, bobId, { signedInAt: Date.now() - HOUR })}`;
+    const own = `fd_session=${createSession("bob", 1, bobId, { signedInAt: Date.now() - 2 * HOUR })}`;
+    for (let attempt = 0; attempt < 10; attempt += 1) assert.equal((await post(stolen, { action: "signOutOthers", currentPassword: `guess-${attempt}` })).status, 401);
+    assert.equal((await post(stolen, { action: "signOutOthers", currentPassword: USER_PASSWORD })).status, 429);
+    // The owner of the account can still sign the stolen session out from their own device.
+    const signedOut = await post(own, { action: "signOutOthers", currentPassword: USER_PASSWORD });
+    assert.equal(signedOut.status, 200);
+    assert.equal((await status(stolen)).authenticated, false);
+    assert.equal((await status(cookieOf(signedOut).cookie)).authenticated, true);
+  });
+});
+
 test("a session signed out while its request was under way can't come back with a new one", async () => {
   await withAccounts(async ({ bobId }) => {
     const cookie = `fd_session=${createSession("bob", 1, bobId)}`;

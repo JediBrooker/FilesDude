@@ -38,7 +38,7 @@ export async function POST(request: Request) {
       switch (body.action) {
         case "options": {
           const party = relyingParty(request);
-          if (!(await verifyCurrentPassword(account.key, body.currentPassword, account.passwordHash))) {
+          if (!(await verifyCurrentPassword(session, body.currentPassword, account.passwordHash))) {
             await audit("settings.passkey.failed", { username: session.username, reason: "INVALID_CURRENT_PASSWORD" });
             throw new AppError("Current password is incorrect", 401, "INVALID_CURRENT_PASSWORD");
           }

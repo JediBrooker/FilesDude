@@ -49,7 +49,7 @@ export async function POST(request: Request) {
     // password also removes the account's passkeys unless asked not to, since one may have been added
     // by whoever knew the old password.
     const confirmIdentity = async (accountKey: string, passwordHash: string, twoFactor: unknown) => {
-      if (!body.currentPassword || !(await verifyCurrentPassword(accountKey, body.currentPassword, passwordHash))) {
+      if (!body.currentPassword || !(await verifyCurrentPassword(session, body.currentPassword, passwordHash))) {
         await audit("settings.credentials.failed", { username: session.username });
         throw new AppError("Current password is incorrect", 401, "INVALID_CURRENT_PASSWORD");
       }

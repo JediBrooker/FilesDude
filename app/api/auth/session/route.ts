@@ -60,7 +60,7 @@ export async function POST(request: Request) {
       if (body.action !== "signOutOthers" && (body.action !== "stay" || typeof body.staySignedIn !== "boolean")) throw new AppError("Unknown sign-in operation", 400, "UNKNOWN_ACTION");
       const client = clientAddress(request);
       const failed = async (reason: string) => audit("settings.stay_signed_in.failed", { username: session.username, client, action: turningOn ? "on" : body.action === "signOutOthers" ? "signOutOthers" : "off", reason });
-      if (!(await verifyCurrentPassword(account.key, body.currentPassword, account.passwordHash))) {
+      if (!(await verifyCurrentPassword(session, body.currentPassword, account.passwordHash))) {
         await failed("INVALID_CURRENT_PASSWORD");
         throw new AppError("Current password is incorrect", 401, "INVALID_CURRENT_PASSWORD");
       }

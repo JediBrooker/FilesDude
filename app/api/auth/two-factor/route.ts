@@ -34,7 +34,7 @@ export async function POST(request: Request) {
       const account = await findAccount(session.accountKey);
       if (!account) throw new AppError("Sign in required", 401, "UNAUTHORIZED");
       const requirePassword = async () => {
-        if (!(await verifyCurrentPassword(account.key, body.currentPassword, account.passwordHash))) {
+        if (!(await verifyCurrentPassword(session, body.currentPassword, account.passwordHash))) {
           await audit("settings.two_factor.failed", { username: session.username, action: body.action });
           throw new AppError("Current password is incorrect", 401, "INVALID_CURRENT_PASSWORD");
         }
