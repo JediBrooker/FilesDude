@@ -109,6 +109,7 @@ import { ArchiveBrowserDialog } from "./archive-browser";
 import { RichPreview } from "./rich-preview";
 import { richKind } from "@/lib/rich-text";
 import { closeTab, MAX_TABS, openTab, parseTabs, shownTabs, type FolderTabs } from "@/lib/folder-tabs";
+import { FlagAU } from "./flag-au";
 import { moveCursor, selectionRange } from "@/lib/selection";
 import { INITIAL_DIRECTION, nextSort, parseSort, sortEntries, type SortKey, type SortState } from "@/lib/sort";
 import type { ContentSearchHit, ContentSearchResult, ShareLink } from "@/lib/types";
@@ -2041,6 +2042,7 @@ export function FileManager() {
           <button className="icon-button" aria-label="Sign out" title="Sign out" onClick={() => void logout()}><LogOut size={17} /></button>
         </div>
         <p className="app-version" title={APP_BUILT_AT ? `Built ${new Date(APP_BUILT_AT).toLocaleString()}` : undefined}>FilesDude v{APP_VERSION}{APP_COMMIT ? ` · ${APP_COMMIT}` : ""}</p>
+        <p className="app-version made-in">Made in Australia <FlagAU width={14} /></p>
       </aside>
 
       <main className="main-panel">
