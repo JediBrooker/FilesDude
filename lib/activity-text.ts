@@ -20,7 +20,7 @@ export const SYSTEM_ACTOR = "@system";
 
 export function activityCategory(event: string): ActivityCategory {
   if (event === "fs.download" || event === "snapshots.download" || event === "share.download") return "downloads";
-  if (event.startsWith("login.") || event === "logout") return "sign-ins";
+  if (event.startsWith("login.") || event === "logout" || event === "logout.others") return "sign-ins";
   if (event.startsWith("share.")) return "sharing";
   if (event.startsWith("users.") || event.startsWith("settings.")) return "accounts";
   if (event.startsWith("snapshots.")) return "snapshots";
@@ -107,6 +107,7 @@ function describe(entry: Entry): Omit<ActivityText, "text"> {
     case "login.two_factor.challenged": return { parts: ["entered their password and was asked for a code"], detail: client };
     case "login.two_factor.failed": return { parts: ["entered a wrong two-factor code"], detail: client, tone: "danger" };
     case "logout": return { parts: ["signed out"] };
+    case "logout.others": return { parts: ["signed out their other devices"], detail: client };
     case "fs.upload": {
       const files = typeof entry.fileCount === "number" ? entry.fileCount : Array.isArray(entry.files) ? entry.files.length : 0;
       const size = typeof entry.bytes === "number" ? ` (${formatSize(entry.bytes)})` : "";
@@ -162,6 +163,8 @@ function describe(entry: Entry): Omit<ActivityText, "text"> {
     case "settings.two_factor.disabled": return { parts: ["turned off two-factor sign-in"], tone: "warning" };
     case "settings.two_factor.recovery_codes": return { parts: ["made new recovery codes"] };
     case "settings.two_factor.failed": return { parts: ["entered a wrong two-factor code in preferences"], tone: "danger" };
+    case "settings.stay_signed_in": return { parts: [!entry.on ? "stopped staying signed in, signing out their other devices" : entry.thisDeviceOnly ? "kept a device signed in" : "chose to stay signed in"], detail: client };
+    case "settings.stay_signed_in.failed": return { parts: [entry.reason === "INVALID_CURRENT_PASSWORD" ? "entered a wrong current password while changing how long they stay signed in" : "entered a wrong two-factor code while turning on staying signed in"], detail: client, tone: "danger" };
     case "settings.notifications": return { parts: [entry.kind === "off" ? "turned notifications off" : `set notifications to go to ${str(entry.kind) === "webhook" ? "a webhook" : str(entry.kind)}`] };
     case "settings.passkey.added": return { parts: str(entry.passkey) ? t`added the passkey ${v(str(entry.passkey))}` : ["added a passkey"] };
     case "settings.passkey.renamed": return { parts: t`renamed the passkey ${v(str(entry.from))} to ${v(str(entry.passkey))}` };

@@ -1,11 +1,11 @@
 import crypto from "node:crypto";
 import { config, configurationIssues, isValidPasswordHash } from "./config";
-import { getCredentials } from "./credentials";
+import { getCredentials, updateCredentials } from "./credentials";
 import { AppError } from "./http";
 import { addressGroup } from "./address-group";
 import { connectionPeer, normalizeAddress } from "./peer";
 import type { Role } from "./scope";
-import { findUserById } from "./users";
+import { findUserById, updateUserAccount } from "./users";
 
 export interface Session {
   username: string;
@@ -14,7 +14,21 @@ export interface Session {
   accountKey: string;
   role: Role;
   root: string;
+  /** This device stays signed in: the account stays signed in, and did when this session began. */
+  staySignedIn: boolean;
+  /** When this device signed in (ms). Renewing or reissuing the session keeps it. */
+  signedInAt: number;
+  /** When the session ends (ms), unless it's renewed first. */
+  expiresAt: number;
 }
+
+// An account that stays signed in keeps each device signed in while it's used at least every
+// STAY_SIGNED_IN_DAYS days: its sessions are renewed (at most daily, when the page checks in)
+// instead of ending FILEDUDE_SESSION_HOURS after sign-in.
+export const STAY_SIGNED_IN_DAYS = 30;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const sessionMs = () => config.sessionHours * 60 * 60 * 1000;
+const keptMs = () => Math.max(STAY_SIGNED_IN_DAYS * DAY_MS, sessionMs());
 
 const COOKIE = "fd_session";
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
@@ -85,18 +99,75 @@ async function checkPassword(password: string, encoded: string) {
   return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
 }
 
-export function createSession(username: string, credentialsVersion: number, accountKey = "owner") {
+/**
+ * A session token. One made to stay signed in lasts STAY_SIGNED_IN_DAYS and is renewed as it's
+ * used; any other ends FILEDUDE_SESSION_HOURS after `signedInAt`, which a reissued session keeps,
+ * so reissuing one never makes it last longer.
+ */
+export function createSession(username: string, credentialsVersion: number, accountKey = "owner", { staySignedIn = false, signedInAt = Date.now() }: { staySignedIn?: boolean; signedInAt?: number } = {}) {
   assertConfigured();
   const payload = base64url(
     JSON.stringify({
       u: username,
       k: accountKey,
       v: credentialsVersion,
-      exp: Date.now() + config.sessionHours * 60 * 60 * 1000,
+      iat: signedInAt,
+      exp: staySignedIn ? Date.now() + keptMs() : signedInAt + sessionMs(),
+      ...(staySignedIn ? { s: 1 } : {}),
       nonce: crypto.randomBytes(16).toString("hex"),
     }),
   );
   return `${payload}.${signature(payload)}`;
+}
+
+/** A new token for this device's session (after its account changed), keeping when it signed in and whether it stays signed in. */
+export function reissueSession(session: Session, credentialsVersion = session.credentialsVersion) {
+  return createSession(session.username, credentialsVersion, session.accountKey, { staySignedIn: session.staySignedIn, signedInAt: session.signedInAt });
+}
+
+/**
+ * A renewed cookie for a session that stays signed in, once a day has passed since it was last
+ * made, so the device stays signed in while it's used; null when none is due.
+ */
+export function renewedSessionCookie(session: Session, request: Request) {
+  if (!session.staySignedIn || session.expiresAt - Date.now() > keptMs() - DAY_MS) return null;
+  return sessionCookie(reissueSession(session), request);
+}
+
+type SessionSettings = { username: string; version: number; staySignedIn?: boolean; updatedAt?: string };
+
+/**
+ * Changes how a signed-in account's sessions last, one change at a time: whether it stays signed
+ * in, and whether to sign it out everywhere (by bumping its version). Only for a session that is
+ * still current when the change is made, so one signed out meanwhile (by a password change, say)
+ * can't come back with a new session. Returns the account's username and version afterwards, and
+ * whether staying signed in changed.
+ */
+function changeSessions(session: Session, decide: (stored: SessionSettings) => { staySignedIn: boolean; signOut: boolean }) {
+  const apply = <S extends SessionSettings>(stored: S) => {
+    if (stored.version !== session.credentialsVersion || stored.username !== session.username) throw new AppError("Sign in required", 401, "UNAUTHORIZED");
+    const { staySignedIn, signOut } = decide(stored);
+    const changed = staySignedIn !== (stored.staySignedIn === true);
+    if (!changed && !signOut) return { next: null, result: { username: stored.username, version: stored.version, changed } };
+    const next: S = { ...stored, version: stored.version + (signOut ? 1 : 0), updatedAt: new Date().toISOString() };
+    if (staySignedIn) next.staySignedIn = true;
+    else delete next.staySignedIn;
+    return { next, result: { username: next.username, version: next.version, changed } };
+  };
+  return session.accountKey === "owner" ? updateCredentials(async (credentials) => apply(credentials)) : updateUserAccount(session.accountKey, async (user) => apply(user));
+}
+
+/**
+ * Turns staying signed in on or off for a session's account. Turning it off signs the account out
+ * everywhere, as its devices may have been signed in for weeks.
+ */
+export function setStaySignedIn(session: Session, staySignedIn: boolean) {
+  return changeSessions(session, (stored) => ({ staySignedIn, signOut: !staySignedIn && stored.staySignedIn === true }));
+}
+
+/** Signs a session's account out everywhere (the caller gives its own device a new session). */
+export function signOutEverywhere(session: Session) {
+  return changeSessions(session, (stored) => ({ staySignedIn: stored.staySignedIn === true, signOut: true }));
 }
 
 /** Whether the request came through one of the configured proxies, judged by its real connection. */
@@ -111,9 +182,16 @@ export function reachedOverHttps(request: Request) {
   return (viaTrustedProxy(request) || config.trustProxy) && request.headers.get("x-forwarded-proto") === "https";
 }
 
+function readPayload(payload: string) {
+  return JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+}
+
 export function sessionCookie(value: string, request: Request) {
   const secure = reachedOverHttps(request);
-  return `${COOKIE}=${value}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${config.sessionHours * 3600};${secure ? " Secure;" : ""}`;
+  // The cookie lasts as long as the session it carries.
+  const expires = readPayload(value.split(".")[0]).exp as number;
+  const maxAge = Math.max(0, Math.floor((expires - Date.now()) / 1000));
+  return `${COOKIE}=${value}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAge};${secure ? " Secure;" : ""}`;
 }
 
 export function clearSessionCookie(request: Request) {
@@ -139,18 +217,31 @@ export async function getSession(request: Request): Promise<Session | null> {
   if (supplied.length !== expected.length || !crypto.timingSafeEqual(supplied, expected)) return null;
 
   try {
-    const value = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
-    if (typeof value.exp !== "number" || value.exp < Date.now() || typeof value.u !== "string") return null;
+    const value = readPayload(payload);
+    const now = Date.now();
+    if (typeof value.exp !== "number" || value.exp < now || typeof value.u !== "string") return null;
+    // Sessions from before staying signed in carry no sign-in time; they lasted FILEDUDE_SESSION_HOURS.
+    const signedInAt = typeof value.iat === "number" ? value.iat : value.exp - sessionMs();
+    let account: Omit<Session, "staySignedIn" | "signedInAt" | "expiresAt">;
+    let accountStays: boolean;
     // Sessions from before accounts existed carry no account key and belong to the owner.
     if (value.k === undefined || value.k === "owner") {
       const credentials = await getCredentials();
       if (value.u !== credentials.username || value.v !== credentials.version) return null;
-      return { username: value.u, credentialsVersion: value.v, accountKey: "owner", role: "owner", root: "" };
+      account = { username: value.u, credentialsVersion: value.v, accountKey: "owner", role: "owner", root: "" };
+      accountStays = credentials.staySignedIn === true;
+    } else {
+      if (typeof value.k !== "string") return null;
+      const user = await findUserById(value.k);
+      if (!user || user.username !== value.u || user.version !== value.v) return null;
+      account = { username: user.username, credentialsVersion: user.version, accountKey: user.id, role: user.role, root: user.root };
+      accountStays = user.staySignedIn === true;
     }
-    if (typeof value.k !== "string") return null;
-    const user = await findUserById(value.k);
-    if (!user || user.username !== value.u || user.version !== value.v) return null;
-    return { username: user.username, credentialsVersion: user.version, accountKey: user.id, role: user.role, root: user.root };
+    // Any session not made to stay signed in, or whose account no longer does, ends
+    // FILEDUDE_SESSION_HOURS after sign-in, however long its token says.
+    const staySignedIn = value.s === 1 && accountStays;
+    if (!staySignedIn && signedInAt + sessionMs() <= now) return null;
+    return { ...account, staySignedIn, signedInAt, expiresAt: value.exp };
   } catch {
     return null;
   }
@@ -260,21 +351,28 @@ export function clearLoginFailures(key: string) {
 }
 
 // Checks of the current password from a signed-in session (before adding a passkey or changing
-// two-factor sign-in) are limited per account, so a session left open can't be used to guess it.
-// A try is counted as it starts; the right password clears the count.
+// two-factor sign-in, say) are limited per device, so a session left open can't be used to guess it.
+// A device is its account and when it signed in, which renewing a session keeps: wrong guesses from
+// a session someone else holds lock only that session, never its owner's other devices, which they
+// need to sign it out. A try is counted as it starts; the right password clears the count.
 const CURRENT_PASSWORD_LIMIT = 10;
+const MAX_CURRENT_PASSWORD_KEYS = 10_000;
 const currentPasswordChecks = new Map<string, { count: number; resetAt: number }>();
 
-export async function verifyCurrentPassword(accountKey: string, password: unknown, encoded: string) {
+export async function verifyCurrentPassword(session: Pick<Session, "accountKey" | "signedInAt">, password: unknown, encoded: string) {
+  const key = `${session.accountKey}\u0000${session.signedInAt}`;
   const now = Date.now();
-  let attempt = currentPasswordChecks.get(accountKey);
+  if (currentPasswordChecks.size >= MAX_CURRENT_PASSWORD_KEYS) {
+    for (const [checked, attempt] of currentPasswordChecks) if (attempt.resetAt <= now) currentPasswordChecks.delete(checked);
+  }
+  let attempt = currentPasswordChecks.get(key);
   if (!attempt || attempt.resetAt <= now) {
     attempt = { count: 0, resetAt: now + 15 * 60 * 1000 };
-    currentPasswordChecks.set(accountKey, attempt);
+    currentPasswordChecks.set(key, attempt);
   }
   if (attempt.count >= CURRENT_PASSWORD_LIMIT) throw new AppError("Too many wrong passwords. Try again in 15 minutes.", 429, "PASSWORD_LOCKED");
   attempt.count += 1;
   const valid = typeof password === "string" && password.length <= 512 && (await verifyPassword(password, encoded));
-  if (valid) currentPasswordChecks.delete(accountKey);
+  if (valid) currentPasswordChecks.delete(key);
   return valid;
 }

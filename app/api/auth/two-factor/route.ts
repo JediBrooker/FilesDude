@@ -34,7 +34,7 @@ export async function POST(request: Request) {
       const account = await findAccount(session.accountKey);
       if (!account) throw new AppError("Sign in required", 401, "UNAUTHORIZED");
       const requirePassword = async () => {
-        if (!(await verifyCurrentPassword(account.key, body.currentPassword, account.passwordHash))) {
+        if (!(await verifyCurrentPassword(session, body.currentPassword, account.passwordHash))) {
           await audit("settings.two_factor.failed", { username: session.username, action: body.action });
           throw new AppError("Current password is incorrect", 401, "INVALID_CURRENT_PASSWORD");
         }
@@ -49,9 +49,10 @@ export async function POST(request: Request) {
           throw error;
         }
       };
-      const withNewSession = (payload: Record<string, unknown>, version: number) => {
+      // Whether the new session stays signed in is read with the change, so it can't be stale.
+      const withNewSession = (payload: Record<string, unknown>, { version, staySignedIn }: { version: number; staySignedIn: boolean }) => {
         const response = NextResponse.json({ ok: true, ...payload }, { headers: { "Cache-Control": "no-store" } });
-        response.headers.set("Set-Cookie", sessionCookie(createSession(account.username, version, account.key), request));
+        response.headers.set("Set-Cookie", sessionCookie(createSession(account.username, version, account.key, { staySignedIn }), request));
         return response;
       };
       switch (body.action) {
@@ -59,21 +60,21 @@ export async function POST(request: Request) {
           await requirePassword();
           return NextResponse.json(await beginSetup(account), { headers: { "Cache-Control": "no-store" } });
         case "enable": {
-          const { result: recoveryCodes, version } = await finishSetup(account.key, body.setupToken, body.code);
+          const { result: recoveryCodes, ...changed } = await finishSetup(account.key, body.setupToken, body.code);
           await audit("settings.two_factor.enabled", { username: session.username });
-          return withNewSession({ recoveryCodes }, version);
+          return withNewSession({ recoveryCodes }, changed);
         }
         case "disable": {
           await requirePassword();
-          const { version } = await auditWrongCode(() => disableTwoFactor(account.key, body.code));
+          const changed = await auditWrongCode(() => disableTwoFactor(account.key, body.code));
           await audit("settings.two_factor.disabled", { username: session.username });
-          return withNewSession({}, version);
+          return withNewSession({}, changed);
         }
         case "recovery-codes": {
           await requirePassword();
-          const { result: recoveryCodes, version } = await auditWrongCode(() => regenerateRecoveryCodes(account.key, body.code));
+          const { result: recoveryCodes, ...changed } = await auditWrongCode(() => regenerateRecoveryCodes(account.key, body.code));
           await audit("settings.two_factor.recovery_codes", { username: session.username });
-          return withNewSession({ recoveryCodes }, version);
+          return withNewSession({ recoveryCodes }, changed);
         }
         default:
           throw new AppError("Unknown two-factor operation", 400, "UNKNOWN_ACTION");

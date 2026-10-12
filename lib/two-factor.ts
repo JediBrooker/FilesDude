@@ -16,15 +16,15 @@ const MAX_CHALLENGE_ATTEMPTS = 5;
 const RECOVERY_CODE_COUNT = 10;
 const RECOVERY_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789";
 
-export type Account = { key: string; username: string; passwordHash: string; version: number; twoFactor?: StoredTwoFactor };
+export type Account = { key: string; username: string; passwordHash: string; version: number; twoFactor?: StoredTwoFactor; staySignedIn: boolean };
 
 export async function findAccount(accountKey: string): Promise<Account | null> {
   if (accountKey === "owner") {
     const credentials = await getCredentials();
-    return { key: "owner", username: credentials.username, passwordHash: credentials.passwordHash, version: credentials.version, twoFactor: credentials.twoFactor };
+    return { key: "owner", username: credentials.username, passwordHash: credentials.passwordHash, version: credentials.version, twoFactor: credentials.twoFactor, staySignedIn: credentials.staySignedIn === true };
   }
   const user = await findUserById(accountKey);
-  return user ? { key: user.id, username: user.username, passwordHash: user.passwordHash, version: user.version, twoFactor: user.twoFactor } : null;
+  return user ? { key: user.id, username: user.username, passwordHash: user.passwordHash, version: user.version, twoFactor: user.twoFactor, staySignedIn: user.staySignedIn === true } : null;
 }
 
 type TwoFactorChange<T> = { twoFactor?: StoredTwoFactor | null; bumpVersion?: boolean; result: T };
@@ -32,7 +32,8 @@ type TwoFactorChange<T> = { twoFactor?: StoredTwoFactor | null; bumpVersion?: bo
 /**
  * Changes an account's two-factor settings one change at a time, so a code can't be used twice by
  * requests racing each other. `twoFactor` undefined leaves them unchanged and null removes them;
- * `bumpVersion` signs the account out everywhere. Returns the result and the account's version.
+ * `bumpVersion` signs the account out everywhere. Returns the result and the account's version and
+ * whether it stays signed in, as they now are.
  */
 async function changeTwoFactor<T>(accountKey: string, change: (account: Account) => TwoFactorChange<T> | Promise<TwoFactorChange<T>>) {
   const apply = <S extends { version: number; twoFactor?: StoredTwoFactor; updatedAt?: string }>(stored: S, outcome: TwoFactorChange<T>): S | null => {
@@ -44,15 +45,15 @@ async function changeTwoFactor<T>(accountKey: string, change: (account: Account)
   };
   if (accountKey === "owner") {
     return updateCredentials(async (credentials) => {
-      const outcome = await change({ key: "owner", username: credentials.username, passwordHash: credentials.passwordHash, version: credentials.version, twoFactor: credentials.twoFactor });
+      const outcome = await change({ key: "owner", username: credentials.username, passwordHash: credentials.passwordHash, version: credentials.version, twoFactor: credentials.twoFactor, staySignedIn: credentials.staySignedIn === true });
       const next = apply(credentials, outcome);
-      return { next, result: { result: outcome.result, version: (next ?? credentials).version, username: credentials.username } };
+      return { next, result: { result: outcome.result, version: (next ?? credentials).version, username: credentials.username, staySignedIn: credentials.staySignedIn === true } };
     });
   }
   return updateUserAccount(accountKey, async (user) => {
-    const outcome = await change({ key: user.id, username: user.username, passwordHash: user.passwordHash, version: user.version, twoFactor: user.twoFactor });
+    const outcome = await change({ key: user.id, username: user.username, passwordHash: user.passwordHash, version: user.version, twoFactor: user.twoFactor, staySignedIn: user.staySignedIn === true });
     const next = apply(user, outcome);
-    return { next, result: { result: outcome.result, version: (next ?? user).version, username: user.username } };
+    return { next, result: { result: outcome.result, version: (next ?? user).version, username: user.username, staySignedIn: user.staySignedIn === true } };
   });
 }
 
@@ -149,7 +150,8 @@ export function createChallenge(account: Account) {
 
 /**
  * Completes a sign-in challenge with a code. Each challenge allows a few attempts. Returns the
- * account's key, username, and version for the session, and how the code was given.
+ * account's key, username, version, and whether it stays signed in, for the session, and how the
+ * code was given.
  */
 export async function completeChallenge(challenge: unknown, code: unknown) {
   const payload = readToken("challenge", challenge);
@@ -168,7 +170,7 @@ export async function completeChallenge(challenge: unknown, code: unknown) {
     return { twoFactor: used.twoFactor, result: { method: used.method, recoveryCodesLeft: used.twoFactor.recoveryCodes.length } };
   }));
   challengeAttempts.delete(nonce);
-  return { accountKey: payload.k, username: outcome.username, version: outcome.version, ...outcome.result };
+  return { accountKey: payload.k, username: outcome.username, version: outcome.version, staySignedIn: outcome.staySignedIn, ...outcome.result };
 }
 
 // --- Managing it from a signed-in account ---
