@@ -21,9 +21,11 @@ export interface StoredUser {
   createdAt: string;
   updatedAt: string;
   twoFactor?: StoredTwoFactor;
+  /** Sessions renew as they're used rather than ending FILEDUDE_SESSION_HOURS after sign-in. */
+  staySignedIn?: boolean;
 }
 
-export type UserSummary = Omit<StoredUser, "passwordHash" | "version" | "twoFactor"> & { twoFactor: boolean };
+export type UserSummary = Omit<StoredUser, "passwordHash" | "version" | "twoFactor" | "staySignedIn"> & { twoFactor: boolean };
 
 let mutationQueue: Promise<void> = Promise.resolve();
 
@@ -142,7 +144,7 @@ export async function updateUser(id: string, changes: { role?: unknown; root?: u
   });
 }
 
-/** Lets an editor or viewer change their own password; returns the new version for their session. */
+/** Lets an editor or viewer change their own password; returns the new version and whether they stay signed in, for their session. */
 export async function changeOwnPassword(id: string, newPassword: string) {
   validateNewPassword(newPassword);
   const passwordHash = await hashPassword(newPassword);
@@ -150,7 +152,7 @@ export async function changeOwnPassword(id: string, newPassword: string) {
     const user = users.find((item) => item.id === id);
     if (!user) throw new AppError("That account no longer exists", 404, "NOT_FOUND");
     const updated = { ...user, passwordHash, version: user.version + 1, updatedAt: new Date().toISOString() };
-    return { users: users.map((item) => (item.id === id ? updated : item)), result: updated.version };
+    return { users: users.map((item) => (item.id === id ? updated : item)), result: { version: updated.version, staySignedIn: updated.staySignedIn === true } };
   });
 }
 

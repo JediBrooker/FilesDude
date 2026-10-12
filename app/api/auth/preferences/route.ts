@@ -69,11 +69,11 @@ export async function POST(request: Request) {
       const user = await findUserById(session.accountKey);
       if (!user) throw new AppError("Sign in required", 401, "UNAUTHORIZED");
       await confirmIdentity(user.id, user.passwordHash, user.twoFactor);
-      const version = await changeOwnPassword(user.id, body.newPassword as string);
+      const { version, staySignedIn } = await changeOwnPassword(user.id, body.newPassword as string);
       const passkeysRemoved = body.keepPasskeys === true ? 0 : await removeAccountPasskeys(user.id);
       await audit("settings.password.changed", { username: session.username, passkeysRemoved: passkeysRemoved || undefined });
       const response = NextResponse.json({ ok: true, username: user.username });
-      response.headers.set("Set-Cookie", sessionCookie(createSession(user.username, version, user.id), request));
+      response.headers.set("Set-Cookie", sessionCookie(createSession(user.username, version, user.id, { staySignedIn }), request));
       response.headers.set("Cache-Control", "no-store");
       return response;
     }
@@ -105,14 +105,14 @@ export async function POST(request: Request) {
     if (!credentialsChanged && !ownershipChanged && !retentionChanged && !piecesChanged) throw new AppError("No preference changes to save", 400, "NO_CHANGES");
 
     const updatedAt = new Date().toISOString();
-    let credentialVersion = current.version;
+    let signedIn = { version: current.version, staySignedIn: current.staySignedIn === true };
     if (credentialsChanged) {
       const passwordHash = body.newPassword ? await hashPassword(body.newPassword as string) : undefined;
       // Applied to the latest credentials through their update queue, so a two-factor change made
       // meanwhile (and anything else stored with them) is kept.
-      credentialVersion = await updateCredentials(async (latest) => {
+      signedIn = await updateCredentials(async (latest) => {
         const next = { ...latest, username, passwordHash: passwordHash ?? latest.passwordHash, version: latest.version + 1, updatedAt };
-        return { next, result: next.version };
+        return { next, result: { version: next.version, staySignedIn: next.staySignedIn === true } };
       });
     }
     const passkeysRemoved = passwordChanged && body.keepPasskeys !== true ? await removeAccountPasskeys("owner") : 0;
@@ -130,7 +130,7 @@ export async function POST(request: Request) {
     if (retentionChanged && trashRetentionDays) void runTrashRetention().catch((error: unknown) => console.error("Could not purge expired trash", error));
 
     const response = NextResponse.json({ ok: true, username, uploadOwnership, trashRetentionDays, uploadInPieces });
-    if (credentialsChanged) response.headers.set("Set-Cookie", sessionCookie(createSession(username, credentialVersion), request));
+    if (credentialsChanged) response.headers.set("Set-Cookie", sessionCookie(createSession(username, signedIn.version, "owner", { staySignedIn: signedIn.staySignedIn }), request));
     response.headers.set("Cache-Control", "no-store");
     return response;
     });

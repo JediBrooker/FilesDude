@@ -10,6 +10,8 @@ export interface StoredCredentials {
   version: number;
   updatedAt?: string;
   twoFactor?: StoredTwoFactor;
+  /** Sessions renew as they're used rather than ending FILEDUDE_SESSION_HOURS after sign-in. */
+  staySignedIn?: boolean;
 }
 
 /** An account's authenticator-app sign-in, stored with its credentials. */

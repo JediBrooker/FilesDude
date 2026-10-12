@@ -12,7 +12,7 @@ import { closeSession, testConnection } from "../lib/sftp";
 import { startSftpServer } from "./helpers/sftp-server";
 
 const PASSWORD = "remote-pieces-test-password";
-const owner: Session = { username: "owner", credentialsVersion: 1, accountKey: "owner", role: "owner", root: "" };
+const owner: Session = { username: "owner", credentialsVersion: 1, accountKey: "owner", role: "owner", root: "", staySignedIn: false, signedInAt: Date.now(), expiresAt: Date.now() + 3_600_000 };
 
 async function withServer<T>(run: (context: { remote: string; id: string }) => Promise<T>) {
   const base = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "filesdude-remote-pieces-")));

@@ -50,6 +50,7 @@ FilesDude File Explorer is a secure, self-hosted web file manager designed for a
 - Signed, expiring, HTTP-only, SameSite login sessions; scrypt password hashes; login throttling; same-origin mutation checks; and hardened response headers
 - Account preferences for changing the username and password; credential changes invalidate other sessions
 - Optional two-factor sign-in for every account with an authenticator app (6-digit codes), with one-time recovery codes
+- Stay signed in: each account can choose to stay signed in on its devices until it signs out, instead of signing in again every 12 hours, and can sign out its other devices
 - Passkeys: sign in with a fingerprint, face, device PIN, or security key instead of a password, when FilesDude is opened over HTTPS
 - Duplicate finder (owner): scan a folder for files with identical contents, see which copies waste the most space, and move extra copies to the trash or replace them with hard links, always keeping one of each
 - ZFS snapshots: when the root is a ZFS dataset, browse earlier versions of files ("Previous versions" or **Snapshots**), download them, and restore them beside the current version; the owner can take snapshots or schedule them hourly or daily
@@ -260,6 +261,23 @@ you in once if you lose your phone; save them, as they aren't shown again.
 - If the owner loses both their phone and recovery codes, remove the `twoFactor` entry
   from `credentials.json` in the state directory as root (for example
   `/var/lib/filesdude/credentials.json`) and restart the service.
+
+## Staying signed in
+
+By default a sign-in lasts `FILEDUDE_SESSION_HOURS` (12 hours). Any account can choose
+instead to stay signed in: open **Preferences** (or **Your account**), choose **Turn on**
+under Stay signed in, and confirm your password.
+
+- Each device then stays signed in until you sign out there, as long as it's used at least
+  every 30 days: the page renews its session (at most once a day) while it's open.
+- It applies to the device you turned it on from straight away, and to your other devices
+  from their next sign-in (or once you confirm your password there too).
+- Turning it off signs you out on your other devices; the one you're using gets a fresh
+  12 hours.
+- **Sign out** under Other devices, in the same place, signs you out everywhere else,
+  for a lost phone or a computer that isn't yours. Changing your password does too.
+- Turning it on can send a *Security* notification. Only turn it on for devices that are
+  yours: anyone using a device that stays signed in has your access.
 
 ## Passkeys
 
@@ -481,7 +499,8 @@ hear about, and use **Save and send a test**.
     of minutes, with the names, total size, and who sent them.
   - *Security*: an address failing to sign in (or entering wrong two-factor codes) 5 times
     in 15 minutes; a link closed after too many wrong passwords; passwords changed,
-    two-factor sign-in turned off, passkeys added, and accounts added or removed.
+    two-factor sign-in turned off, staying signed in turned on, passkeys added, and
+    accounts added or removed.
   - *Every sign-in* (off unless chosen): who, how, and from where.
   - *Storage*: the managed disk falling below 10% free (checked hourly, told once until it
     recovers), and scheduled snapshots failing.

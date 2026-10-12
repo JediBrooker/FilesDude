@@ -39,7 +39,7 @@ export async function POST(request: Request) {
       }
       refundLoginAttempt(key);
       const response = NextResponse.json({ authenticated: true, username: completed.username, recoveryCodesLeft: completed.method === "recovery" ? completed.recoveryCodesLeft : undefined });
-      response.headers.set("Set-Cookie", sessionCookie(createSession(completed.username, completed.version, completed.accountKey), request));
+      response.headers.set("Set-Cookie", sessionCookie(createSession(completed.username, completed.version, completed.accountKey, { staySignedIn: completed.staySignedIn }), request));
       response.headers.set("Cache-Control", "no-store");
       await audit("login.succeeded", { username: completed.username, client: key, twoFactor: completed.method });
       return response;
@@ -62,8 +62,8 @@ export async function POST(request: Request) {
     const found = inputValid ? await findUserByName(username) : undefined;
     const user = username !== credentials.username ? found : undefined;
     const account = !inputValid ? null
-      : username === credentials.username ? { key: "owner", username, passwordHash: credentials.passwordHash, hash: credentials.passwordHash, version: credentials.version, twoFactor: credentials.twoFactor }
-        : user ? { key: user.id, username, passwordHash: user.passwordHash, hash: user.passwordHash, version: user.version, twoFactor: user.twoFactor } : null;
+      : username === credentials.username ? { key: "owner", username, passwordHash: credentials.passwordHash, hash: credentials.passwordHash, version: credentials.version, twoFactor: credentials.twoFactor, staySignedIn: credentials.staySignedIn === true }
+        : user ? { key: user.id, username, passwordHash: user.passwordHash, hash: user.passwordHash, version: user.version, twoFactor: user.twoFactor, staySignedIn: user.staySignedIn === true } : null;
     // A password check runs even for unknown names, so response timing doesn't reveal which exist.
     const validPassword = await verifyPassword(inputValid ? password : "", account?.hash ?? credentials.passwordHash);
     if (!account || !validPassword) {
@@ -83,7 +83,7 @@ export async function POST(request: Request) {
     refundLoginAttempt(key);
     refundUsernameAttempt(username);
     const response = NextResponse.json({ authenticated: true, username });
-    response.headers.set("Set-Cookie", sessionCookie(createSession(username, account.version, account.key), request));
+    response.headers.set("Set-Cookie", sessionCookie(createSession(username, account.version, account.key, { staySignedIn: account.staySignedIn }), request));
     response.headers.set("Cache-Control", "no-store");
     await audit("login.succeeded", { username, client: key });
     return response;

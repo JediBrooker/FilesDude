@@ -43,7 +43,7 @@ export async function POST(request: Request) {
     const { account, passkey } = signedIn;
     refundLoginAttempt(key);
     const response = NextResponse.json({ authenticated: true, username: account.username });
-    response.headers.set("Set-Cookie", sessionCookie(createSession(account.username, account.version, account.key), request));
+    response.headers.set("Set-Cookie", sessionCookie(createSession(account.username, account.version, account.key, { staySignedIn: account.staySignedIn }), request));
     response.headers.set("Cache-Control", "no-store");
     await audit("login.succeeded", { username: account.username, client: key, method: "passkey", passkey: passkey.name });
     return response;

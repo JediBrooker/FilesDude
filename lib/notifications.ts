@@ -295,6 +295,13 @@ export function notifyFromAudit(event: string, details: Record<string, unknown>)
     case "settings.two_factor.disabled":
       void notify({ topic: "security", urgent: true, title: "Two-factor sign-in turned off", message: `${who} turned off two-factor sign-in.` });
       return;
+    case "settings.stay_signed_in":
+      if (details.on && !details.thisDeviceOnly) void notify({ topic: "security", title: "Staying signed in was turned on", message: `${who} turned on staying signed in (from ${str(details.client) || "an unknown address"}): their devices now stay signed in until they sign out.` });
+      if (!details.on) void notify({ topic: "security", title: "Staying signed in was turned off", message: `${who} turned off staying signed in (from ${str(details.client) || "an unknown address"}), signing out their other devices.` });
+      return;
+    case "logout.others":
+      void notify({ topic: "security", title: "Other devices were signed out", message: `${who} signed out their other devices (from ${str(details.client) || "an unknown address"}).` });
+      return;
     case "settings.passkey.added":
       void notify({ topic: "security", title: "A passkey was added", message: `${who} added the passkey "${str(details.passkey)}".` });
       return;
