@@ -1,9 +1,11 @@
 #!/usr/bin/env node
+import { execFileSync } from "node:child_process";
 // FilesDude's commands in its Docker image (the image's entrypoint, and `filesdude` on its PATH):
 //
 //   start   runs FilesDude (the default)
 //   setup   sets the login: the first time, or again to replace it and sign everyone out
 //           (--username NAME skips that question; --rotate-secret also replaces the session secret)
+//   health  whether FilesDude answers (the image's health check)
 //
 // The container starts as root only so this can hand FilesDude's state to the account it runs as
 // (PUID:PGID, its own 1001 by default); it then becomes that account, without any capabilities,
@@ -21,8 +23,7 @@ const scrypt = promisify(crypto.scrypt);
 /** The settings kept in login.env; nothing else in it is read. */
 export const LOGIN_KEYS = ["FILEDUDE_USERNAME", "FILEDUDE_PASSWORD_HASH", "FILEDUDE_SESSION_SECRET", "FILEDUDE_SESSION_EPOCH"];
 
-const USAGE = "Usage: filesdude [start | setup [--username NAME] [--rotate-secret]]";
-const SETUP_HINT = "docker compose run --rm filesdude setup (or: docker exec -it filesdude filesdude setup)";
+const USAGE = "Usage: filesdude [start | setup [--username NAME] [--rotate-secret] | health]";
 
 class Stop extends Error {}
 
@@ -81,25 +82,27 @@ function accountId(name, fallback) {
 }
 
 /**
- * Gives FilesDude's state to its account (links themselves, never what they point at, and only on the
- * state's own filesystem), and the managed folder too if it is still empty and root's, as Docker makes
- * a missing folder it mounts.
+ * Gives FilesDude's state to its account, and the managed folder too if it is still empty and root's,
+ * as Docker makes a missing folder it mounts. Everything in the state goes over only as FilesDude
+ * starts; setup, which can run beside a running FilesDude (docker exec), only takes the state folder
+ * itself, as FilesDude can change what's inside while root works through it.
  */
-function handOver(uid, gid) {
+function handOver(uid, gid, { everything }) {
   const stateDir = stateDirectory();
   fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
-  const device = fs.lstatSync(stateDir).dev;
-  const pending = [stateDir];
   try {
-    while (pending.length) {
-      const item = pending.pop();
-      const stat = fs.lstatSync(item);
-      if (stat.dev !== device) continue;
-      if (stat.uid !== uid || stat.gid !== gid) fs.lchownSync(item, uid, gid);
-      if (stat.isDirectory()) for (const name of fs.readdirSync(item)) pending.push(path.join(item, name));
+    if (everything) {
+      // chown -R works through folders it has opened, never by path, and never follows links, so
+      // nothing renamed or linked along the way can send it elsewhere.
+      execFileSync("chown", ["-R", "-h", "-P", `${uid}:${gid}`, stateDir], { stdio: ["ignore", "ignore", "pipe"] });
+    } else {
+      const stat = fs.lstatSync(stateDir);
+      if (stat.uid !== uid || stat.gid !== gid) fs.lchownSync(stateDir, uid, gid);
     }
   } catch (error) {
-    if (error.code === "EROFS") throw new Stop(`FilesDude's state folder (${stateDir}) is read-only: mount a volume there (compose.yaml does).`);
+    if (error.code === "EROFS" || /read-only file system/i.test(String(error.stderr))) {
+      throw new Stop(`FilesDude's state folder (${stateDir}) is read-only: mount a volume there (compose.yaml does).`);
+    }
     throw error;
   }
   const root = managedRoot();
@@ -111,13 +114,16 @@ function handOver(uid, gid) {
   }
 }
 
-/** As root: hands the state over, then becomes PUID:PGID with no capabilities (unless PUID is 0). */
-function becomeAccount() {
+/**
+ * As root: hands the state over (as much as `handOver` says, or none), then becomes PUID:PGID with no
+ * capabilities (unless PUID is 0).
+ */
+function becomeAccount(handOverState) {
   if (process.getuid() !== 0) return;
   const uid = accountId("PUID", "1001");
   const gid = accountId("PGID", "1001");
   if (uid === 0) return;
-  handOver(uid, gid);
+  if (handOverState) handOver(uid, gid, handOverState);
   // Changing from root to another user ID drops every capability.
   process.setgroups([gid]);
   process.setgid(gid);
@@ -136,7 +142,7 @@ async function start() {
   }
   Object.assign(process.env, missingFromEnvironment(saved, process.env));
   if (!process.env.FILEDUDE_PASSWORD_HASH) {
-    console.error(`FilesDude has no login yet, so nobody can sign in. Set one with: ${SETUP_HINT}, then restart the container.`);
+    console.error("FilesDude has no login yet, so nobody can sign in. Set one with: docker exec -it filesdude filesdude setup");
   }
   await import(new URL("../server.js", import.meta.url).href);
 }
@@ -212,6 +218,9 @@ async function setup(args) {
   const saved = readLogin(stateDir);
   const credentials = path.join(stateDir, "credentials.json");
   const replacing = Boolean(saved.FILEDUDE_PASSWORD_HASH) || fs.existsSync(credentials);
+  if (replacing && runningServer()) {
+    console.log("FilesDude is running. If someone else may have used it, stop it first (docker compose stop) and set the login from a new container instead (docker compose run --rm filesdude setup --rotate-secret): a running FilesDude could put its own login back.");
+  }
   if (replacing && interactive) {
     const answer = await ask("This replaces the login, removes its passkeys, and signs everyone out. Continue? [y/N] ");
     if (!/^y(es)?$/i.test(answer.trim())) throw new Stop("Nothing was changed.");
@@ -257,12 +266,26 @@ async function setup(args) {
   }
 }
 
+/** Exits 0 if FilesDude answers. Run as its account, as it reads what FilesDude says. */
+async function health() {
+  const response = await fetch(`http://127.0.0.1:${process.env.PORT || 3000}/api/auth/status`, { signal: AbortSignal.timeout(4_000) }).catch(() => null);
+  process.exit(response?.ok ? 0 : 1);
+}
+
 async function main() {
   const [command = "start", ...args] = process.argv.slice(2);
-  if (command !== "start" && command !== "setup") throw new Stop(USAGE);
-  becomeAccount();
-  if (command === "start") await start();
-  else await setup(args);
+  if (command === "start") {
+    becomeAccount({ everything: true });
+    await start();
+  } else if (command === "setup") {
+    becomeAccount({ everything: false });
+    await setup(args);
+  } else if (command === "health" && !args.length) {
+    becomeAccount(null);
+    await health();
+  } else {
+    throw new Stop(USAGE);
+  }
 }
 
 // Run as a command (directly, or through its link on the PATH), not imported (tests).

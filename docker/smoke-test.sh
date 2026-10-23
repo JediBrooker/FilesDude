@@ -38,11 +38,17 @@ PROCESS="$(docker compose exec -T filesdude node -e '
   for (const pid of fs.readdirSync("/proc").filter((name) => /^\d+$/.test(name))) {
     const status = fs.readFileSync(`/proc/${pid}/status`, "utf8");
     if (fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").startsWith("next-server")) {
-      console.log(status.split("\n").filter((line) => /^(Uid|Gid|CapEff|CapPrm|CapAmb):/.test(line)).join(" "));
+      console.log(status.split("\n").filter((line) => /^(Uid|Gid|CapEff|CapPrm|CapAmb|CapInh|NoNewPrivs):/.test(line)).join(" "));
     }
   }')"
 [[ ${PROCESS} =~ Uid:[[:space:]]+${PUID}[[:space:]] && ${PROCESS} =~ Gid:[[:space:]]+${PGID}[[:space:]] ]] || fail "not running as ${PUID}:${PGID}: ${PROCESS}"
-[[ ${PROCESS} =~ CapEff:[[:space:]]+0+[[:space:]] && ${PROCESS} =~ CapPrm:[[:space:]]+0+[[:space:]] && ${PROCESS} =~ CapAmb:[[:space:]]+0+($|[[:space:]]) ]] || fail "has capabilities: ${PROCESS}"
+for set in CapInh CapPrm CapEff CapAmb; do
+  [[ ${PROCESS} =~ ${set}:[[:space:]]+0+($|[[:space:]]) ]] || fail "has capabilities: ${PROCESS}"
+done
+[[ ${PROCESS} =~ NoNewPrivs:[[:space:]]+1 ]] || fail "can gain privileges: ${PROCESS}"
+# Nothing in the image can be run to become root again.
+[[ -z $(docker compose exec -T filesdude find / -xdev -perm /6000 -type f) ]] || fail "the image has set-user-ID programs"
+docker compose exec -T filesdude filesdude health || fail "the health check fails"
 
 # Sign in, make a folder, and get a thumbnail of a picture put there from outside.
 curl -fsS -c cookies -H 'Content-Type: application/json' -H 'X-FileDude-Request: 1' \

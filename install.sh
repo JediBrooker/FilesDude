@@ -150,10 +150,14 @@ ensure_node() {
     system_node="$(readlink -f "$(command -v node)")"
   fi
   # The system's own Node.js is only used from /usr, which the service can see (not from a home folder
-  # or /opt, which it can't).
+  # or /opt, which it can't), and only if root's alone: the build runs it, and its npm, as root.
   if ((current_major >= 22)) && [[ ${system_node} == /usr/* ]]; then
-    ln -sfn "$(dirname "$(dirname "${system_node}")")" "${APP_HOME}/node"
-    return
+    local prefix
+    prefix="$(dirname "$(dirname "${system_node}")")"
+    if [[ -z $(find "${system_node}" "$(dirname "${system_node}")" "${prefix}" -maxdepth 0 \( ! -user root -o -perm /022 \) 2>/dev/null) ]]; then
+      ln -sfn "${prefix}" "${APP_HOME}/node"
+      return
+    fi
   fi
 
   say "Installing the current verified Node.js 22 runtime"
@@ -189,20 +193,17 @@ BUILD_ROOT="$(mktemp -d "${APP_HOME}/build.XXXXXX")"
 trap 'rm -rf "${BUILD_ROOT}"' EXIT
 ARCHIVE="${BUILD_ROOT}/source.tar.gz"
 SOURCE_URL="https://api.github.com/repos/${GITHUB_REPOSITORY}/tarball/${GITHUB_REF}"
-CURL_AUTH=()
+download_source() { curl -fsSL --retry 3 --header 'Accept: application/vnd.github+json' "$@" "${SOURCE_URL}" -o "${ARCHIVE}"; }
+DOWNLOAD_FAILED="Could not download ${GITHUB_REPOSITORY}. If it is private, pass a read-only GITHUB_TOKEN."
 if [[ -n ${GITHUB_TOKEN:-} ]]; then
-  TOKEN_CONFIG="${BUILD_ROOT}/github-curl.conf"
-  umask 077
-  printf 'header = "Authorization: Bearer %s"\n' "${GITHUB_TOKEN}" >"${TOKEN_CONFIG}"
-  CURL_AUTH=(--config "${TOKEN_CONFIG}")
-fi
-if ! curl -fsSL --retry 3 --header 'Accept: application/vnd.github+json' \
-  "${CURL_AUTH[@]}" "${SOURCE_URL}" -o "${ARCHIVE}"; then
-  fail "Could not download ${GITHUB_REPOSITORY}. If it is private, pass a read-only GITHUB_TOKEN."
+  # Handed to curl on its standard input (printf is built in, so it's in no command line either): the
+  # build folder is in /opt, which the running FilesDude can read, so the token is never written there.
+  printf 'header = "Authorization: Bearer %s"\n' "${GITHUB_TOKEN}" | download_source --config - || fail "${DOWNLOAD_FAILED}"
+else
+  download_source || fail "${DOWNLOAD_FAILED}"
 fi
 # The token is only for the download: nothing run by the build (package install scripts, the build
 # itself) gets to see it.
-rm -f "${TOKEN_CONFIG:-}"
 HAD_GITHUB_TOKEN="${GITHUB_TOKEN:+true}"
 unset GITHUB_TOKEN
 mkdir -p "${BUILD_ROOT}/source"
@@ -339,6 +340,9 @@ elif [[ ${MODE} == "reset" ]]; then
   EXISTING_USERNAME="$(env_value FILEDUDE_USERNAME)"
   INSTALL_USERNAME="${INSTALL_USERNAME:-$(prompt_value "Replacement username" "${EXISTING_USERNAME:-admin}")}"
   INSTALL_PASSWORD="$(prompt_password)"
+  # Stopped first, so a FilesDude that someone else took over (perhaps why it's being reset) can't
+  # put its own login back; it starts again at the end.
+  systemctl stop filesdude.service 2>/dev/null || true
   reset_environment "${INSTALL_USERNAME}" "${INSTALL_PASSWORD}"
   # Passkeys sign in without the password, so a reset for a lost or exposed login removes them too.
   rm -f "${STATE_DIR}/credentials.json" "${STATE_DIR}/passkeys.json"
@@ -423,16 +427,17 @@ STATE_UNIT="$(quote_unit "${STATE_DIR}")"
 top_of() { local rest="${1#/}"; printf '/%s' "${rest%%/*}"; }
 HIDDEN="-/boot -/lost+found -/sys/kernel/debug -/sys/kernel/security -/sys/firmware"
 EMPTIED="/run:ro /opt:ro /var:ro"
-ETC_FILES="passwd group hosts host.conf resolv.conf nsswitch.conf gai.conf services protocols localtime timezone ssl/certs ca-certificates ld.so.cache alternatives hostid zfs"
+# (Folders end with a slash.)
+ETC_FILES="passwd group hosts host.conf resolv.conf nsswitch.conf gai.conf services protocols localtime timezone ssl/certs/ ca-certificates/ ld.so.cache alternatives/ hostid zfs/"
 ETC_SHOWN=""
 for file in ${ETC_FILES}; do
-  ETC_SHOWN+=" -/etc/${file}"
+  ETC_SHOWN+=" -/etc/${file%/}"
 done
 # Its /etc is a folder of empty placeholders (made below) that those files are mounted onto: systemd
 # can't make them in an empty in-memory /etc where SELinux is on (Fedora, RHEL, openSUSE), as each new
 # file there would take the label of what it stands for. The media sandbox's /etc is made the same way.
 ETC_VIEW="${APP_HOME}/etc-view"
-SANDBOX_ETC_FILES="ld.so.cache alternatives"
+SANDBOX_ETC_FILES="ld.so.cache alternatives/"
 SANDBOX_ETC_VIEW="${APP_HOME}/sandbox-etc-view"
 for entry in /*; do
   name="${entry#/}"
@@ -601,7 +606,7 @@ if command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled; then
   SELINUX_MODULE="${CONFIG_DIR}/filesdude.cil"
   SELINUX_RULES="; Written by the FilesDude installer: systemd may accept the open files FilesDude's media sandbox
 ; helper hands it as a run's standard input and output (see scripts/sandbox-helper.py).
-(allow init_t non_security_file_type (file (getattr read write append ioctl lock)))"
+(allow init_t non_auth_file_type (file (getattr read write append)))"
   if [[ $(cat "${SELINUX_MODULE}" 2>/dev/null) != "${SELINUX_RULES}" ]] || ! semodule -l | grep -qx filesdude; then
     say "Letting systemd hand files to the media sandbox (an SELinux module)"
     printf '%s\n' "${SELINUX_RULES}" >"${SELINUX_MODULE}"
@@ -684,17 +689,20 @@ fi
 # keep their owners.
 systemctl stop filesdude.service filesdude-sandbox.service 2>/dev/null || true
 
-# The /etc placeholders, for the files this host has (remade while nothing has them mounted).
+# The /etc placeholders (remade while nothing has them mounted). There's one for each file even if this
+# host lacks it, as the view can't take a new one later: one that appears would then stop FilesDude
+# from starting. Empty, it reads as missing would.
 make_etc_view() {
-  local view="$1" item; shift
+  local view="$1" item name; shift
   rm -rf "${view}.new"
   install -d -m 0755 "${view}.new"
   for item in "$@"; do
-    if [[ -d /etc/${item} ]]; then
-      install -d -m 0755 "${view}.new/${item}"
-    elif [[ -e /etc/${item} ]]; then
-      install -d -m 0755 "$(dirname "${view}.new/${item}")"
-      install -m 0644 /dev/null "${view}.new/${item}"
+    name="${item%/}"
+    if [[ -d /etc/${name} || ( ! -e /etc/${name} && ${item} == */ ) ]]; then
+      install -d -m 0755 "${view}.new/${name}"
+    else
+      install -d -m 0755 "$(dirname "${view}.new/${name}")"
+      install -m 0644 /dev/null "${view}.new/${name}"
     fi
   done
   rm -rf "${view}"
@@ -743,7 +751,7 @@ printf 'Status: systemctl status filesdude\n'
 printf 'Logs: journalctl -u filesdude -f\n'
 printf 'Update later: sudo %s\n' "${UPDATE_COMMAND}"
 if [[ -n ${HAD_GITHUB_TOKEN:-} ]]; then
-  printf 'Private-repo update: sudo GITHUB_TOKEN="$(gh auth token)" %s\n' "${UPDATE_COMMAND}"
+  printf 'Private-repo update: sudo GITHUB_TOKEN=<a read-only token for the repository> %s\n' "${UPDATE_COMMAND}"
 fi
 # Listening beyond this host: the system's own firewall may still keep everyone else out.
 if [[ ${BIND_ADDRESS} != "127.0.0.1" && ${BIND_ADDRESS} != "::1" ]]; then

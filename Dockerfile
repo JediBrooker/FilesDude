@@ -22,7 +22,10 @@ ENV NODE_ENV=production \
     FILEDUDE_STATE_DIR=/state
 # FilesDude runs as PUID:PGID (its own account, 1001, unless set). The base image's `node` account
 # (1000) goes, so it doesn't name the files of whoever has that ID on the host.
-RUN userdel --remove node \
+# No set-user-ID or set-group-ID programs (su, passwd, mount...) either, so nothing in the container can
+# become root again, even where no-new-privileges isn't set.
+RUN find / -xdev -perm /6000 -type f -exec chmod a-s {} + \
+    && userdel --remove node \
     && groupadd --system --gid 1001 filesdude \
     && useradd --system --uid 1001 --gid filesdude --no-create-home --shell /usr/sbin/nologin filesdude \
     && mkdir -p /data /state && chown filesdude:filesdude /data /state && chmod 0700 /state
@@ -33,8 +36,7 @@ COPY --from=builder /app/public ./public
 COPY docker/filesdude.mjs ./docker/filesdude.mjs
 RUN chmod 0755 docker/filesdude.mjs && ln -s /app/docker/filesdude.mjs /usr/local/bin/filesdude
 EXPOSE 3000
-HEALTHCHECK --interval=30s --timeout=5s --start-period=30s \
-  CMD ["node", "-e", "fetch('http://127.0.0.1:3000/api/auth/status').then((response) => process.exit(response.ok ? 0 : 1), () => process.exit(1))"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s CMD ["node", "/app/docker/filesdude.mjs", "health"]
 
 # Starts as root only to hand /state to PUID:PGID, then runs FilesDude as that account with no
 # capabilities (see docker/filesdude.mjs). `setup` sets the login.

@@ -668,7 +668,9 @@ Compose file holds no secrets. Run it again to replace a forgotten login: that s
 everyone out and removes the login's passkeys (`setup --rotate-secret` also replaces the
 session secret, ending every share link). While FilesDude is running, run it inside its
 container instead, `docker exec -it filesdude filesdude setup`, which restarts FilesDude
-with the new login.
+with the new login. If someone else may have used FilesDude, stop it first instead
+(`docker compose stop`, then `docker compose run --rm filesdude setup --rotate-secret`, then
+`docker compose up -d`), so a FilesDude they control can't put its own login back.
 
 To update, run `docker compose pull && docker compose up -d`. Every change to `main` is
 published as `:latest` and as `:sha-<commit>`, which you can name in `compose.yaml` to stay on
@@ -684,12 +686,15 @@ What's different from the installer:
 
 - There's no media sandbox, which needs systemd: no video thumbnails, video and audio
   details, copies of videos that play everywhere, or subtitles from inside videos. Image
-  thumbnails and details work, read by sharp in a separate process.
+  thumbnails and details work, but outside any sandbox: sharp reads pictures in a separate
+  process running as `PUID`, so a picture crafted to exploit an image decoder could do
+  whatever FilesDude can. Keep that in mind if people you don't trust can upload files.
 - There are no ZFS snapshots.
 - FilesDude can only do what `PUID` can: it can't give files to other owners. Setting `PUID`
-  and `PGID` to `0` runs it as root, which can, but then image thumbnails are off too
-  (FilesDude never decodes other people's pictures with privileges, outside the sandbox).
-  Keep that to a narrowly scoped folder, never `/`, reachable only over your VPN or LAN.
+  and `PGID` to `0` runs it as root, which can once you also add `DAC_OVERRIDE` and `FOWNER`
+  to `cap_add`, but then image thumbnails are off too (FilesDude never decodes other
+  people's pictures with privileges, outside the sandbox). Keep that to a narrowly scoped
+  folder, never `/`, reachable only over your VPN or LAN.
 - File owners show as numbers, unless you mount the host's `/etc/passwd` and `/etc/group`
   (commented out in `compose.yaml`).
 

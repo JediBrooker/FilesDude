@@ -1,5 +1,6 @@
-# Builds the Docker image for x86_64 and arm64, checks each with docker/smoke-test.sh, and on main
-# publishes it to ghcr.io/jedibrooker/filesdude as :latest and :sha-<commit>.
+# Builds the Docker image for x86_64 and arm64 and checks each with docker/smoke-test.sh. Only main
+# publishes it, to ghcr.io/jedibrooker/filesdude as :latest and :sha-<commit>; nothing that runs a
+# pull request's code holds the token that can.
 name: Docker image
 
 on:
@@ -19,10 +20,43 @@ env:
   IMAGE: ghcr.io/jedibrooker/filesdude
 
 jobs:
-  build:
-    name: Build (${{ matrix.platform }})
+  test:
+    name: Test (${{ matrix.platform }})
     strategy:
       fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          build-args: FILEDUDE_BUILD_COMMIT=${{ github.sha }}
+          load: true
+          tags: filesdude:smoke-test
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+
+      - name: Smoke test
+        run: docker/smoke-test.sh filesdude:smoke-test
+
+  push:
+    name: Push (${{ matrix.platform }})
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: test
+    strategy:
       matrix:
         include:
           - platform: linux/amd64
@@ -46,33 +80,16 @@ jobs:
         with:
           images: ${{ env.IMAGE }}
 
-      - name: Build
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          platforms: ${{ matrix.platform }}
-          build-args: FILEDUDE_BUILD_COMMIT=${{ github.sha }}
-          labels: ${{ steps.meta.outputs.labels }}
-          load: true
-          tags: filesdude:smoke-test
-          cache-from: type=gha,scope=${{ matrix.platform }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
-
-      - name: Smoke test
-        run: docker/smoke-test.sh filesdude:smoke-test
-
-      - name: Sign in to the GitHub Container Registry
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # The same build (from the cache), pushed by digest; the publish job names it.
+      # The build the test job checked (its layers come from the cache), pushed by digest; the publish
+      # job names it.
       - name: Push
         id: push
-        if: github.event_name != 'pull_request'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -83,7 +100,6 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.platform }}
 
       - name: Record the digest
-        if: github.event_name != 'pull_request'
         env:
           DIGEST: ${{ steps.push.outputs.digest }}
           PLATFORM: ${{ matrix.platform }}
@@ -93,7 +109,6 @@ jobs:
           echo "PLATFORM_PAIR=${PLATFORM//\//-}" >>"${GITHUB_ENV}"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: github.event_name != 'pull_request'
         with:
           name: digests-${{ env.PLATFORM_PAIR }}
           path: ${{ runner.temp }}/digests/*
@@ -102,8 +117,8 @@ jobs:
 
   publish:
     name: Publish
-    if: github.event_name != 'pull_request'
-    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: push
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -123,7 +138,7 @@ jobs:
         with:
           images: ${{ env.IMAGE }}
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest
             type=sha,format=short
 
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
