@@ -62,8 +62,20 @@ SANDBOX = [
     # No swap on top of the memory limit, and every run shares one slice's limits (see install.sh).
     "MemoryMax=512M", "MemorySwapMax=0", "TasksMax=64", "CPUQuota=200%", "Slice=filesdude-media.slice",
     # Its own small /dev/shm rather than the host's.
-    "TemporaryFileSystem=/etc:ro /run:ro /dev/shm:size=16M", "BindReadOnlyPaths=-/etc/ld.so.cache -/etc/alternatives",
+    "TemporaryFileSystem=/run:ro /dev/shm:size=16M",
 ]
+
+# Its /etc holds only what the dynamic linker needs, mounted onto empty placeholders in a folder the
+# installer makes: where SELinux is on, systemd can't make them in an empty in-memory /etc.
+ETC_SHOWN = "BindReadOnlyPaths=-/etc/ld.so.cache -/etc/alternatives"
+
+
+def etc_properties():
+    view = setting("FILEDUDE_SANDBOX_ETC", "/opt/filesdude/sandbox-etc-view")
+    if os.path.isdir(view):
+        return ["BindReadOnlyPaths=" + quote(view) + ":/etc", ETC_SHOWN]
+    # Installed by an older installer, which made no placeholders (an update makes them).
+    return ["TemporaryFileSystem=/etc:ro", ETC_SHOWN]
 
 # Top-level folders the sandbox keeps: the system's programs and libraries (often symlinks into /usr),
 # and the kernel and temporary filesystems the sandbox already replaces with its own.
@@ -129,7 +141,7 @@ def unit_arguments(request, unit):
     """systemd-run's arguments for one run of a checked request, as the unit with this name."""
     command, mounts = tool_command(request["tool"])
     seconds = request["seconds"]
-    properties = list(SANDBOX)
+    properties = SANDBOX + etc_properties()
     if request["inspectSockets"]:
         properties.append("SystemCallFilter=getsockname getsockopt")
     if request["fileOutput"] is not None:

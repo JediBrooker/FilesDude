@@ -1,6 +1,6 @@
 # FilesDude
 
-FilesDude File Explorer is a secure, self-hosted web file manager designed for a Proxmox host, VM, or LXC container. It exposes one explicitly configured filesystem root and keeps every browser operation inside that boundary.
+FilesDude File Explorer is a secure, self-hosted web file manager for a Linux server: a Proxmox host, VM, or LXC container, most Linux distributions, or anywhere Docker runs. It exposes one explicitly configured filesystem root and keeps every browser operation inside that boundary.
 
 ## What is included
 
@@ -58,10 +58,14 @@ FilesDude File Explorer is a secure, self-hosted web file manager designed for a
 - User accounts: the owner (the installer's login) can add editors (view and change files) and viewers (view and download only), each confined to one folder, from **Users** in the sidebar
 - Multi-selection toolbar actions, responsive UI, dark mode, keyboard shortcuts, and no external analytics or storage services
 
-## Install on Proxmox with systemd
+## Install on Linux with systemd
 
-The installer needs a Debian-based system with systemd, such as a Proxmox VE host, VM,
-or LXC container, or Debian or Ubuntu, on x86_64 or arm64. SSH into the server and run:
+The installer runs on Linux with systemd 248 or newer and Python 3.9 or newer, on x86_64 or
+arm64, and installs anything else it needs with the system's package manager (apt, dnf,
+zypper, or pacman). It's tested on Proxmox VE, Debian 13, Fedora 43, AlmaLinux 10, openSUSE
+Tumbleweed, and Arch Linux; relatives of those (Ubuntu 22.04 and later, Rocky Linux 9 and
+later, openSUSE Leap 16) work the same way. Elsewhere (Alpine, Unraid, Synology, TrueNAS, macOS,
+Windows), use [Docker](#install-with-docker). SSH into the server and run:
 
 ```bash
 curl -fsSLo /tmp/filesdude-install.sh \
@@ -69,9 +73,10 @@ curl -fsSLo /tmp/filesdude-install.sh \
 sudo bash /tmp/filesdude-install.sh
 ```
 
-The installer asks for the folder FilesDude may manage and the initial username and
-password. It then installs a checksum-verified Node.js 22 runtime when necessary, builds an
-immutable release, writes a hardened systemd service, and starts FilesDude.
+The installer asks for the folder FilesDude may manage (`/srv/files` unless you choose
+another, or `/mnt/pve` on Proxmox) and the initial username and password. It then installs a
+checksum-verified Node.js 22 runtime when necessary, builds an immutable release, writes a
+hardened systemd service, and starts FilesDude. Building needs about BUILD_MEMORY of memory.
 
 FilesDude runs as its own `filesdude` account, not root. It holds just the file
 capabilities a file manager needs: changing owners, and reading and writing files
@@ -628,30 +633,67 @@ FilesDude deliberately refuses to sign users in until a password hash and a stro
 
    Open `http://localhost:3000`.
 
-## Alternative Docker Compose deployment
+## Install with Docker
 
-Set the host directory in `.env`:
-
-```dotenv
-FILEDUDE_HOST_ROOT=/mnt/pve/storage
-```
-
-Then start the service:
+The image (`ghcr.io/jedibrooker/filesdude`, for x86_64 and arm64) runs anywhere Docker
+does, including the systems the installer doesn't support. In a folder of its own, say which
+folder FilesDude manages and whose files they are, then download the Compose file, choose
+the login, and start it:
 
 ```bash
-docker compose up -d --build
+mkdir filesdude && cd filesdude
+printf 'FILEDUDE_HOST_ROOT=/srv/files\nPUID=1000\nPGID=1000\n' > .env
+curl -fsSLO https://raw.githubusercontent.com/JediBrooker/FilesDude/main/compose.yaml
+docker compose run --rm filesdude setup
+docker compose up -d
 ```
 
-The default Compose file only binds FilesDude to `127.0.0.1:3000`. Put Caddy, Nginx Proxy Manager, Traefik, Tailscale Serve, or another trusted reverse proxy in front of it and use HTTPS. A Caddy example is in `deploy/Caddyfile.example`.
+Then open `http://localhost:3000` on that machine. Without a `.env`, FilesDude manages a
+`files` folder beside `compose.yaml`, as user and group 1000.
 
-The container runs as UID/GID `1001:1001` by default. Give that account access to the mounted files. If FilesDude must change arbitrary ownership or administer files that this UID cannot access, set `user: "0:0"` for the service. That is powerful: use a narrowly scoped mount, never mount `/`, and restrict network access to your VPN or trusted LAN.
+`PUID` and `PGID` are the user and group FilesDude works as (`id` shows yours): it can do
+what that user can do with the files, and what it makes belongs to them. The container
+starts as root only to hand FilesDude's state volume to that user, then runs FilesDude as
+it, without any capabilities. The rest of the container is read-only.
+
+`setup` keeps the login in the state volume, with a session secret it makes, so the
+Compose file holds no secrets. Run it again to replace a forgotten login: that signs
+everyone out and removes the login's passkeys (`setup --rotate-secret` also replaces the
+session secret, ending every share link). While the container is running,
+`docker exec -it filesdude filesdude setup` does the same; restart the container afterwards.
+
+To update, run `docker compose pull && docker compose up -d`. Every change to `main` is
+published as `:latest` and as `:sha-<commit>`, which you can name in `compose.yaml` to stay on
+one build.
+
+Compose only binds FilesDude to `127.0.0.1:3000`. Put Caddy, Nginx Proxy Manager, Traefik,
+Tailscale Serve, or another reverse proxy in front of it and use HTTPS (a Caddy example is in
+`deploy/Caddyfile.example`). To publish the port to your network directly, change
+`127.0.0.1:3000:3000` to `3000:3000` and set `FILEDUDE_TRUST_PROXY` to `"false"`. Other
+settings go in `environment` in `compose.yaml`.
+
+What's different from the installer:
+
+- There's no media sandbox, which needs systemd: no video thumbnails, video and audio
+  details, copies of videos that play everywhere, or subtitles from inside videos. Image
+  thumbnails and details work, read by sharp in a separate process.
+- There are no ZFS snapshots.
+- FilesDude can only do what `PUID` can: it can't give files to other owners. Setting `PUID`
+  and `PGID` to `0` runs it as root, which can, but then image thumbnails are off too
+  (FilesDude never decodes other people's pictures with privileges, outside the sandbox).
+  Keep that to a narrowly scoped folder, never `/`, reachable only over your VPN or LAN.
+- File owners show as numbers, unless you mount the host's `/etc/passwd` and `/etc/group`
+  (commented out in `compose.yaml`).
+
+To build the image yourself from a copy of this repository, replace the `image:` line in
+`compose.yaml` with `build: .` and run `docker compose up -d --build`.
 
 ## Recommended deployment rules
 
 - Expose only the smallest useful root, such as `/mnt/pve/media`; never expose the Proxmox host root.
 - Prefer a dedicated unprivileged LXC or VM and bind-mount the managed storage into it.
 - Use HTTPS even on a LAN. For remote access, prefer WireGuard or Tailscale over directly exposing the login page to the internet.
-- Behind a reverse proxy or tunnel (such as a Cloudflare Tunnel's `cloudflared`), set `FILEDUDE_TRUSTED_PROXIES` in `/etc/filesdude/filesdude.env` to its address, for example `FILEDUDE_TRUSTED_PROXIES=192.168.0.3`, and restart. Only connections that really come from that address (FilesDude checks the connection itself, not a header) have their client address (Cloudflare's `CF-Connecting-IP`, or `X-Forwarded-For`) and HTTPS believed, so sign-in limits apply per real visitor, Activity shows real addresses, and session cookies are marked secure. Anyone else is taken as their own address, whatever headers they send. `FILEDUDE_TRUST_PROXY=true` (believing every connection is a proxy) remains only for setups where FilesDude can't be reached except through one.
+- Behind a reverse proxy or tunnel (such as a Cloudflare Tunnel's `cloudflared`), set `FILEDUDE_TRUSTED_PROXIES` in `/etc/filesdude/filesdude.env` (with Docker, in `compose.yaml`) to its address, for example `FILEDUDE_TRUSTED_PROXIES=192.168.0.3`, and restart. Only connections that really come from that address (FilesDude checks the connection itself, not a header) have their client address (Cloudflare's `CF-Connecting-IP`, or `X-Forwarded-For`) and HTTPS believed, so sign-in limits apply per real visitor, Activity shows real addresses, and session cookies are marked secure. Anyone else is taken as their own address, whatever headers they send. `FILEDUDE_TRUST_PROXY=true` (believing every connection is a proxy) remains only for setups where FilesDude can't be reached except through one.
 - Back up the underlying data independently. Protected trash helps with mistakes but is not a backup.
 - Keep Proxmox, the container image, and reverse proxy patched. `filesdude-update --reset-credentials` signs everyone out; rotating the session secret also does, and ends every share link.
 - Behind a tunnel, let only the tunnel reach FilesDude's port (`--allow-from`, above), so nobody on the LAN signs in over plain HTTP.

@@ -136,6 +136,20 @@ async function start() {
   await import(new URL("../server.js", import.meta.url).href);
 }
 
+/** FilesDude's own process, when setup runs in its container (docker exec), or null. */
+function runningServer() {
+  for (const name of fs.readdirSync("/proc")) {
+    if (!/^\d+$/.test(name) || Number(name) === process.pid) continue;
+    try {
+      const args = fs.readFileSync(`/proc/${name}/cmdline`, "utf8").split("\0");
+      if (args.some((arg) => arg.endsWith("/filesdude.mjs")) && args.includes("start")) return Number(name);
+    } catch {
+      // Gone already, or another account's.
+    }
+  }
+  return null;
+}
+
 /** Reads a line from the terminal, showing what's typed unless `hidden`. */
 function ask(question, { hidden = false } = {}) {
   const { stdin, stdout } = process;
@@ -217,7 +231,16 @@ async function setup(args) {
   }
   writeLogin(stateDir, saved);
   if (rotateSecret) console.log("The session secret was replaced: every share link and saved server credential has stopped working.");
-  console.log(`The login for ${username} is saved. Start FilesDude, or restart it if it's running, to use it.`);
+  // A running FilesDude still has the old login (and sessions) until it restarts, which its container
+  // does by itself when it stops (restart: unless-stopped).
+  const server = runningServer();
+  if (server) {
+    // Said first: stopping FilesDude stops the container, and this command with it.
+    console.log(`The login for ${username} is saved, and FilesDude is restarting to use it. If the container doesn't come back by itself, start it again.`);
+    process.kill(server, "SIGTERM");
+  } else {
+    console.log(`The login for ${username} is saved. Start FilesDude (or restart its container) to use it.`);
+  }
 }
 
 async function main() {

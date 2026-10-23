@@ -54,10 +54,26 @@ base64 -d >files/pixel.png <<<'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAD
 curl -fsS -b cookies -o thumbnail "${URL}/api/fs/thumbnail?path=pixel.png" || fail "no thumbnail"
 [[ $(head -c 4 thumbnail) == RIFF ]] || fail "the thumbnail isn't a WebP picture"
 
+sign_in() {
+  curl -fsS -c cookies -H 'Content-Type: application/json' -H 'X-FileDude-Request: 1' \
+    -d "{\"username\":\"smoke\",\"password\":\"$1\"}" "${URL}/api/auth/login" >/dev/null 2>&1
+}
+wait_for_restart() {
+  sleep 3
+  for _ in $(seq 60); do curl -fsS "${URL}/api/auth/status" >/dev/null 2>&1 && return; sleep 1; done
+  fail "FilesDude didn't come back"
+}
+
 # The login survives a restart (it's kept in the state volume).
 docker compose restart >/dev/null
-for _ in $(seq 60); do curl -fsS "${URL}/api/auth/status" >status.json 2>/dev/null && break; sleep 1; done
-curl -fsS -c cookies -H 'Content-Type: application/json' -H 'X-FileDude-Request: 1' \
-  -d "{\"username\":\"smoke\",\"password\":\"${PASSWORD}\"}" "${URL}/api/auth/login" >/dev/null || fail "couldn't sign in after a restart"
+wait_for_restart
+sign_in "${PASSWORD}" || fail "couldn't sign in after a restart"
+
+# Replacing the login in the running container restarts FilesDude with it; the old one stops working.
+# (The container stops under the command, which may end it early.)
+docker compose exec -T -e FILEDUDE_INSTALL_PASSWORD="${PASSWORD}-new" filesdude filesdude setup --username smoke >/dev/null || true
+wait_for_restart
+sign_in "${PASSWORD}-new" || fail "couldn't sign in with the replaced login"
+if sign_in "${PASSWORD}"; then fail "the old login still works"; fi
 
 printf 'Smoke test passed: %s\n' "${IMAGE}"

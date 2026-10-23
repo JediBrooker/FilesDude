@@ -231,7 +231,8 @@ mv -Tf "${APP_HOME}/current.new" "${APP_HOME}/current"
 
 prompt_value() {
   local prompt="$1" default="$2" value=""
-  if [[ -r /dev/tty ]]; then
+  # /dev/tty can exist without a terminal behind it (ssh without -t, systemd-run).
+  if { : </dev/tty; } 2>/dev/null; then
     IFS= read -r -p "${prompt} [${default}]: " value </dev/tty || true
   fi
   printf '%s' "${value:-${default}}"
@@ -417,11 +418,18 @@ STATE_UNIT="$(quote_unit "${STATE_DIR}")"
 # would otherwise let it use.
 top_of() { local rest="${1#/}"; printf '/%s' "${rest%%/*}"; }
 HIDDEN="-/boot -/lost+found -/sys/kernel/debug -/sys/kernel/security -/sys/firmware"
-EMPTIED="/etc:ro /run:ro /opt:ro /var:ro"
+EMPTIED="/run:ro /opt:ro /var:ro"
+ETC_FILES="passwd group hosts host.conf resolv.conf nsswitch.conf gai.conf services protocols localtime timezone ssl/certs ca-certificates ld.so.cache alternatives hostid zfs"
 ETC_SHOWN=""
-for file in passwd group hosts host.conf resolv.conf nsswitch.conf gai.conf services protocols localtime timezone ssl/certs ca-certificates ld.so.cache alternatives hostid zfs; do
+for file in ${ETC_FILES}; do
   ETC_SHOWN+=" -/etc/${file}"
 done
+# Its /etc is a folder of empty placeholders (made below) that those files are mounted onto: systemd
+# can't make them in an empty in-memory /etc where SELinux is on (Fedora, RHEL, openSUSE), as each new
+# file there would take the label of what it stands for. The media sandbox's /etc is made the same way.
+ETC_VIEW="${APP_HOME}/etc-view"
+SANDBOX_ETC_FILES="ld.so.cache alternatives"
+SANDBOX_ETC_VIEW="${APP_HOME}/sandbox-etc-view"
 for entry in /*; do
   name="${entry#/}"
   [[ -d ${entry} && ! -L ${entry} ]] || continue
@@ -494,7 +502,7 @@ CapabilityBoundingSet=${CAPABILITY_LIST}
 AmbientCapabilities=${CAPABILITY_LIST}
 TemporaryFileSystem=${EMPTIED}
 InaccessiblePaths=${HIDDEN}
-BindReadOnlyPaths=${APP_HOME} -/run/filesdude-sandbox -/run/systemd/resolve${ETC_SHOWN}
+BindReadOnlyPaths=${ETC_VIEW}:/etc ${APP_HOME} -/run/filesdude-sandbox -/run/systemd/resolve${ETC_SHOWN}
 BindPaths=${ROOT_UNIT} ${STATE_UNIT}
 ReadWritePaths=${ROOT_UNIT} ${STATE_UNIT}
 ${ZFS_UNIT}
@@ -542,6 +550,7 @@ Environment=$(quote_unit "FILEDUDE_STATE_DIR=${STATE_DIR}")
 Environment=FILEDUDE_SANDBOX_USER=${SERVICE_ACCOUNT}
 Environment=FILEDUDE_SANDBOX_NODE=${APP_HOME}/node/bin/node
 Environment=FILEDUDE_SANDBOX_MODULES=${APP_HOME}/current/node_modules
+Environment=FILEDUDE_SANDBOX_ETC=${SANDBOX_ETC_VIEW}
 $(helper_setting FILEDUDE_FFMPEG_PATH)
 $(helper_setting FILEDUDE_FFPROBE_PATH)
 NoNewPrivileges=true
@@ -653,6 +662,28 @@ fi
 # else can write to are handed over (other users may write to the managed folder); the trash's items
 # keep their owners.
 systemctl stop filesdude.service filesdude-sandbox.service 2>/dev/null || true
+
+# The /etc placeholders, for the files this host has (remade while nothing has them mounted).
+make_etc_view() {
+  local view="$1" item; shift
+  rm -rf "${view}.new"
+  install -d -m 0755 "${view}.new"
+  for item in "$@"; do
+    if [[ -d /etc/${item} ]]; then
+      install -d -m 0755 "${view}.new/${item}"
+    elif [[ -e /etc/${item} ]]; then
+      install -d -m 0755 "$(dirname "${view}.new/${item}")"
+      install -m 0644 /dev/null "${view}.new/${item}"
+    fi
+  done
+  rm -rf "${view}"
+  mv -T "${view}.new" "${view}"
+}
+# shellcheck disable=SC2086 # the lists are plain words
+make_etc_view "${ETC_VIEW}" ${ETC_FILES}
+# shellcheck disable=SC2086
+make_etc_view "${SANDBOX_ETC_VIEW}" ${SANDBOX_ETC_FILES}
+
 find "${STATE_DIR}" -xdev ! -user "${SERVICE_ACCOUNT}" -exec chown -h "${SERVICE_ACCOUNT}:${SERVICE_GROUP}" {} +
 PREVIOUS_ACCOUNT="filesdude"
 [[ ${SERVICE_ACCOUNT} == "filesdude" ]] && PREVIOUS_ACCOUNT="root"
