@@ -1,8 +1,15 @@
 node_modules
 .next
 .git
+.github
+.claude
 .env
 .env.*
 !.env.example
 npm-debug.log*
 demo-root
+tests
+*.tsbuildinfo
+.vinext
+.wrangler
+**/* 2.*
