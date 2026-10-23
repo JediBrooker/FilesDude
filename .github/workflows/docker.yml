@@ -162,8 +162,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
         run: |
-          releases="$(gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/v" --paginate --jq '.[].ref | ltrimstr("refs/tags/")' \
-            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V || true)"
+          tags="$(gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/v" --paginate --jq '.[].ref | ltrimstr("refs/tags/")')"
+          releases="$(grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' <<<"${tags}" | sort -V || true)"
+          if [[ ${TAG} != *-* ]] && ! grep -qxF "${TAG}" <<<"${releases}"; then
+            echo "::error::GitHub didn't list the tag ${TAG}, so whether it's the newest release is unknown."
+            exit 1
+          fi
           newest="$(tail -n 1 <<<"${releases}")"
           previous="$(awk -v tag="${TAG}" '$0 == tag { print last; exit } { last = $0 }' <<<"${releases}")"
           echo "newest=$([[ ${TAG} == "${newest}" ]] && echo true || echo false)" >>"${GITHUB_OUTPUT}"
@@ -229,6 +233,7 @@ jobs:
         run: |
           if gh release view "${TAG}" >/dev/null 2>&1; then
             gh release upload "${TAG}" install.sh compose.yaml --clobber
+            if [[ ${NEWEST} == "true" ]]; then gh release edit "${TAG}" --latest; fi
             exit 0
           fi
           options=(--verify-tag --generate-notes --title "FilesDude ${TAG#v}")
