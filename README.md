@@ -666,8 +666,9 @@ it, without any capabilities. The rest of the container is read-only.
 `setup` keeps the login in the state volume, with a session secret it makes, so the
 Compose file holds no secrets. Run it again to replace a forgotten login: that signs
 everyone out and removes the login's passkeys (`setup --rotate-secret` also replaces the
-session secret, ending every share link). While the container is running,
-`docker exec -it filesdude filesdude setup` does the same; restart the container afterwards.
+session secret, ending every share link). While FilesDude is running, run it inside its
+container instead, `docker exec -it filesdude filesdude setup`, which restarts FilesDude
+with the new login.
 
 To update, run `docker compose pull && docker compose up -d`. Every change to `main` is
 published as `:latest` and as `:sha-<commit>`, which you can name in `compose.yaml` to stay on

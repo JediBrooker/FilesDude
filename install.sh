@@ -125,13 +125,16 @@ install_tools() {
   done
   ((${#packages[@]})) || return 0
   say "Installing ${packages[*]}"
+  # pacman installs from the package lists it last fetched, which upgrading the system refreshes.
+  local hint="Install them"
+  [[ ${PACKAGE_MANAGER} == pacman ]] && hint="Install them (pacman -Syu ${packages[*]})"
   case "${PACKAGE_MANAGER}" in
     apt-get) apt-get update -qq && apt-get install -y -qq "${packages[@]}" >/dev/null ;;
     dnf) dnf install -y -q --setopt=install_weak_deps=False "${packages[@]}" >/dev/null ;;
     zypper) zypper --non-interactive --quiet install --no-recommends "${packages[@]}" >/dev/null ;;
     pacman) pacman -S --needed --noconfirm "${packages[@]}" >/dev/null ;;
     *) false ;;
-  esac || fail "FilesDude needs ${packages[*]}, which couldn't be installed here. Install them, then run the installer again."
+  esac || fail "FilesDude needs ${packages[*]}, which couldn't be installed here. ${hint}, then run the installer again."
 }
 
 say "Checking operating-system prerequisites"
