@@ -76,7 +76,8 @@ sudo bash /tmp/filesdude-install.sh
 The installer asks for the folder FilesDude may manage (`/srv/files` unless you choose
 another, or `/mnt/pve` on Proxmox) and the initial username and password. It then installs a
 checksum-verified Node.js 22 runtime when necessary, builds an immutable release, writes a
-hardened systemd service, and starts FilesDude. Building needs about BUILD_MEMORY of memory.
+hardened systemd service, and starts FilesDude. Building it takes about 2 GB of memory, so give
+a smaller machine some swap first.
 
 FilesDude runs as its own `filesdude` account, not root. It holds just the file
 capabilities a file manager needs: changing owners, and reading and writing files
@@ -90,9 +91,15 @@ everything in its folder, the installer refuses a folder that holds or is inside
 system's own (such as `/etc`, `/usr`, or `/root`). The one part that runs as root is a small helper,
 `filesdude-sandbox.service`. It is reached through a socket only FilesDude's account
 can use, and it does one job: start the media sandbox (below) for ffmpeg, ffprobe, or
-the image decoder, with its own fixed settings. Older installs that run as root can
+the image decoder, with its own fixed settings. Where SELinux is on (Fedora, RHEL and its
+relatives, openSUSE), the installer adds a one-rule policy module, `filesdude`, so that
+systemd can accept the open files the helper hands each sandbox run; it gives FilesDude
+itself nothing more. Older installs that run as root can
 switch with `sudo filesdude-update --service-user filesdude`. That moves FilesDude's
 state to the new account; `--service-user root` switches back.
+
+On RHEL and its relatives, and on openSUSE, `sudo` doesn't look in `/usr/local/sbin`, so
+run the updater below as `sudo /usr/local/sbin/filesdude-update` there.
 
 To let only your reverse proxy or tunnel reach FilesDude's port, pass its address. Add
 any network interfaces that should also reach it, such as Tailscale's. The installer

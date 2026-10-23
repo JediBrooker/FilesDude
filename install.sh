@@ -112,6 +112,7 @@ package_for() {
     useradd:dnf) printf 'shadow-utils' ;;
     useradd:*) printf 'shadow' ;;
     nft:*) printf 'nftables' ;;
+    semodule:*) printf 'policycoreutils' ;;
     *) printf '%s' "$1" ;;
   esac
 }
@@ -587,6 +588,23 @@ MemorySwapMax=0
 CPUQuota=400%
 TasksMax=256
 EOF
+
+# Where SELinux is on (Fedora, RHEL and its relatives, openSUSE), its policy doesn't let systemd accept
+# the open files the sandbox helper hands it as a run's input and output (FilesDude's files and state),
+# and a refused one leaves systemd unable to answer anyone for a while. This module lets systemd
+# itself take them; it gives FilesDude and the sandboxes nothing more.
+if command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled; then
+  install_tools semodule
+  SELINUX_MODULE="${CONFIG_DIR}/filesdude.cil"
+  SELINUX_RULES="; Written by the FilesDude installer: systemd may accept the open files FilesDude's media sandbox
+; helper hands it as a run's standard input and output (see scripts/sandbox-helper.py).
+(allow init_t non_security_file_type (file (getattr read write append ioctl lock)))"
+  if [[ $(cat "${SELINUX_MODULE}" 2>/dev/null) != "${SELINUX_RULES}" ]] || ! semodule -l | grep -qx filesdude; then
+    say "Letting systemd hand files to the media sandbox (an SELinux module)"
+    printf '%s\n' "${SELINUX_RULES}" >"${SELINUX_MODULE}"
+    semodule -i "${SELINUX_MODULE}" || fail "The SELinux module in ${SELINUX_MODULE} couldn't be installed, and FilesDude's media sandbox needs it."
+  fi
+fi
 
 cat >/usr/local/sbin/filesdude-update <<'EOF'
 #!/usr/bin/env bash

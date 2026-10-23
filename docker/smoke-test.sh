@@ -37,7 +37,7 @@ PROCESS="$(docker compose exec -T filesdude node -e '
   const fs = require("fs");
   for (const pid of fs.readdirSync("/proc").filter((name) => /^\d+$/.test(name))) {
     const status = fs.readFileSync(`/proc/${pid}/status`, "utf8");
-    if (fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").includes("filesdude.mjs")) {
+    if (fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").startsWith("next-server")) {
       console.log(status.split("\n").filter((line) => /^(Uid|Gid|CapEff|CapPrm|CapAmb):/.test(line)).join(" "));
     }
   }')"
@@ -48,7 +48,7 @@ PROCESS="$(docker compose exec -T filesdude node -e '
 curl -fsS -c cookies -H 'Content-Type: application/json' -H 'X-FileDude-Request: 1' \
   -d "{\"username\":\"smoke\",\"password\":\"${PASSWORD}\"}" "${URL}/api/auth/login" >/dev/null || fail "couldn't sign in"
 curl -fsS -b cookies -H 'Content-Type: application/json' -H 'X-FileDude-Request: 1' \
-  -d '{"action":"create","path":"","name":"made-by-filesdude","type":"folder"}' "${URL}/api/fs" >/dev/null || fail "couldn't make a folder"
+  -d '{"action":"create","path":"","name":"made-by-filesdude","type":"directory"}' "${URL}/api/fs" >/dev/null || fail "couldn't make a folder"
 [[ $(stat -c %u:%g files/made-by-filesdude) == "${PUID}:${PGID}" ]] || fail "the new folder isn't owned by ${PUID}:${PGID}"
 base64 -d >files/pixel.png <<<'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
 curl -fsS -b cookies -o thumbnail "${URL}/api/fs/thumbnail?path=pixel.png" || fail "no thumbnail"

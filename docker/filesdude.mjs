@@ -90,12 +90,17 @@ function handOver(uid, gid) {
   fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   const device = fs.lstatSync(stateDir).dev;
   const pending = [stateDir];
-  while (pending.length) {
-    const item = pending.pop();
-    const stat = fs.lstatSync(item);
-    if (stat.dev !== device) continue;
-    if (stat.uid !== uid || stat.gid !== gid) fs.lchownSync(item, uid, gid);
-    if (stat.isDirectory()) for (const name of fs.readdirSync(item)) pending.push(path.join(item, name));
+  try {
+    while (pending.length) {
+      const item = pending.pop();
+      const stat = fs.lstatSync(item);
+      if (stat.dev !== device) continue;
+      if (stat.uid !== uid || stat.gid !== gid) fs.lchownSync(item, uid, gid);
+      if (stat.isDirectory()) for (const name of fs.readdirSync(item)) pending.push(path.join(item, name));
+    }
+  } catch (error) {
+    if (error.code === "EROFS") throw new Stop(`FilesDude's state folder (${stateDir}) is read-only: mount a volume there (compose.yaml does).`);
+    throw error;
   }
   const root = managedRoot();
   try {
@@ -138,17 +143,23 @@ async function start() {
 
 /** FilesDude's own process, when setup runs in its container (docker exec), or null. */
 function runningServer() {
+  const account = new RegExp(`^Uid:\\s+${process.getuid()}\\s`, "m");
   for (const name of fs.readdirSync("/proc")) {
     if (!/^\d+$/.test(name) || Number(name) === process.pid) continue;
     try {
+      // Its account's (not the container's init, which runs as root).
+      if (!account.test(fs.readFileSync(`/proc/${name}/status`, "utf8"))) continue;
       const args = fs.readFileSync(`/proc/${name}/cmdline`, "utf8").split("\0");
-      if (args.some((arg) => arg.endsWith("/filesdude.mjs")) && args.includes("start")) return Number(name);
+      // Next.js renames the process once it's serving.
+      if (args[0].startsWith("next-server") || (args.some((arg) => arg.endsWith("/filesdude.mjs")) && args.includes("start"))) return Number(name);
     } catch {
-      // Gone already, or another account's.
+      // Gone already.
     }
   }
   return null;
 }
+
+const running = (pid) => fs.existsSync(`/proc/${pid}`);
 
 /** Reads a line from the terminal, showing what's typed unless `hidden`. */
 function ask(question, { hidden = false } = {}) {
@@ -238,6 +249,9 @@ async function setup(args) {
     // Said first: stopping FilesDude stops the container, and this command with it.
     console.log(`The login for ${username} is saved, and FilesDude is restarting to use it. If the container doesn't come back by itself, start it again.`);
     process.kill(server, "SIGTERM");
+    for (let waited = 0; waited < 10_000 && running(server); waited += 250) await new Promise((resolve) => setTimeout(resolve, 250));
+    // Without an init process, FilesDude is the container's own first process, which ignores signals.
+    if (running(server)) console.log("FilesDude didn't stop: restart its container (docker restart filesdude) to use the new login.");
   } else {
     console.log(`The login for ${username} is saved. Start FilesDude (or restart its container) to use it.`);
   }
