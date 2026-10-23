@@ -1,11 +1,15 @@
-# Builds the Docker image for x86_64 and arm64 and checks each with docker/smoke-test.sh. Only main
-# publishes it, to ghcr.io/jedibrooker/filesdude as :latest and :sha-<commit>; nothing that runs a
-# pull request's code holds the token that can.
+# Builds the Docker image for x86_64 and arm64 and checks each with docker/smoke-test.sh, then
+# publishes it to ghcr.io/jedibrooker/filesdude: each change to main as :main and :sha-<commit>, and
+# each release tag, vX.Y.Z, as :X.Y.Z, :X.Y, and (the highest release) :stable and :latest, followed
+# by its GitHub release, which the installer's stable channel follows. A pre-release, vX.Y.Z-rc.1, is
+# only :X.Y.Z-rc.1 and a GitHub pre-release. Nothing that runs a pull request's code holds a token
+# that can publish.
 name: Docker image
 
 on:
   push:
     branches: [main]
+    tags: ['v[0-9]+.[0-9]+.[0-9]+', 'v[0-9]+.[0-9]+.[0-9]+-*']
   pull_request:
   workflow_dispatch:
 
@@ -36,6 +40,19 @@ jobs:
         with:
           persist-credentials: false
 
+      # A release's tag names the version in package.json (which the app shows): v0.3.0, or a
+      # pre-release of it such as v0.3.0-rc.1.
+      - name: Check the release's version
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="$(jq -r .version package.json)"
+          if [[ ${TAG} != "v${version}" && ${TAG} != "v${version}-"* ]]; then
+            echo "::error::The tag ${TAG} doesn't match the version in package.json, ${version}."
+            exit 1
+          fi
+
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Build
@@ -54,7 +71,7 @@ jobs:
 
   push:
     name: Push (${{ matrix.platform }})
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     needs: test
     strategy:
       matrix:
@@ -117,12 +134,15 @@ jobs:
 
   publish:
     name: Publish
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     needs: push
     runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
+    outputs:
+      newest: ${{ steps.newest.outputs.newest }}
+      previous: ${{ steps.newest.outputs.previous }}
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -132,14 +152,42 @@ jobs:
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
+      # Only the highest release moves :stable, :latest and GitHub's latest release, so a fix for an
+      # older version, or a release's workflow run again later, never takes them back. Also the
+      # release before this one, where its notes start.
+      - name: Newest release?
+        id: newest
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          tags="$(gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/v" --paginate --jq '.[].ref | ltrimstr("refs/tags/")')"
+          releases="$(grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' <<<"${tags}" | sort -V || true)"
+          if [[ ${TAG} != *-* ]] && ! grep -qxF "${TAG}" <<<"${releases}"; then
+            echo "::error::GitHub didn't list the tag ${TAG}, so whether it's the newest release is unknown."
+            exit 1
+          fi
+          newest="$(tail -n 1 <<<"${releases}")"
+          previous="$(awk -v tag="${TAG}" '$0 == tag { print last; exit } { last = $0 }' <<<"${releases}")"
+          echo "newest=$([[ ${TAG} == "${newest}" ]] && echo true || echo false)" >>"${GITHUB_OUTPUT}"
+          echo "previous=${previous}" >>"${GITHUB_OUTPUT}"
+          echo "Newest release: ${newest:-none}; the one before ${TAG}: ${previous:-none}"
+
       - name: Tags
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.IMAGE }}
+          flavor: latest=false
+          # (Pre-releases only get {{version}}.)
           tags: |
-            type=raw,value=latest
-            type=sha,format=short
+            type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,format=short,enable=${{ github.ref == 'refs/heads/main' }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=stable,enable=${{ steps.newest.outputs.newest == 'true' }}
+            type=raw,value=latest,enable=${{ steps.newest.outputs.newest == 'true' }}
 
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
@@ -152,7 +200,48 @@ jobs:
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
         run: |
-          tags=()
-          while IFS= read -r tag; do [[ -n ${tag} ]] && tags+=(--tag "${tag}"); done <<<"${TAGS}"
+          tags=() first=""
+          while IFS= read -r tag; do
+            [[ -n ${tag} ]] || continue
+            tags+=(--tag "${tag}")
+            first="${first:-${tag}}"
+          done <<<"${TAGS}"
           docker buildx imagetools create "${tags[@]}" $(printf "${IMAGE}@sha256:%s " *)
-          docker buildx imagetools inspect "${IMAGE}:sha-${GITHUB_SHA::7}"
+          docker buildx imagetools inspect "${first}"
+
+  # Once a release's image is out: its GitHub release, with notes from the pull requests merged since
+  # the last one, and its install.sh and compose.yaml, which new installs start from.
+  release:
+    name: GitHub release
+    if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/v')
+    needs: publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          NEWEST: ${{ needs.publish.outputs.newest }}
+          PREVIOUS: ${{ needs.publish.outputs.previous }}
+        run: |
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" install.sh compose.yaml --clobber
+            if [[ ${NEWEST} == "true" ]]; then gh release edit "${TAG}" --latest; fi
+            exit 0
+          fi
+          options=(--verify-tag --generate-notes --title "FilesDude ${TAG#v}")
+          if [[ ${TAG} == *-* ]]; then
+            options+=(--prerelease)
+          else
+            # Its notes go back to the release before it, past any pre-releases.
+            if [[ -n ${PREVIOUS} ]]; then options+=(--notes-start-tag "${PREVIOUS}"); fi
+            if [[ ${NEWEST} != "true" ]]; then options+=(--latest=false); fi
+          fi
+          gh release create "${TAG}" "${options[@]}" install.sh compose.yaml

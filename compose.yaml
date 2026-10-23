@@ -7,8 +7,10 @@
 # Updates: docker compose pull && docker compose up -d
 services:
   filesdude:
-    image: ghcr.io/jedibrooker/filesdude:latest
-    # To build from a copy of the repository instead, replace the line above with: build: .
+    # The latest release. To stay on one release, name it (for example :0.3.0), or :0.3 for its fixes
+    # only; :main has every change as it's merged. To build from a copy of the repository instead,
+    # replace this line with: build: .
+    image: ghcr.io/jedibrooker/filesdude:stable
     container_name: filesdude
     restart: unless-stopped
     init: true

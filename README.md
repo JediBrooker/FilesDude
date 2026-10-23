@@ -69,7 +69,7 @@ Windows), use [Docker](#install-with-docker). SSH into the server and run:
 
 ```bash
 curl -fsSLo /tmp/filesdude-install.sh \
-  https://raw.githubusercontent.com/JediBrooker/FilesDude/main/install.sh
+  https://github.com/JediBrooker/FilesDude/releases/latest/download/install.sh
 sudo bash /tmp/filesdude-install.sh
 ```
 
@@ -78,6 +78,30 @@ another, or `/mnt/pve` on Proxmox) and the initial username and password. It the
 checksum-verified Node.js 22 runtime when necessary, builds an immutable release, writes a
 hardened systemd service, and starts FilesDude. Building it takes about 2 GB of memory, so give
 a smaller machine some swap first.
+
+### Releases and updates
+
+FilesDude installs its latest [release](https://github.com/JediBrooker/FilesDude/releases),
+and `sudo filesdude-update` moves it to the newest one (on GitHub, **Watch → Custom →
+Releases** tells you when there is one). To follow every change as it's merged to `main`
+instead, before it's in a release, pass `--channel main` to the installer or to
+`filesdude-update`; `--channel stable` goes back to releases. The installer remembers the
+channel (`FILEDUDE_CHANNEL` in `/etc/filesdude/filesdude.env`), and every update keeps to
+it. Moving from `main` to `stable` never installs an older build: the one you have stays
+until there's a newer release. To install one particular release (or commit) this time,
+name it in `FILEDUDE_GITHUB_REF`; later updates keep to the channel again:
+
+```bash
+sudo FILEDUDE_GITHUB_REF=v0.3.0 filesdude-update
+```
+
+Installs from before 0.3.0 follow `main`. Their updater doesn't know `--channel` yet (each
+update runs the installer that came with the installed version), so update once, then switch:
+
+```bash
+sudo filesdude-update
+sudo filesdude-update --channel stable
+```
 
 FilesDude runs as its own `filesdude` account, not root. It holds just the file
 capabilities a file manager needs: changing owners, and reading and writing files
@@ -599,7 +623,9 @@ every file in it. If snapshots don't appear, check `journalctl -u filesdude` for
 
 The running version (from `package.json`) and the commit it was built from appear
 at the bottom of the sidebar once signed in; hover it for the build time. It is not
-shown on the sign-in page.
+shown on the sign-in page. Releases are tagged `v0.3.0` and so on, and listed with what
+changed on [GitHub](https://github.com/JediBrooker/FilesDude/releases); a build from `main`
+between releases shows the last release's version with its own commit.
 
 An open page checks whether the server has been updated when you return to its tab and
 every 10 minutes while it is visible. If the server runs a newer build, a banner offers to
@@ -650,7 +676,7 @@ the login, and start it:
 ```bash
 mkdir filesdude && cd filesdude
 printf 'FILEDUDE_HOST_ROOT=/srv/files\nPUID=1000\nPGID=1000\n' > .env
-curl -fsSLO https://raw.githubusercontent.com/JediBrooker/FilesDude/main/compose.yaml
+curl -fsSLO https://github.com/JediBrooker/FilesDude/releases/latest/download/compose.yaml
 docker compose run --rm filesdude setup
 docker compose up -d
 ```
@@ -672,9 +698,17 @@ with the new login. If someone else may have used FilesDude, stop it first inste
 (`docker compose stop`, then `docker compose run --rm filesdude setup --rotate-secret`, then
 `docker compose up -d`), so a FilesDude they control can't put its own login back.
 
-To update, run `docker compose pull && docker compose up -d`. Every change to `main` is
-published as `:latest` and as `:sha-<commit>`, which you can name in `compose.yaml` to stay on
-one build.
+To update, run `docker compose pull && docker compose up -d`. `compose.yaml` uses the image's
+`:stable` tag, the latest release (`:latest` is the same). To stay on one release, name it in
+`compose.yaml` instead:
+
+```yaml
+    image: ghcr.io/jedibrooker/filesdude:0.3.0
+```
+
+`:0.3` takes only that version's fixes (0.3.1, 0.3.2, and so on). `:main` has every change as
+it's merged to `main`, and `:sha-<commit>` each of those builds. (Before 0.3.0, `:latest`
+followed `main`.)
 
 Compose only binds FilesDude to `127.0.0.1:3000`. Put Caddy, Nginx Proxy Manager, Traefik,
 Tailscale Serve, or another reverse proxy in front of it and use HTTPS (a Caddy example is in
@@ -743,3 +777,25 @@ npm test
 npm run lint
 npm run build
 ```
+
+## Making a release
+
+1. In a pull request, set the new version with `npm version 0.4.0 --no-git-tag-version`
+   (it changes `package.json` and `package-lock.json`), and merge it.
+2. Tag `main` with it and push the tag:
+
+   ```bash
+   git fetch origin
+   git tag -a v0.4.0 -m "FilesDude 0.4.0" origin/main
+   git push origin v0.4.0
+   ```
+
+The Docker workflow checks that the tag matches `package.json`, builds and tests the image
+for both processors, and publishes it as `:0.4.0`, `:0.4`, `:stable`, and `:latest` (those last
+two, and GitHub's latest release, only move to the highest version, so a fix for an older one
+doesn't take them back). Then it
+makes the GitHub release, with notes from the pull requests merged since the last release
+(edit them on GitHub if they need more) and the release's `install.sh` and `compose.yaml`.
+Installs on the stable channel move to it on their next update. A pre-release tag, such as
+`v0.4.0-rc.1`, is only published as `:0.4.0-rc.1` and a GitHub pre-release, which nothing
+follows.
