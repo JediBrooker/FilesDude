@@ -126,6 +126,9 @@ test("with privileges, images are only ever decoded in the sandbox", () => {
   assert.equal(decodingMode({ sandbox: true, privileged: false }), "sandbox");
   assert.equal(decodingMode({ sandbox: false, privileged: true }), "off");
   assert.equal(decodingMode({ sandbox: false, privileged: false }), "process");
+  // The Docker image allows no decoding outside the sandbox.
+  assert.equal(decodingMode({ sandbox: true, privileged: false, unsandboxedAllowed: false }), "sandbox");
+  assert.equal(decodingMode({ sandbox: false, privileged: false, unsandboxedAllowed: false }), "off");
 });
 
 const unitArguments = (request: object, env: Record<string, string> = {}) => JSON.parse(execFileSync("python3", ["-I", HELPER, "--print-args", JSON.stringify(request)], { env: { ...helperEnvironment(), ...env } }).toString()) as string[];

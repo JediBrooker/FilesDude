@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 // FilesDude's commands in its Docker image (the image's entrypoint, and `filesdude` on its PATH):
 //
 //   start   runs FilesDude (the default)
@@ -8,14 +8,14 @@ import { execFileSync } from "node:child_process";
 //   health  whether FilesDude answers (the image's health check)
 //
 // The container starts as root only so this can hand FilesDude's state to the account it runs as
-// (PUID:PGID, its own 1001 by default); it then becomes that account, without any capabilities,
-// before doing anything else. The login `setup` sets is kept in the state folder (login.env), with a
-// session secret made the first time, so a container needs no secrets in its configuration. Settings
-// in the container's environment win over the saved ones.
+// (PUID:PGID, its own 1001 by default) and start the media sandbox's helper; it then becomes that
+// account, without any capabilities, before doing anything else. The login `setup` sets is kept in
+// the state folder (login.env), with a session secret made the first time, so a container needs no
+// secrets in its configuration. Settings in the container's environment win over the saved ones.
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 const scrypt = promisify(crypto.scrypt);
@@ -71,6 +71,11 @@ export async function hashPassword(password) {
 export function missingFromEnvironment(saved, environment) {
   return Object.fromEntries(LOGIN_KEYS.filter((key) => !environment[key] && saved[key]).map((key) => [key, saved[key]]));
 }
+
+const SANDBOX_FOLDER = "/tmp/filesdude-sandbox";
+const SANDBOX_HELPER = fileURLToPath(new URL("../scripts/sandbox-helper.py", import.meta.url));
+// How long the helper may take to start before FilesDude goes on without it.
+const SANDBOX_START_MS = 20_000;
 
 const stateDirectory = () => path.resolve(process.env.FILEDUDE_STATE_DIR || "/state");
 const managedRoot = () => path.resolve(process.env.FILEDUDE_ROOT || "/data");
@@ -131,7 +136,63 @@ function becomeAccount(handOverState) {
   process.umask(0o027);
 }
 
-async function start() {
+/**
+ * As root, before FilesDude starts: starts the media sandbox's helper (scripts/sandbox-helper.py
+ * --container), which stays root to run (and kill) each image or video decoder as a throwaway user in
+ * a root of its own, keeping only the capabilities that takes. Only FilesDude's account (and root) can reach it,
+ * through a socket in a folder only PGID can enter. Resolves with the socket once the helper listens,
+ * or null if the sandbox is off (the helper says why). The helper ends when FilesDude does.
+ */
+async function startMediaSandbox() {
+  if (process.getuid() !== 0) return null;
+  const uid = accountId("PUID", "1001");
+  const gid = accountId("PGID", "1001");
+  try {
+    // Made afresh: nothing left in a /tmp that outlived an earlier start is trusted.
+    fs.rmSync(SANDBOX_FOLDER, { recursive: true, force: true });
+    fs.mkdirSync(SANDBOX_FOLDER, { mode: 0o700 });
+    fs.chownSync(SANDBOX_FOLDER, 0, gid);
+    fs.chmodSync(SANDBOX_FOLDER, 0o710);
+  } catch (error) {
+    console.error(`The media sandbox is off: its folder can't be made in /tmp (${error.code}). Mount a tmpfs there (compose.yaml does).`);
+    return null;
+  }
+  const socket = path.join(SANDBOX_FOLDER, "sandbox.sock");
+  const environment = { PATH: "/usr/sbin:/usr/bin:/sbin:/bin" };
+  if (process.env.FILEDUDE_SANDBOX_IDS) environment.FILEDUDE_SANDBOX_IDS = process.env.FILEDUDE_SANDBOX_IDS;
+  // Its standard input stays open in FilesDude, so it stops when FilesDude does.
+  const helper = spawn("/usr/bin/python3", ["-I", SANDBOX_HELPER, "--container", socket, String(uid), String(gid)], { stdio: ["pipe", "inherit", "inherit"], env: environment });
+  helper.stdin.on("error", () => undefined);
+  return new Promise((resolve) => {
+    let started = false;
+    const finish = (result) => {
+      clearInterval(timer);
+      if (!started) resolve(result);
+      started = true;
+    };
+    helper.on("error", () => finish(null));
+    helper.on("exit", (code, signal) => {
+      if (started) console.error(`The media sandbox's helper stopped (${signal ?? code}): restart the container to have it back.`);
+      finish(null);
+    });
+    // It puts the socket in place once it's listening.
+    const since = Date.now();
+    const timer = setInterval(() => {
+      if (fs.existsSync(socket)) finish(socket);
+      else if (Date.now() - since > SANDBOX_START_MS) {
+        console.error("The media sandbox is off: its helper didn't start in time.");
+        helper.kill("SIGKILL");
+        finish(null);
+      }
+    }, 50);
+  });
+}
+
+async function start(sandboxSocket) {
+  if (sandboxSocket) process.env.FILEDUDE_SANDBOX_SOCKET = sandboxSocket;
+  // Pictures are only decoded in the media sandbox: without it they get no thumbnails or details,
+  // unless FILEDUDE_UNSANDBOXED_IMAGES=true (that, and nothing else) allows decoding them outside it.
+  process.env.FILEDUDE_UNSANDBOXED_IMAGES = process.env.FILEDUDE_UNSANDBOXED_IMAGES === "true" ? "true" : "false";
   const stateDir = stateDirectory();
   fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   const saved = readLogin(stateDir);
@@ -275,8 +336,9 @@ async function health() {
 async function main() {
   const [command = "start", ...args] = process.argv.slice(2);
   if (command === "start") {
+    const sandboxSocket = await startMediaSandbox();
     becomeAccount({ everything: true });
-    await start();
+    await start(sandboxSocket);
   } else if (command === "setup") {
     becomeAccount({ everything: false });
     await setup(args);

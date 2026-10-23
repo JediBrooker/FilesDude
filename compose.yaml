@@ -38,7 +38,10 @@ services:
     read_only: true
     tmpfs:
       - /tmp:size=256m,mode=1777
-    # Only for handing /state to PUID:PGID as the container starts; FilesDude itself runs without any.
+    # Only for the container's start, as root: handing /state to PUID:PGID (CHOWN, DAC_READ_SEARCH),
+    # and the media sandbox's helper, which keeps just what it takes to run each picture or video
+    # decoder as a throwaway user in a root of its own, and to stop it (SETUID, SETGID, SYS_CHROOT,
+    # KILL). FilesDude itself runs without any.
     cap_drop:
       - ALL
     cap_add:
@@ -46,6 +49,8 @@ services:
       - DAC_READ_SEARCH
       - SETUID
       - SETGID
+      - SYS_CHROOT
+      - KILL
     security_opt:
       - no-new-privileges:true
 
