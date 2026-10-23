@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { readSync } from "node:fs";
+import { mkdtempSync, readSync, rmSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -134,7 +134,7 @@ test("the sandbox shows Node.js and its packages read-only, and keeps hiding eve
   const args = unitArguments({ tool: "node", args: ["-e", "code"], inspectSockets: true }, { FILEDUDE_SANDBOX_NODE: "/opt/node/bin/node", FILEDUDE_SANDBOX_MODULES: "/opt/my app/node_modules" });
   assert.ok(args.includes(`BindReadOnlyPaths=/opt/node/bin/node:${MOUNT_DIR}/node "/opt/my app/node_modules":${MOUNT_DIR}/node_modules`));
   assert.ok(args.some((arg) => arg.startsWith("InaccessiblePaths=-/")));
-  for (const property of ["DynamicUser=yes", "PrivateNetwork=yes", "SystemCallFilter=~@network-io", "SystemCallFilter=getsockname getsockopt", "TemporaryFileSystem=/etc:ro /run:ro /dev/shm:size=16M", "MemorySwapMax=0", "SystemCallFilter=~io_uring_setup:EPERM io_uring_enter:EPERM io_uring_register:EPERM", "RuntimeMaxSec=15"]) assert.ok(args.includes(property), property);
+  for (const property of ["DynamicUser=yes", "PrivateNetwork=yes", "SystemCallFilter=~@network-io", "SystemCallFilter=getsockname getsockopt", "TemporaryFileSystem=/run:ro /dev/shm:size=16M", "MemorySwapMax=0", "SystemCallFilter=~io_uring_setup:EPERM io_uring_enter:EPERM io_uring_register:EPERM", "RuntimeMaxSec=15"]) assert.ok(args.includes(property), property);
   // Only the two harmless socket calls come back, after the rest are taken away.
   assert.ok(args.indexOf("SystemCallFilter=getsockname getsockopt") > args.indexOf("SystemCallFilter=~@network-io"));
   assert.deepEqual(args.slice(-5), ["/usr/bin/env", "-i", `${MOUNT_DIR}/node`, "-e", "code"]);
@@ -142,6 +142,23 @@ test("the sandbox shows Node.js and its packages read-only, and keeps hiding eve
   const plain = unitArguments({ tool: "ffmpeg", args: ["-i", "pipe:0"] });
   assert.ok(!plain.some((arg) => arg.includes(MOUNT_DIR) || arg === "SystemCallFilter=getsockname getsockopt"));
   assert.deepEqual(plain.slice(-3), ["/usr/bin/ffmpeg", "-i", "pipe:0"]);
+});
+
+test("the sandbox's /etc is the installer's folder of placeholders, or an empty one without it", () => {
+  const view = mkdtempSync(path.join(os.tmpdir(), "sandbox etc-"));
+  try {
+    const args = unitArguments({ tool: "ffmpeg", args: [] }, { FILEDUDE_SANDBOX_ETC: view });
+    assert.ok(args.includes(`BindReadOnlyPaths="${view}":/etc`));
+    assert.ok(args.includes("BindReadOnlyPaths=-/etc/ld.so.cache -/etc/alternatives"));
+    assert.ok(!args.includes("TemporaryFileSystem=/etc:ro"));
+    // An install from an older installer has no placeholders yet: /etc is an empty in-memory one.
+    const older = unitArguments({ tool: "ffmpeg", args: [] }, { FILEDUDE_SANDBOX_ETC: path.join(view, "missing") });
+    assert.ok(older.includes("TemporaryFileSystem=/etc:ro"));
+    assert.ok(older.includes("BindReadOnlyPaths=-/etc/ld.so.cache -/etc/alternatives"));
+    assert.ok(!older.some((arg) => arg.endsWith(":/etc")));
+  } finally {
+    rmSync(view, { recursive: true, force: true });
+  }
 });
 
 test("the sandbox helper only runs its own three tools, with plain arguments", () => {

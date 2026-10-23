@@ -29,7 +29,8 @@ usage() {
 Usage: sudo bash install.sh [options]
 
 Options:
-  --root PATH             Folder FilesDude may manage (default: /mnt/pve)
+  --root PATH             Folder FilesDude may manage (default: /mnt/pve on Proxmox,
+                          /srv/files elsewhere)
   --username NAME         Initial login username (default: admin)
   --bind ADDRESS          Listening address (default: 127.0.0.1)
   --port NUMBER           Listening port (default: 3000)
@@ -70,22 +71,93 @@ done
 [[ ${EUID} -eq 0 ]] || fail "Run this installer with sudo."
 [[ ${PORT} =~ ^[0-9]+$ ]] && ((PORT >= 1 && PORT <= 65535)) || fail "Port must be between 1 and 65535."
 
+# FilesDude runs as a systemd service, and decodes media in throwaway systemd units. Systems without
+# systemd (Alpine, most NAS systems, macOS, Windows) can run the Docker image instead.
+DOCKER_HINT="The Docker image runs elsewhere: see https://github.com/${GITHUB_REPOSITORY}#install-with-docker"
+[[ -d /run/systemd/system ]] || fail "FilesDude needs Linux running systemd. ${DOCKER_HINT}"
+SYSTEMD_VERSION="$(systemctl --version 2>/dev/null | awk 'NR == 1 { print $2 }')"
+SYSTEMD_VERSION="${SYSTEMD_VERSION%%[!0-9]*}"
+# The media sandbox's settings (PrivateIPC, for one) need systemd 248 or newer.
+[[ -n ${SYSTEMD_VERSION} ]] && ((SYSTEMD_VERSION >= 248)) \
+  || fail "FilesDude needs systemd 248 or newer, and this system has ${SYSTEMD_VERSION:-an unknown version}. ${DOCKER_HINT}"
+case "$(uname -m)" in
+  x86_64|aarch64) ;;
+  *) fail "FilesDude runs on x86_64 and arm64 processors, not $(uname -m)." ;;
+esac
+
 export DEBIAN_FRONTEND=noninteractive
 export npm_config_update_notifier=false
-say "Installing operating-system prerequisites"
-apt-get update -qq
-apt-get install -y -qq ca-certificates curl openssl tar xz-utils python3 >/dev/null
+
+# The package manager, for installing what the installer needs and this system lacks.
+PACKAGE_MANAGER=""
+for candidate in apt-get dnf zypper pacman; do
+  if command -v "${candidate}" >/dev/null 2>&1; then PACKAGE_MANAGER="${candidate}"; break; fi
+done
+
+# Whether this system has a tool (or, for ca-certificates, a certificate bundle).
+have() {
+  case "$1" in
+    ca-certificates) [[ -s /etc/ssl/certs/ca-certificates.crt || -s /etc/pki/tls/certs/ca-bundle.crt || -s /etc/ssl/ca-bundle.pem || -s /etc/ssl/cert.pem ]] ;;
+    *) command -v "$1" >/dev/null 2>&1 ;;
+  esac
+}
+
+# The package a tool comes in, for this system's package manager.
+package_for() {
+  case "$1:${PACKAGE_MANAGER}" in
+    xz:apt-get) printf 'xz-utils' ;;
+    python3:pacman) printf 'python' ;;
+    find:*) printf 'findutils' ;;
+    useradd:apt-get) printf 'passwd' ;;
+    useradd:dnf) printf 'shadow-utils' ;;
+    useradd:*) printf 'shadow' ;;
+    nft:*) printf 'nftables' ;;
+    semodule:*) printf 'policycoreutils' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+# Installs the packages for these tools, where this system lacks them (nothing already there is changed).
+install_tools() {
+  local tool packages=()
+  for tool in "$@"; do
+    have "${tool}" || packages+=("$(package_for "${tool}")")
+  done
+  ((${#packages[@]})) || return 0
+  say "Installing ${packages[*]}"
+  # pacman installs from the package lists it last fetched, which upgrading the system refreshes.
+  local hint="Install them"
+  [[ ${PACKAGE_MANAGER} == pacman ]] && hint="Install them (pacman -Syu ${packages[*]})"
+  case "${PACKAGE_MANAGER}" in
+    apt-get) apt-get update -qq && apt-get install -y -qq "${packages[@]}" >/dev/null ;;
+    dnf) dnf install -y -q --setopt=install_weak_deps=False "${packages[@]}" >/dev/null ;;
+    zypper) zypper --non-interactive --quiet install --no-recommends "${packages[@]}" >/dev/null ;;
+    pacman) pacman -S --needed --noconfirm "${packages[@]}" >/dev/null ;;
+    *) false ;;
+  esac || fail "FilesDude needs ${packages[*]}, which couldn't be installed here. ${hint}, then run the installer again."
+}
+
+say "Checking operating-system prerequisites"
+install_tools ca-certificates curl openssl tar xz python3 find useradd
+# The media sandbox helper and its client pass open files over a socket, which needs Python 3.9.
+/usr/bin/python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))' 2>/dev/null \
+  || fail "FilesDude needs Python 3.9 or newer as /usr/bin/python3. ${DOCKER_HINT}"
 
 ensure_node() {
-  local current_major="0"
+  local current_major="0" system_node=""
   if command -v node >/dev/null 2>&1; then
     current_major="$(node -p 'Number(process.versions.node.split(".")[0])' 2>/dev/null || printf 0)"
+    system_node="$(readlink -f "$(command -v node)")"
   fi
-  if ((current_major >= 22)); then
-    local system_home
-    system_home="$(dirname "$(dirname "$(readlink -f "$(command -v node)")")")"
-    ln -sfn "${system_home}" "${APP_HOME}/node"
-    return
+  # The system's own Node.js is only used from /usr, which the service can see (not from a home folder
+  # or /opt, which it can't), and only if root's alone: the build runs it, and its npm, as root.
+  if ((current_major >= 22)) && [[ ${system_node} == /usr/* ]]; then
+    local prefix
+    prefix="$(dirname "$(dirname "${system_node}")")"
+    if [[ -z $(find "${system_node}" "$(dirname "${system_node}")" "${prefix}" -maxdepth 0 \( ! -user root -o -perm /022 \) 2>/dev/null) ]]; then
+      ln -sfn "${prefix}" "${APP_HOME}/node"
+      return
+    fi
   fi
 
   say "Installing the current verified Node.js 22 runtime"
@@ -116,24 +188,22 @@ ensure_node
 export PATH="${APP_HOME}/node/bin:${PATH}"
 
 say "Downloading and building FilesDude"
-BUILD_ROOT="$(mktemp -d)"
+# Built on disk beside the releases: /tmp is often a small in-memory filesystem.
+BUILD_ROOT="$(mktemp -d "${APP_HOME}/build.XXXXXX")"
 trap 'rm -rf "${BUILD_ROOT}"' EXIT
 ARCHIVE="${BUILD_ROOT}/source.tar.gz"
 SOURCE_URL="https://api.github.com/repos/${GITHUB_REPOSITORY}/tarball/${GITHUB_REF}"
-CURL_AUTH=()
+download_source() { curl -fsSL --retry 3 --header 'Accept: application/vnd.github+json' "$@" "${SOURCE_URL}" -o "${ARCHIVE}"; }
+DOWNLOAD_FAILED="Could not download ${GITHUB_REPOSITORY}. If it is private, pass a read-only GITHUB_TOKEN."
 if [[ -n ${GITHUB_TOKEN:-} ]]; then
-  TOKEN_CONFIG="${BUILD_ROOT}/github-curl.conf"
-  umask 077
-  printf 'header = "Authorization: Bearer %s"\n' "${GITHUB_TOKEN}" >"${TOKEN_CONFIG}"
-  CURL_AUTH=(--config "${TOKEN_CONFIG}")
-fi
-if ! curl -fsSL --retry 3 --header 'Accept: application/vnd.github+json' \
-  "${CURL_AUTH[@]}" "${SOURCE_URL}" -o "${ARCHIVE}"; then
-  fail "Could not download ${GITHUB_REPOSITORY}. If it is private, pass a read-only GITHUB_TOKEN."
+  # Handed to curl on its standard input (printf is built in, so it's in no command line either): the
+  # build folder is in /opt, which the running FilesDude can read, so the token is never written there.
+  printf 'header = "Authorization: Bearer %s"\n' "${GITHUB_TOKEN}" | download_source --config - || fail "${DOWNLOAD_FAILED}"
+else
+  download_source || fail "${DOWNLOAD_FAILED}"
 fi
 # The token is only for the download: nothing run by the build (package install scripts, the build
 # itself) gets to see it.
-rm -f "${TOKEN_CONFIG:-}"
 HAD_GITHUB_TOKEN="${GITHUB_TOKEN:+true}"
 unset GITHUB_TOKEN
 mkdir -p "${BUILD_ROOT}/source"
@@ -166,7 +236,8 @@ mv -Tf "${APP_HOME}/current.new" "${APP_HOME}/current"
 
 prompt_value() {
   local prompt="$1" default="$2" value=""
-  if [[ -r /dev/tty ]]; then
+  # /dev/tty can exist without a terminal behind it (ssh without -t, systemd-run).
+  if { : </dev/tty; } 2>/dev/null; then
     IFS= read -r -p "${prompt} [${default}]: " value </dev/tty || true
   fi
   printf '%s' "${value:-${default}}"
@@ -269,11 +340,17 @@ elif [[ ${MODE} == "reset" ]]; then
   EXISTING_USERNAME="$(env_value FILEDUDE_USERNAME)"
   INSTALL_USERNAME="${INSTALL_USERNAME:-$(prompt_value "Replacement username" "${EXISTING_USERNAME:-admin}")}"
   INSTALL_PASSWORD="$(prompt_password)"
+  # Stopped first, so a FilesDude that someone else took over (perhaps why it's being reset) can't
+  # put its own login back; it starts again at the end.
+  systemctl stop filesdude.service 2>/dev/null || true
   reset_environment "${INSTALL_USERNAME}" "${INSTALL_PASSWORD}"
   # Passkeys sign in without the password, so a reset for a lost or exposed login removes them too.
   rm -f "${STATE_DIR}/credentials.json" "${STATE_DIR}/passkeys.json"
 else
-  ROOT_PATH="${ROOT_PATH:-$(prompt_value "Folder FilesDude may manage" "/mnt/pve")}"
+  # Proxmox keeps its storage under /mnt/pve.
+  DEFAULT_ROOT="/srv/files"
+  [[ -d /etc/pve ]] && DEFAULT_ROOT="/mnt/pve"
+  ROOT_PATH="${ROOT_PATH:-$(prompt_value "Folder FilesDude may manage" "${DEFAULT_ROOT}")}"
   [[ ${ROOT_PATH} == /* && ${ROOT_PATH} != "/" ]] || fail "The managed folder must be an absolute path and cannot be /."
   mkdir -p "${ROOT_PATH}"
   INSTALL_USERNAME="${INSTALL_USERNAME:-$(prompt_value "Initial username" "admin")}"
@@ -306,7 +383,7 @@ fi
 
 if [[ ${SERVICE_ACCOUNT} == "filesdude" ]]; then
   getent group filesdude >/dev/null 2>&1 || groupadd --system filesdude
-  id filesdude >/dev/null 2>&1 || useradd --system --gid filesdude --home-dir "${STATE_DIR}" --shell /usr/sbin/nologin filesdude
+  id filesdude >/dev/null 2>&1 || useradd --system --gid filesdude --home-dir "${STATE_DIR}" --shell "$(command -v nologin || printf /usr/sbin/nologin)" filesdude
 fi
 SERVICE_GROUP="${SERVICE_ACCOUNT}"
 install -d -m 0700 "${STATE_DIR}"
@@ -349,11 +426,19 @@ STATE_UNIT="$(quote_unit "${STATE_DIR}")"
 # would otherwise let it use.
 top_of() { local rest="${1#/}"; printf '/%s' "${rest%%/*}"; }
 HIDDEN="-/boot -/lost+found -/sys/kernel/debug -/sys/kernel/security -/sys/firmware"
-EMPTIED="/etc:ro /run:ro /opt:ro /var:ro"
+EMPTIED="/run:ro /opt:ro /var:ro"
+# (Folders end with a slash.)
+ETC_FILES="passwd group hosts host.conf resolv.conf nsswitch.conf gai.conf services protocols localtime timezone ssl/certs/ ca-certificates/ ld.so.cache alternatives/ hostid zfs/"
 ETC_SHOWN=""
-for file in passwd group hosts host.conf resolv.conf nsswitch.conf gai.conf services protocols localtime timezone ssl/certs ca-certificates ld.so.cache alternatives hostid zfs; do
-  ETC_SHOWN+=" -/etc/${file}"
+for file in ${ETC_FILES}; do
+  ETC_SHOWN+=" -/etc/${file%/}"
 done
+# Its /etc is a folder of empty placeholders (made below) that those files are mounted onto: systemd
+# can't make them in an empty in-memory /etc where SELinux is on (Fedora, RHEL, openSUSE), as each new
+# file there would take the label of what it stands for. The media sandbox's /etc is made the same way.
+ETC_VIEW="${APP_HOME}/etc-view"
+SANDBOX_ETC_FILES="ld.so.cache alternatives/"
+SANDBOX_ETC_VIEW="${APP_HOME}/sandbox-etc-view"
 for entry in /*; do
   name="${entry#/}"
   [[ -d ${entry} && ! -L ${entry} ]] || continue
@@ -426,7 +511,7 @@ CapabilityBoundingSet=${CAPABILITY_LIST}
 AmbientCapabilities=${CAPABILITY_LIST}
 TemporaryFileSystem=${EMPTIED}
 InaccessiblePaths=${HIDDEN}
-BindReadOnlyPaths=${APP_HOME} -/run/filesdude-sandbox -/run/systemd/resolve${ETC_SHOWN}
+BindReadOnlyPaths=${ETC_VIEW}:/etc ${APP_HOME} -/run/filesdude-sandbox -/run/systemd/resolve${ETC_SHOWN}
 BindPaths=${ROOT_UNIT} ${STATE_UNIT}
 ReadWritePaths=${ROOT_UNIT} ${STATE_UNIT}
 ${ZFS_UNIT}
@@ -474,6 +559,7 @@ Environment=$(quote_unit "FILEDUDE_STATE_DIR=${STATE_DIR}")
 Environment=FILEDUDE_SANDBOX_USER=${SERVICE_ACCOUNT}
 Environment=FILEDUDE_SANDBOX_NODE=${APP_HOME}/node/bin/node
 Environment=FILEDUDE_SANDBOX_MODULES=${APP_HOME}/current/node_modules
+Environment=FILEDUDE_SANDBOX_ETC=${SANDBOX_ETC_VIEW}
 $(helper_setting FILEDUDE_FFMPEG_PATH)
 $(helper_setting FILEDUDE_FFPROBE_PATH)
 NoNewPrivileges=true
@@ -511,6 +597,23 @@ CPUQuota=400%
 TasksMax=256
 EOF
 
+# Where SELinux is on (Fedora, RHEL and its relatives, openSUSE), its policy doesn't let systemd accept
+# the open files the sandbox helper hands it as a run's input and output (FilesDude's files and state),
+# and a refused one leaves systemd unable to answer anyone for a while. This module lets systemd
+# itself take them; it gives FilesDude and the sandboxes nothing more.
+if command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled; then
+  install_tools semodule
+  SELINUX_MODULE="${CONFIG_DIR}/filesdude.cil"
+  SELINUX_RULES="; Written by the FilesDude installer: systemd may accept the open files FilesDude's media sandbox
+; helper hands it as a run's standard input and output (see scripts/sandbox-helper.py).
+(allow init_t non_auth_file_type (file (getattr read write append)))"
+  if [[ $(cat "${SELINUX_MODULE}" 2>/dev/null) != "${SELINUX_RULES}" ]] || ! semodule -l | grep -qx filesdude; then
+    say "Letting systemd hand files to the media sandbox (an SELinux module)"
+    printf '%s\n' "${SELINUX_RULES}" >"${SELINUX_MODULE}"
+    semodule -i "${SELINUX_MODULE}" || fail "The SELinux module in ${SELINUX_MODULE} couldn't be installed, and FilesDude's media sandbox needs it."
+  fi
+fi
+
 cat >/usr/local/sbin/filesdude-update <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -521,7 +624,8 @@ chmod 755 /usr/local/sbin/filesdude-update
 FIREWALL_FILE="${CONFIG_DIR}/firewall.nft"
 FIREWALL_UNIT="/etc/systemd/system/filesdude-firewall.service"
 if [[ -n ${ALLOW_FROM} || -n ${ALLOW_INTERFACES} ]]; then
-  command -v nft >/dev/null 2>&1 || apt-get install -y -qq nftables >/dev/null
+  install_tools nft
+  NFT="$(command -v nft)"
   IPV4="" IPV6="" INTERFACES=""
   IFS=',' read -r -a entries <<<"${ALLOW_FROM}"
   for address in "${entries[@]}"; do
@@ -540,7 +644,7 @@ if [[ -n ${ALLOW_FROM} || -n ${ALLOW_INTERFACES} ]]; then
     INTERFACES+="    tcp dport ${PORT} iifname \"${interface}\" accept"$'\n'
   done
   {
-    printf '#!/usr/sbin/nft -f\n'
+    printf '#!%s -f\n' "${NFT}"
     printf '# FilesDude: only these may reach port %s. Written by the FilesDude installer (see --allow-from).\n' "${PORT}"
     printf 'table inet filesdude\ndelete table inet filesdude\ntable inet filesdude {\n  chain input {\n'
     printf '    type filter hook input priority -10; policy accept;\n'
@@ -561,8 +665,8 @@ Wants=network-pre.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/sbin/nft -f ${FIREWALL_FILE}
-ExecStop=/usr/sbin/nft delete table inet filesdude
+ExecStart=${NFT} -f ${FIREWALL_FILE}
+ExecStop=${NFT} delete table inet filesdude
 
 [Install]
 WantedBy=multi-user.target
@@ -584,6 +688,31 @@ fi
 # else can write to are handed over (other users may write to the managed folder); the trash's items
 # keep their owners.
 systemctl stop filesdude.service filesdude-sandbox.service 2>/dev/null || true
+
+# The /etc placeholders (remade while nothing has them mounted). There's one for each file even if this
+# host lacks it, as the view can't take a new one later: one that appears would then stop FilesDude
+# from starting. Empty, it reads as missing would.
+make_etc_view() {
+  local view="$1" item name; shift
+  rm -rf "${view}.new"
+  install -d -m 0755 "${view}.new"
+  for item in "$@"; do
+    name="${item%/}"
+    if [[ -d /etc/${name} || ( ! -e /etc/${name} && ${item} == */ ) ]]; then
+      install -d -m 0755 "${view}.new/${name}"
+    else
+      install -d -m 0755 "$(dirname "${view}.new/${name}")"
+      install -m 0644 /dev/null "${view}.new/${name}"
+    fi
+  done
+  rm -rf "${view}"
+  mv -T "${view}.new" "${view}"
+}
+# shellcheck disable=SC2086 # the lists are plain words
+make_etc_view "${ETC_VIEW}" ${ETC_FILES}
+# shellcheck disable=SC2086
+make_etc_view "${SANDBOX_ETC_VIEW}" ${SANDBOX_ETC_FILES}
+
 find "${STATE_DIR}" -xdev ! -user "${SERVICE_ACCOUNT}" -exec chown -h "${SERVICE_ACCOUNT}:${SERVICE_GROUP}" {} +
 PREVIOUS_ACCOUNT="filesdude"
 [[ ${SERVICE_ACCOUNT} == "filesdude" ]] && PREVIOUS_ACCOUNT="root"
@@ -608,15 +737,30 @@ systemctl restart filesdude.service
 mapfile -t OLD_RELEASES < <(find "${APP_HOME}/releases" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -rn | tail -n +4 | cut -d' ' -f2-)
 if ((${#OLD_RELEASES[@]})); then rm -rf -- "${OLD_RELEASES[@]}"; fi
 
+# sudo on some systems (RHEL and its relatives) doesn't look in /usr/local/sbin.
+UPDATE_COMMAND="filesdude-update"
+if command -v sudo >/dev/null 2>&1 && sudo -V 2>/dev/null | grep -i "override user's \$PATH with" | grep -qv /usr/local/sbin; then
+  UPDATE_COMMAND="/usr/local/sbin/filesdude-update"
+fi
+
 say "Installation complete"
 LISTEN_HOST="${BIND_ADDRESS}"
 [[ ${LISTEN_HOST} == *:* ]] && LISTEN_HOST="[${LISTEN_HOST}]"
 printf 'Listening on: http://%s:%s\n' "${LISTEN_HOST}" "${PORT}"
 printf 'Status: systemctl status filesdude\n'
 printf 'Logs: journalctl -u filesdude -f\n'
-printf 'Update later: sudo filesdude-update\n'
+printf 'Update later: sudo %s\n' "${UPDATE_COMMAND}"
 if [[ -n ${HAD_GITHUB_TOKEN:-} ]]; then
-  printf 'Private-repo update: sudo GITHUB_TOKEN="$(gh auth token)" filesdude-update\n'
+  printf 'Private-repo update: sudo GITHUB_TOKEN=<a read-only token for the repository> %s\n' "${UPDATE_COMMAND}"
+fi
+# Listening beyond this host: the system's own firewall may still keep everyone else out.
+if [[ ${BIND_ADDRESS} != "127.0.0.1" && ${BIND_ADDRESS} != "::1" ]]; then
+  if systemctl is-active --quiet firewalld 2>/dev/null; then
+    printf '\nfirewalld is running: to let other machines reach FilesDude, open its port with\n'
+    printf '  sudo firewall-cmd --permanent --add-port=%s/tcp && sudo firewall-cmd --reload\n' "${PORT}"
+  elif command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    printf '\nufw is active: to let other machines reach FilesDude, open its port with: sudo ufw allow %s/tcp\n' "${PORT}"
+  fi
 fi
 if [[ ${SERVICE_ACCOUNT} == "root" ]]; then
   printf '\nFilesDude runs as root. To run it as its own account instead: sudo filesdude-update --service-user filesdude\n'
