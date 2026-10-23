@@ -791,7 +791,9 @@ npm run build
    ```
 
 The Docker workflow checks that the tag matches `package.json`, builds and tests the image
-for both processors, and publishes it as `:0.4.0`, `:0.4`, `:stable`, and `:latest`. Then it
+for both processors, and publishes it as `:0.4.0`, `:0.4`, `:stable`, and `:latest` (those last
+two, and GitHub's latest release, only move to the highest version, so a fix for an older one
+doesn't take them back). Then it
 makes the GitHub release, with notes from the pull requests merged since the last release
 (edit them on GitHub if they need more) and the release's `install.sh` and `compose.yaml`.
 Installs on the stable channel move to it on their next update. A pre-release tag, such as

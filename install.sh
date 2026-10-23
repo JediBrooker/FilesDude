@@ -172,10 +172,10 @@ install_tools ca-certificates curl openssl tar xz python3 find useradd
   || fail "FilesDude needs Python 3.9 or newer as /usr/bin/python3. ${DOCKER_HINT}"
 
 # Asks GitHub's API about the repository (with the token, for a private one); more curl options follow
-# the path.
+# the path. GITHUB_ACCEPT asks for another kind of answer.
 github_api() {
   local path="$1"; shift
-  local options=(-fsSL --retry 3 --header 'Accept: application/vnd.github+json')
+  local options=(-fsSL --retry 3 --header "Accept: ${GITHUB_ACCEPT:-application/vnd.github+json}")
   if [[ -n ${GITHUB_TOKEN:-} ]]; then
     # Handed to curl on its standard input (printf is built in, so it's in no command line either): the
     # build folder is in /opt, which the running FilesDude can read, so the token is never written there.
@@ -185,14 +185,35 @@ github_api() {
     curl "${options[@]}" "$@" "https://api.github.com/repos/${GITHUB_REPOSITORY}/${path}"
   fi
 }
-# One text field of a JSON object (read from standard input), or nothing.
+# One text field of the JSON read from standard input (base_commit.sha for one inside another), or
+# nothing; fails if it isn't JSON with that field.
 json_field() {
-  /usr/bin/python3 -I -c 'import json, sys; value = json.load(sys.stdin).get(sys.argv[1]); print(value if isinstance(value, str) else "")' "$1"
+  /usr/bin/python3 -I -c '
+import json, sys
+try:
+    value = json.load(sys.stdin)
+    for key in sys.argv[1].split("."):
+        value = value[key]
+except (ValueError, KeyError, TypeError, IndexError):
+    sys.exit(1)
+print(value if isinstance(value, str) else "")' "$1"
 }
 
+# Whether version $1 is older than version $2 (each X.Y.Z, pre-release suffixes aside).
+version_older() {
+  local older newer i
+  IFS=. read -r -a older <<<"${1%%-*}"
+  IFS=. read -r -a newer <<<"${2%%-*}"
+  for i in 0 1 2; do
+    if ((10#${older[i]} != 10#${newer[i]})); then
+      return $((10#${older[i]} < 10#${newer[i]} ? 0 : 1))
+    fi
+  done
+  return 1
+}
+VERSION_PATTERN='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+
 # The build to install: the one FILEDUDE_GITHUB_REF names, the newest on main, or the latest release.
-# The stable channel never goes back to a release older than the installed build (installed from main,
-# say): that build stays until a newer release includes it.
 SOURCE_REF="${FILEDUDE_GITHUB_REF:-}"
 if [[ -n ${SOURCE_REF} ]]; then
   SOURCE_NAME="${SOURCE_REF}, from FILEDUDE_GITHUB_REF"
@@ -201,23 +222,56 @@ elif [[ ${CHANNEL} == "main" ]]; then
   SOURCE_NAME="the newest change on main"
 else
   LATEST_RELEASE="$(github_api releases/latest | json_field tag_name)" || LATEST_RELEASE=""
-  [[ ${LATEST_RELEASE} =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] \
-    || fail "Couldn't find the latest release of ${GITHUB_REPOSITORY}: GitHub may be unreachable or busy, so try again shortly. To follow every change on main instead, pass --channel main."
+  [[ ${LATEST_RELEASE} == v* && ${LATEST_RELEASE#v} =~ ${VERSION_PATTERN} ]] \
+    || fail "Couldn't look up the latest release of ${GITHUB_REPOSITORY}. Try again shortly, or follow every change on main instead with --channel main."
   SOURCE_REF="${LATEST_RELEASE}"
   SOURCE_NAME="the latest release, ${LATEST_RELEASE}"
-  INSTALLED_COMMIT=""
+
+  # An update never goes back to a release older than the installed build (one from main, say): that
+  # build stays until a newer release includes it. The build records its version and commit.
+  INSTALLED=""
   if [[ ${MODE} != "install" ]]; then
-    # The commit the installed build was made from, as the build itself records it.
-    INSTALLED_COMMIT="$(/usr/bin/python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["config"]["env"]["NEXT_PUBLIC_FILESDUDE_COMMIT"])' \
-      "${APP_HOME}/current/.next/required-server-files.json" 2>/dev/null)" || INSTALLED_COMMIT=""
+    INSTALLED="$(/usr/bin/python3 -I -c '
+import json, sys
+try:
+    version = json.load(open(sys.argv[1] + "/package.json"))["version"]
+    commit = json.load(open(sys.argv[1] + "/.next/required-server-files.json"))["config"]["env"]["NEXT_PUBLIC_FILESDUDE_COMMIT"]
+except (OSError, ValueError, KeyError, TypeError):
+    sys.exit(1)
+print(version, commit)' "${APP_HOME}/current")" || INSTALLED=""
   fi
-  if [[ ${INSTALLED_COMMIT} =~ ^[0-9a-f]{7,40}$ ]] \
-    && [[ $(github_api "compare/${LATEST_RELEASE}...${INSTALLED_COMMIT}?per_page=1" | json_field status || true) == "ahead" ]]; then
-    printf '\nThe installed build, %s, is newer than the latest release, %s, so it stays until a newer release.\n' "${INSTALLED_COMMIT}" "${LATEST_RELEASE}"
-    SOURCE_REF="${INSTALLED_COMMIT}"
-    SOURCE_NAME="the installed build, ${INSTALLED_COMMIT}, again"
+  INSTALLED_VERSION="${INSTALLED% *}"
+  INSTALLED_COMMIT="${INSTALLED#* }"
+  COMPARE_FAILED="Couldn't compare the installed build with the latest release, ${LATEST_RELEASE}. Try again shortly, or install that release anyway with FILEDUDE_GITHUB_REF=${LATEST_RELEASE}."
+  # An older version needs no asking; for the same version or newer, GitHub says which build is newer.
+  if [[ ${INSTALLED_VERSION} =~ ${VERSION_PATTERN} && ${INSTALLED_COMMIT} =~ ^[0-9a-f]{7,40}$ ]] \
+    && ! version_older "${INSTALLED_VERSION}" "${LATEST_RELEASE#v}"; then
+    COMPARISON="$(github_api "compare/${INSTALLED_COMMIT}...${LATEST_RELEASE}?per_page=1" 2>/dev/null)" || COMPARISON=""
+    case "$(json_field status <<<"${COMPARISON}" || true)" in
+      ahead|identical) ;;
+      behind|diverged)
+        # The installed build stays only if it's FilesDude's own, from main: the app records an
+        # abbreviated commit, which could also name one in a fork.
+        INSTALLED_COMMIT="$(json_field base_commit.sha <<<"${COMPARISON}" || true)"
+        [[ ${INSTALLED_COMMIT} =~ ^[0-9a-f]{40}$ ]] || fail "${COMPARE_FAILED}"
+        case "$(github_api "compare/${INSTALLED_COMMIT}...main?per_page=1" 2>/dev/null | json_field status || true)" in
+          ahead|identical)
+            printf '\nThe installed build, %s, is newer than the latest release, %s: it stays until a newer release.\n' "${INSTALLED_COMMIT:0:7}" "${LATEST_RELEASE}"
+            SOURCE_REF="${INSTALLED_COMMIT}"
+            SOURCE_NAME="the installed build, ${INSTALLED_COMMIT:0:7}, again" ;;
+          behind|diverged)
+            printf '\nThe installed build, %s, is not from main, so the latest release, %s, replaces it.\n' "${INSTALLED_COMMIT:0:7}" "${LATEST_RELEASE}" ;;
+          *) fail "${COMPARE_FAILED}" ;;
+        esac ;;
+      *) fail "${COMPARE_FAILED}" ;;
+    esac
   fi
 fi
+
+# The commit itself (for a tag, the commit it names), which the app shows too.
+SOURCE_COMMIT="$(GITHUB_ACCEPT=application/vnd.github.sha github_api "commits/${SOURCE_REF}")" || SOURCE_COMMIT=""
+[[ ${SOURCE_COMMIT} =~ ^[0-9a-f]{40}$ ]] \
+  || fail "Couldn't find ${SOURCE_REF} in ${GITHUB_REPOSITORY}. If it is private, pass a read-only GITHUB_TOKEN."
 
 ensure_node() {
   local current_major="0" system_node=""
@@ -268,7 +322,7 @@ say "Downloading and building FilesDude (${SOURCE_NAME})"
 BUILD_ROOT="$(mktemp -d "${APP_HOME}/build.XXXXXX")"
 trap 'rm -rf "${BUILD_ROOT}"' EXIT
 ARCHIVE="${BUILD_ROOT}/source.tar.gz"
-github_api "tarball/${SOURCE_REF}" -o "${ARCHIVE}" \
+github_api "tarball/${SOURCE_COMMIT}" -o "${ARCHIVE}" \
   || fail "Could not download ${GITHUB_REPOSITORY} (${SOURCE_REF}). If it is private, pass a read-only GITHUB_TOKEN."
 # The token is only for the download: nothing run by the build (package install scripts, the build
 # itself) gets to see it.
@@ -276,10 +330,7 @@ HAD_GITHUB_TOKEN="${GITHUB_TOKEN:+true}"
 unset GITHUB_TOKEN
 mkdir -p "${BUILD_ROOT}/source"
 tar -xzf "${ARCHIVE}" --strip-components=1 -C "${BUILD_ROOT}/source"
-# GitHub names the tarball's top folder <owner>-<repo>-<short commit>; the app shows that commit.
-BUILD_COMMIT="$(tar -tzf "${ARCHIVE}" 2>/dev/null | awk -F/ 'NR == 1 { print $1 }' || true)"
-BUILD_COMMIT="${BUILD_COMMIT##*-}"
-[[ ${BUILD_COMMIT} =~ ^[0-9a-f]{7,40}$ ]] || BUILD_COMMIT=""
+BUILD_COMMIT="${SOURCE_COMMIT}"
 cd "${BUILD_ROOT}/source"
 BUILD_VERSION="$(/usr/bin/python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["version"])' package.json 2>/dev/null)" || BUILD_VERSION=""
 npm ci --no-audit --no-fund >/dev/null
@@ -805,7 +856,7 @@ LISTEN_HOST="${BIND_ADDRESS}"
 printf 'Listening on: http://%s:%s\n' "${LISTEN_HOST}" "${PORT}"
 printf 'Status: systemctl status filesdude\n'
 printf 'Logs: journalctl -u filesdude -f\n'
-printf 'Installed: FilesDude %s%s\n' "${BUILD_VERSION:-(unknown version)}" "${BUILD_COMMIT:+, commit ${BUILD_COMMIT}}"
+printf 'Installed: FilesDude %s%s\n' "${BUILD_VERSION:-(unknown version)}" "${BUILD_COMMIT:+, commit ${BUILD_COMMIT:0:7}}"
 if [[ ${CHANNEL} == "stable" ]]; then
   printf 'Update to the latest release: sudo %s (to follow every change on main instead, add --channel main)\n' "${UPDATE_COMMAND}"
 else
