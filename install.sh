@@ -2,7 +2,6 @@
 set -Eeuo pipefail
 
 GITHUB_REPOSITORY="${FILEDUDE_GITHUB_REPOSITORY:-JediBrooker/FilesDude}"
-GITHUB_REF="${FILEDUDE_GITHUB_REF:-main}"
 APP_HOME="/opt/filesdude"
 CONFIG_DIR="/etc/filesdude"
 ENV_FILE="${CONFIG_DIR}/filesdude.env"
@@ -20,9 +19,22 @@ ALLOW_FROM=""
 ALLOW_FROM_REQUESTED="false"
 ALLOW_INTERFACES=""
 ALLOW_INTERFACES_REQUESTED="false"
+CHANNEL=""
 
 say() { printf '\n\033[1;36mFilesDude\033[0m  %s\n' "$*"; }
 fail() { printf '\n\033[1;31mFilesDude error:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# Reads KEY=value from the existing environment file without executing it.
+env_value() { sed -n "s/^$1=//p" "${ENV_FILE}" | head -n 1; }
+
+# Sets KEY=value in the environment file in place, keeping every other line (added if missing).
+set_env_value() {
+  local key="$1" value="$2" temporary
+  temporary="$(mktemp "${ENV_FILE}.XXXXXX")"
+  { grep -v "^${key}=" "${ENV_FILE}" || true; printf '%s=%s\n' "${key}" "${value}"; } >"${temporary}"
+  chmod 600 "${temporary}"
+  mv -f "${temporary}" "${ENV_FILE}"
+}
 
 usage() {
   cat <<'EOF'
@@ -39,6 +51,8 @@ Options:
   --allow-from LIST       Only these addresses (comma-separated, e.g. your reverse proxy or
                           tunnel) may reach the port; 'any' removes the filter
   --allow-interfaces LIST Network interfaces that may also reach it (e.g. tailscale0)
+  --channel NAME          'stable' (the default): install the latest release, and update to each
+                          new one; 'main': every change as it's merged. Updates keep to it.
   --update                Update the application and keep all settings
   --reset-credentials     Replace the bootstrap login, clear saved credentials and passkeys,
                           and sign everyone out (other settings are kept)
@@ -47,6 +61,7 @@ Options:
   --help                  Show this help
 
 For unattended first installs, set FILEDUDE_INSTALL_PASSWORD in the environment.
+To install one particular release or commit this time, set FILEDUDE_GITHUB_REF (e.g. v0.3.0).
 For a private GitHub repository, also pass a read-only GITHUB_TOKEN.
 EOF
 }
@@ -60,6 +75,7 @@ while (($#)); do
     --service-user) SERVICE_ACCOUNT="${2:?Missing user}"; shift 2 ;;
     --allow-from) ALLOW_FROM="${2:?Missing addresses}"; ALLOW_FROM_REQUESTED="true"; shift 2 ;;
     --allow-interfaces) ALLOW_INTERFACES="${2:?Missing interfaces}"; ALLOW_INTERFACES_REQUESTED="true"; shift 2 ;;
+    --channel) CHANNEL="${2:?Missing channel}"; shift 2 ;;
     --update) MODE="update"; shift ;;
     --reset-credentials) MODE="reset"; shift ;;
     --rotate-secret) ROTATE_SECRET="true"; shift ;;
@@ -84,6 +100,18 @@ case "$(uname -m)" in
   x86_64|aarch64) ;;
   *) fail "FilesDude runs on x86_64 and arm64 processors, not $(uname -m)." ;;
 esac
+
+# What to install: the latest release ('stable'), or every change as it's merged to 'main'. Updates
+# keep to the channel in the environment file. Installs from before there were releases followed
+# main, so they still do until told otherwise.
+if [[ ${MODE} != "install" ]]; then
+  [[ -f ${ENV_FILE} ]] || fail "No existing FilesDude configuration was found. Run the normal installer first."
+  CHANNEL="${CHANNEL:-$(env_value FILEDUDE_CHANNEL)}"
+  CHANNEL="${CHANNEL:-main}"
+fi
+CHANNEL="${CHANNEL:-stable}"
+[[ ${CHANNEL} == "stable" || ${CHANNEL} == "main" ]] \
+  || fail "The update channel must be stable or main (--channel, or FILEDUDE_CHANNEL in ${ENV_FILE})."
 
 export DEBIAN_FRONTEND=noninteractive
 export npm_config_update_notifier=false
@@ -143,6 +171,54 @@ install_tools ca-certificates curl openssl tar xz python3 find useradd
 /usr/bin/python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))' 2>/dev/null \
   || fail "FilesDude needs Python 3.9 or newer as /usr/bin/python3. ${DOCKER_HINT}"
 
+# Asks GitHub's API about the repository (with the token, for a private one); more curl options follow
+# the path.
+github_api() {
+  local path="$1"; shift
+  local options=(-fsSL --retry 3 --header 'Accept: application/vnd.github+json')
+  if [[ -n ${GITHUB_TOKEN:-} ]]; then
+    # Handed to curl on its standard input (printf is built in, so it's in no command line either): the
+    # build folder is in /opt, which the running FilesDude can read, so the token is never written there.
+    printf 'header = "Authorization: Bearer %s"\n' "${GITHUB_TOKEN}" \
+      | curl "${options[@]}" --config - "$@" "https://api.github.com/repos/${GITHUB_REPOSITORY}/${path}"
+  else
+    curl "${options[@]}" "$@" "https://api.github.com/repos/${GITHUB_REPOSITORY}/${path}"
+  fi
+}
+# One text field of a JSON object (read from standard input), or nothing.
+json_field() {
+  /usr/bin/python3 -I -c 'import json, sys; value = json.load(sys.stdin).get(sys.argv[1]); print(value if isinstance(value, str) else "")' "$1"
+}
+
+# The build to install: the one FILEDUDE_GITHUB_REF names, the newest on main, or the latest release.
+# The stable channel never goes back to a release older than the installed build (installed from main,
+# say): that build stays until a newer release includes it.
+SOURCE_REF="${FILEDUDE_GITHUB_REF:-}"
+if [[ -n ${SOURCE_REF} ]]; then
+  SOURCE_NAME="${SOURCE_REF}, from FILEDUDE_GITHUB_REF"
+elif [[ ${CHANNEL} == "main" ]]; then
+  SOURCE_REF="main"
+  SOURCE_NAME="the newest change on main"
+else
+  LATEST_RELEASE="$(github_api releases/latest | json_field tag_name)" || LATEST_RELEASE=""
+  [[ ${LATEST_RELEASE} =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] \
+    || fail "Couldn't find the latest release of ${GITHUB_REPOSITORY}: GitHub may be unreachable or busy, so try again shortly. To follow every change on main instead, pass --channel main."
+  SOURCE_REF="${LATEST_RELEASE}"
+  SOURCE_NAME="the latest release, ${LATEST_RELEASE}"
+  INSTALLED_COMMIT=""
+  if [[ ${MODE} != "install" ]]; then
+    # The commit the installed build was made from, as the build itself records it.
+    INSTALLED_COMMIT="$(/usr/bin/python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["config"]["env"]["NEXT_PUBLIC_FILESDUDE_COMMIT"])' \
+      "${APP_HOME}/current/.next/required-server-files.json" 2>/dev/null)" || INSTALLED_COMMIT=""
+  fi
+  if [[ ${INSTALLED_COMMIT} =~ ^[0-9a-f]{7,40}$ ]] \
+    && [[ $(github_api "compare/${LATEST_RELEASE}...${INSTALLED_COMMIT}?per_page=1" | json_field status || true) == "ahead" ]]; then
+    printf '\nThe installed build, %s, is newer than the latest release, %s, so it stays until a newer release.\n' "${INSTALLED_COMMIT}" "${LATEST_RELEASE}"
+    SOURCE_REF="${INSTALLED_COMMIT}"
+    SOURCE_NAME="the installed build, ${INSTALLED_COMMIT}, again"
+  fi
+fi
+
 ensure_node() {
   local current_major="0" system_node=""
   if command -v node >/dev/null 2>&1; then
@@ -187,21 +263,13 @@ mkdir -p "${APP_HOME}/releases" "${CONFIG_DIR}"
 ensure_node
 export PATH="${APP_HOME}/node/bin:${PATH}"
 
-say "Downloading and building FilesDude"
+say "Downloading and building FilesDude (${SOURCE_NAME})"
 # Built on disk beside the releases: /tmp is often a small in-memory filesystem.
 BUILD_ROOT="$(mktemp -d "${APP_HOME}/build.XXXXXX")"
 trap 'rm -rf "${BUILD_ROOT}"' EXIT
 ARCHIVE="${BUILD_ROOT}/source.tar.gz"
-SOURCE_URL="https://api.github.com/repos/${GITHUB_REPOSITORY}/tarball/${GITHUB_REF}"
-download_source() { curl -fsSL --retry 3 --header 'Accept: application/vnd.github+json' "$@" "${SOURCE_URL}" -o "${ARCHIVE}"; }
-DOWNLOAD_FAILED="Could not download ${GITHUB_REPOSITORY}. If it is private, pass a read-only GITHUB_TOKEN."
-if [[ -n ${GITHUB_TOKEN:-} ]]; then
-  # Handed to curl on its standard input (printf is built in, so it's in no command line either): the
-  # build folder is in /opt, which the running FilesDude can read, so the token is never written there.
-  printf 'header = "Authorization: Bearer %s"\n' "${GITHUB_TOKEN}" | download_source --config - || fail "${DOWNLOAD_FAILED}"
-else
-  download_source || fail "${DOWNLOAD_FAILED}"
-fi
+github_api "tarball/${SOURCE_REF}" -o "${ARCHIVE}" \
+  || fail "Could not download ${GITHUB_REPOSITORY} (${SOURCE_REF}). If it is private, pass a read-only GITHUB_TOKEN."
 # The token is only for the download: nothing run by the build (package install scripts, the build
 # itself) gets to see it.
 HAD_GITHUB_TOKEN="${GITHUB_TOKEN:+true}"
@@ -213,6 +281,7 @@ BUILD_COMMIT="$(tar -tzf "${ARCHIVE}" 2>/dev/null | awk -F/ 'NR == 1 { print $1 
 BUILD_COMMIT="${BUILD_COMMIT##*-}"
 [[ ${BUILD_COMMIT} =~ ^[0-9a-f]{7,40}$ ]] || BUILD_COMMIT=""
 cd "${BUILD_ROOT}/source"
+BUILD_VERSION="$(/usr/bin/python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["version"])' package.json 2>/dev/null)" || BUILD_VERSION=""
 npm ci --no-audit --no-fund >/dev/null
 FILEDUDE_BUILD_COMMIT="${BUILD_COMMIT}" NEXT_TELEMETRY_DISABLED=1 npm run build >/dev/null
 
@@ -285,18 +354,6 @@ write_environment() {
   chmod 600 "${ENV_FILE}"
 }
 
-# Reads KEY=value from the existing environment file without executing it.
-env_value() { sed -n "s/^$1=//p" "${ENV_FILE}" | head -n 1; }
-
-# Sets KEY=value in the environment file in place, keeping every other line (added if missing).
-set_env_value() {
-  local key="$1" value="$2" temporary
-  temporary="$(mktemp "${ENV_FILE}.XXXXXX")"
-  { grep -v "^${key}=" "${ENV_FILE}" || true; printf '%s=%s\n' "${key}" "${value}"; } >"${temporary}"
-  chmod 600 "${temporary}"
-  mv -f "${temporary}" "${ENV_FILE}"
-}
-
 # A credentials reset replaces only the login, and signs everyone out by moving the sessions on a
 # generation; every other setting (trusted proxies, limits, the listener) is kept. The secret, which
 # share links and saved server credentials depend on, is only replaced with --rotate-secret.
@@ -331,10 +388,8 @@ load_listen_address() {
 }
 
 if [[ ${MODE} == "update" ]]; then
-  [[ -f ${ENV_FILE} ]] || fail "No existing FilesDude configuration was found. Run the normal installer first."
   load_listen_address
 elif [[ ${MODE} == "reset" ]]; then
-  [[ -f ${ENV_FILE} ]] || fail "No existing FilesDude configuration was found. Run the normal installer first."
   ROOT_PATH="$(env_value FILEDUDE_ROOT)"
   load_listen_address
   EXISTING_USERNAME="$(env_value FILEDUDE_USERNAME)"
@@ -357,6 +412,7 @@ else
   INSTALL_PASSWORD="$(prompt_password)"
   write_environment "${INSTALL_USERNAME}" "${INSTALL_PASSWORD}" "${ROOT_PATH}"
 fi
+[[ $(env_value FILEDUDE_CHANNEL) == "${CHANNEL}" ]] || set_env_value FILEDUDE_CHANNEL "${CHANNEL}"
 
 # Read the configured root without executing the environment file.
 ROOT_PATH="$(env_value FILEDUDE_ROOT)"
@@ -749,7 +805,12 @@ LISTEN_HOST="${BIND_ADDRESS}"
 printf 'Listening on: http://%s:%s\n' "${LISTEN_HOST}" "${PORT}"
 printf 'Status: systemctl status filesdude\n'
 printf 'Logs: journalctl -u filesdude -f\n'
-printf 'Update later: sudo %s\n' "${UPDATE_COMMAND}"
+printf 'Installed: FilesDude %s%s\n' "${BUILD_VERSION:-(unknown version)}" "${BUILD_COMMIT:+, commit ${BUILD_COMMIT}}"
+if [[ ${CHANNEL} == "stable" ]]; then
+  printf 'Update to the latest release: sudo %s (to follow every change on main instead, add --channel main)\n' "${UPDATE_COMMAND}"
+else
+  printf 'Update to the newest change on main: sudo %s (to keep to releases instead, add --channel stable)\n' "${UPDATE_COMMAND}"
+fi
 if [[ -n ${HAD_GITHUB_TOKEN:-} ]]; then
   printf 'Private-repo update: sudo GITHUB_TOKEN=<a read-only token for the repository> %s\n' "${UPDATE_COMMAND}"
 fi
