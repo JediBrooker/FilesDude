@@ -11,7 +11,10 @@ import path from "node:path";
 // dynamic linker needs and, for images, Node.js and its packages, read-only). FilesDude doesn't run
 // as root, so it can't start those units itself: a small root helper (scripts/sandbox-helper.py,
 // reached through scripts/sandbox-client.py) starts them, and only with its own fixed profile, for one
-// of three named tools. The file is handed over as the
+// of three named tools. In the Docker image, which has no systemd, the same helper runs each of them
+// itself instead: as a throwaway user in a root of its own holding only the tools and their libraries,
+// with resource limits and a system-call filter (see "Without systemd" in sandbox-helper.py); FilesDude
+// reaches it the same way. The file is handed over as the
 // already-verified open file (standard input), never as a path, so nothing can be swapped in on the
 // way, and the tool may only read that file, in one of the container formats listed below: a crafted
 // file can't make it open playlists, other files, or URLs. Bytes that are already in memory (a video

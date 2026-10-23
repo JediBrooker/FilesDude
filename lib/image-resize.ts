@@ -12,8 +12,9 @@ import { privileged } from "./privileges";
 // sandbox is available, that process runs in the same throwaway sandbox as ffmpeg (see
 // media-sandbox.ts), with Node.js and its packages shown to it read-only. Without it, a FilesDude
 // with privileges (root, or the file capabilities a production install has) gives images no
-// thumbnails; otherwise (a development machine) the process runs as this account with this
-// account's access, which only keeps a crash or runaway decode from taking FilesDude down. Either way only the decoders for the allowed formats can run at all.
+// thumbnails, and so does the Docker image (FILEDUDE_UNSANDBOXED_IMAGES=false); otherwise (a
+// development machine) the process runs as this account with this account's access, which only keeps
+// a crash or runaway decode from taking FilesDude down. Either way only the decoders for the allowed formats can run at all.
 
 export interface ResizeJob {
   /** The formats sharp may find in the input, from its contents (whatever the file is called). */
@@ -133,12 +134,13 @@ export function isWebp(data: Buffer | null): data is Buffer {
 }
 
 /**
- * How images are decoded: in the sandbox wherever there is one, never in a process of FilesDude's
- * own if it has privileges (root, or capabilities its children would inherit), and otherwise in a
- * process running as FilesDude's ordinary account.
+ * How images are decoded: in the sandbox wherever there is one; never in a process of FilesDude's
+ * own if it has privileges (root, or capabilities its children would inherit) or that isn't allowed
+ * (FILEDUDE_UNSANDBOXED_IMAGES=false, as in the Docker image); and otherwise in a process running as
+ * FilesDude's ordinary account.
  */
-export function decodingMode({ sandbox, privileged }: { sandbox: boolean; privileged: boolean }) {
-  return sandbox ? "sandbox" : privileged ? "off" : "process";
+export function decodingMode({ sandbox, privileged, unsandboxedAllowed = true }: { sandbox: boolean; privileged: boolean; unsandboxedAllowed?: boolean }) {
+  return sandbox ? "sandbox" : privileged || !unsandboxedAllowed ? "off" : "process";
 }
 
 /** Node.js and sharp (with the packages it needs), which the sandbox helper shows to the sandbox. */
@@ -166,7 +168,8 @@ async function works(candidate: Worker) {
 }
 
 async function workingWorker(): Promise<Worker | null> {
-  const mode = decodingMode({ sandbox: await sandboxAvailable(), privileged: privileged() });
+  const withPrivileges = privileged();
+  const mode = decodingMode({ sandbox: await sandboxAvailable(), privileged: withPrivileges, unsandboxedAllowed: process.env.FILEDUDE_UNSANDBOXED_IMAGES !== "false" });
   // The packages FilesDude itself runs with (a release's own, in production).
   const modules = path.join(process.cwd(), "node_modules");
   const found = existsSync(path.join(modules, "sharp", "package.json")) ? await fs.realpath(modules) : null;
@@ -175,9 +178,11 @@ async function workingWorker(): Promise<Worker | null> {
   if (candidate && (await works(candidate))) return candidate;
   console.error(mode === "sandbox"
     ? "Image thumbnails and details are off: the media sandbox couldn't run Node.js and sharp (they and node_modules must be readable by other users)"
-    : mode === "off"
+    : mode === "off" && withPrivileges
       ? "Image thumbnails and details are off: FilesDude has privileges, so it only reads images in the media sandbox, and its helper (filesdude-sandbox.socket) isn't running"
-      : "Image thumbnails and details are off: sharp couldn't be run");
+      : mode === "off"
+        ? "Image thumbnails and details are off: the media sandbox isn't running, and FILEDUDE_UNSANDBOXED_IMAGES=false keeps images from being decoded outside it"
+        : "Image thumbnails and details are off: sharp couldn't be run");
   return null;
 }
 

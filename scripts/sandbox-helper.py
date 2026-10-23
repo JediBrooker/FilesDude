@@ -16,14 +16,24 @@ a 4-byte number. A client that goes away stops its run.
 
 Run by filesdude-sandbox.service (socket-activated), or with --socket PATH (tests). With
 --print-args REQUEST it prints the systemd-run arguments a request would get, and exits.
+
+In FilesDude's Docker image, which has no systemd, the container's entrypoint (docker/filesdude.mjs)
+starts it as root with --container SOCKET UID GID instead, and it starts each run itself (see "Without
+systemd" below). --print-container REQUEST prints what such a run would get, and exits.
 """
 
+import ctypes
+import errno
+import grp
 import json
 import math
 import os
 import pwd
+import re
 import select
+import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -232,6 +242,410 @@ def run(request, files, connection):
     return 124 if stopped else process.returncode
 
 
+# ---- Without systemd (Docker) ---------------------------------------------------------------------
+#
+# Each run is a process of its own (see contain), started here as root and then:
+# - inside a root of its own (chroot): a folder in the image holding only the system's libraries,
+#   ffmpeg, Node.js, and sharp, so FilesDude's state, the managed folder, /tmp, /proc, and /dev don't
+#   exist for it, and nothing there is writable;
+# - as a throwaway user and group, one of a range that no other run has while it runs, with no
+#   supplementary groups and no capabilities (and no way back: no set-user-ID programs either);
+# - with memory, task, open-file, CPU-time, and file-size limits;
+# - under a system-call filter on top of Docker's own: no sockets at all (so no network, and no way to
+#   reach FilesDude or this helper), no io_uring, namespaces, mounts, tracing, keyrings, shared
+#   memory, or System V IPC, much like the systemd profile's; and no new processes, only threads, so
+#   a run is one process, which this helper (as root, with CAP_KILL) kills when it's done or out of
+#   time, without anything of the run being able to stop that.
+# No process of a run's user is left before that ID is used again. The helper itself keeps only the
+# capabilities this takes (switching users and groups, chroot, and killing), and only takes requests
+# from FilesDude's account (and root).
+
+HELPER = os.path.abspath(__file__)
+PYTHON = "/usr/bin/python3"
+CONTAINER_ROOT = "/opt/filesdude/sandbox"
+# Each tool's program, inside that root.
+CONTAINER_PROGRAMS = {"ffmpeg": "/usr/bin/ffmpeg", "ffprobe": "/usr/bin/ffprobe", "node": MOUNT_DIR + "/node"}
+# The user and group IDs runs get: within the 65536 IDs that rootless Docker and userns-remap map, and
+# clear of people's accounts, Debian's reserved IDs, and systemd's dynamic users.
+CONTAINER_IDS = "59000-59999"
+# Per run, like the systemd profile's MemoryMax and TasksMax.
+CONTAINER_MEMORY = 512 * 1024 * 1024
+CONTAINER_TASKS = 64
+CONTAINER_OPEN_FILES = 256
+# Starting a run (Python, and its filter), on top of its own time limit.
+LAUNCH_SECONDS = 5
+CAP_KILL, CAP_SETGID, CAP_SETUID, CAP_SYS_CHROOT = 5, 6, 7, 18
+PR_SET_NO_NEW_PRIVS, PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL = 38, 47, 4
+
+DENIED_CALLS = (
+    # Sockets: no network, nothing on this machine. Reading and writing the standard input and output
+    # handed over (which may be sockets) needs none of these.
+    "socket socketpair connect bind listen accept accept4 getpeername setsockopt shutdown "
+    "sendto sendmsg sendmmsg recvfrom recvmsg recvmmsg "
+    # io_uring would do what the filter forbids (and is a common way to attack the kernel).
+    "io_uring_setup io_uring_enter io_uring_register "
+    # Namespaces, mounts, and roots.
+    "unshare setns mount umount umount2 pivot_root chroot move_mount open_tree fsopen fsconfig fsmount fspick mount_setattr "
+    # New processes (threads are clone with CLONE_THREAD, below), and other processes.
+    "fork vfork ptrace process_vm_readv process_vm_writev kcmp pidfd_getfd perf_event_open "
+    # Memory outside the memory limit, System V IPC, and POSIX message queues (the whole container
+    # shares the last two).
+    "memfd_create shmget shmat shmdt shmctl semget semop semtimedop semctl msgget msgsnd msgrcv msgctl "
+    "mq_open mq_unlink mq_timedsend mq_timedreceive mq_notify mq_getsetattr "
+    # Keyrings, BPF, userfaultfd, opening files by handle, and watching files.
+    "keyctl add_key request_key bpf userfaultfd name_to_handle_at open_by_handle_at fanotify_init inotify_init inotify_init1 "
+    # Running the system (refused anyway without capabilities).
+    "init_module finit_module delete_module kexec_load kexec_file_load reboot swapon swapoff acct quotactl "
+    "settimeofday clock_settime clock_adjtime adjtimex sethostname setdomainname syslog vhangup "
+    "iopl ioperm modify_ldt uselib ustat sysfs _sysctl lookup_dcookie nfsservctl"
+).split()
+# The filter must have these, whatever else this system's libseccomp knows of.
+ESSENTIAL_CALLS = {"socket", "socketpair", "connect", "io_uring_setup", "unshare", "setns", "mount", "chroot", "ptrace", "process_vm_readv", "bpf", "userfaultfd", "keyctl", "memfd_create"}
+# clone's flags that make namespaces, and the one that makes a thread (rather than a process).
+CLONE_NAMESPACES = (0x00020000, 0x02000000, 0x04000000, 0x08000000, 0x10000000, 0x20000000, 0x40000000)
+CLONE_THREAD = 0x00010000
+# mmap's flags for memory shared between processes, which the memory limit doesn't count.
+MAP_SHARED_ANONYMOUS = 0x01 | 0x20
+# What getsockopt tells of the other end of a socket (SO_PEERCRED, SO_PEERSEC, SO_PEERGROUPS,
+# SO_PEERPIDFD): FilesDude's process, for the standard input and output.
+PEER_OPTIONS = (17, 31, 59, 77)
+# Faking terminal input (TIOCSTI), and the console's own requests (TIOCLINUX).
+DENIED_IOCTLS = (0x5412, 0x541C)
+
+
+def container_denied(run):
+    """The system calls this run may not make."""
+    denied = list(DENIED_CALLS)
+    if not run["inspectSockets"]:
+        denied += ["getsockname", "getsockopt"]
+    if run["fileOutput"] is not None:
+        # The kernel refuses writes past the limit; reserving space and resizing aren't allowed at all.
+        denied += ["fallocate", "ftruncate", "truncate"]
+    return denied
+
+
+def container_limits(run):
+    """The run's resource limits (soft and hard alike)."""
+    return {
+        "RLIMIT_DATA": CONTAINER_MEMORY,
+        "RLIMIT_NPROC": CONTAINER_TASKS,
+        "RLIMIT_NOFILE": CONTAINER_OPEN_FILES,
+        # Two CPUs' worth over its time, like the systemd profile's CPUQuota=200%.
+        "RLIMIT_CPU": 2 * run["seconds"] + LAUNCH_SECONDS,
+        # Only a playable copy writes to a file (its output), and only up to its limit.
+        "RLIMIT_FSIZE": run["fileOutput"] or 0,
+        "RLIMIT_CORE": 0,
+        "RLIMIT_MSGQUEUE": 0,
+        "RLIMIT_RTPRIO": 0,
+    }
+
+
+def container_filter(run):
+    """The run's system-call filter, to load once it has become the run's user."""
+    import seccomp  # Debian's python3-seccomp (libseccomp), in the image
+
+    rules = seccomp.SyscallFilter(defaction=seccomp.ALLOW)
+    # Calls through another architecture's interface (32-bit x86) would get round the rules.
+    rules.set_attr(seccomp.Attr.ACT_BADARCH, seccomp.KILL_PROCESS)
+    refused = seccomp.ERRNO(errno.EPERM)
+    added = set()
+    for name in container_denied(run):
+        try:
+            rules.add_rule(refused, name)
+            added.add(name)
+        except ValueError:
+            pass  # a call this libseccomp doesn't know of
+    if not ESSENTIAL_CALLS <= added:
+        raise RuntimeError("the system-call filter is missing " + " ".join(sorted(ESSENTIAL_CALLS - added)))
+    for flag in CLONE_NAMESPACES:
+        rules.add_rule(refused, "clone", seccomp.Arg(0, seccomp.MASKED_EQ, flag, flag))
+    rules.add_rule(refused, "clone", seccomp.Arg(0, seccomp.MASKED_EQ, CLONE_THREAD, 0))
+    # clone3's flags can't be checked (they're in memory), so it's missing: the C library uses clone.
+    rules.add_rule(seccomp.ERRNO(errno.ENOSYS), "clone3")
+    rules.add_rule(refused, "mmap", seccomp.Arg(3, seccomp.MASKED_EQ, MAP_SHARED_ANONYMOUS, MAP_SHARED_ANONYMOUS))
+    if run["inspectSockets"]:
+        for option in PEER_OPTIONS:
+            rules.add_rule(refused, "getsockopt", seccomp.Arg(2, seccomp.EQ, option))
+    for request in DENIED_IOCTLS:
+        rules.add_rule(refused, "ioctl", seccomp.Arg(1, seccomp.MASKED_EQ, 0xFFFFFFFF, request))
+    return rules
+
+
+def become(number):
+    """Becomes this user and group, with no other groups. Root's capabilities go, for good."""
+    os.setgroups([])
+    os.setresgid(number, number, number)
+    os.setresuid(number, number, number)
+    if os.getgroups() or os.getresuid() != (number,) * 3 or os.getresgid() != (number,) * 3:
+        raise OSError("couldn't become the run's user")
+    try:
+        os.setuid(0)
+    except PermissionError:
+        return
+    raise OSError("could become root again")
+
+
+def contain(launch):
+    """Becomes a run, then its tool. Started by container_run as root, with nothing open but the run's
+    input, its output, and /dev/null."""
+    import resource
+
+    program = CONTAINER_PROGRAMS[launch["tool"]]
+    # Made while the system's Python is still in reach.
+    rules = container_filter(launch)
+    # The kernel's out-of-memory killer takes a run before FilesDude.
+    try:
+        with open("/proc/self/oom_score_adj", "w") as score:
+            score.write("1000")
+    except OSError:
+        pass
+    for name, value in container_limits(launch).items():
+        resource.setrlimit(getattr(resource, name), (value, value))
+    # Long runs read whole videos; they yield the CPU (and the disk) to everything else.
+    if launch["seconds"] > DEFAULT_SECONDS:
+        os.nice(10)
+    os.chroot(launch["root"])
+    os.chdir("/")
+    become(launch["id"])
+    os.umask(0o077)
+    os.closerange(3, 1 << 20)
+    rules.load()
+    os.execve(program, [program] + launch["args"], {})
+
+
+def runs_as(pid, number):
+    """Whether this process (not one that has ended) runs as this user."""
+    try:
+        with open("/proc/%d/status" % pid) as status:
+            fields = dict(line.split(":", 1) for line in status if ":" in line)
+    except OSError:
+        return False  # gone already
+    return str(number) in fields.get("Uid", "").split() and not fields.get("State", "").strip().startswith(("Z", "X"))
+
+
+def processes_of(number):
+    """The processes running as this user."""
+    return [int(name) for name in os.listdir("/proc") if name.isdigit() and runs_as(int(name), number)]
+
+
+def no_strays(number):
+    """Kills anything still running as a run's user once the run has ended, and whether nothing is. A run
+    can't start processes, so there shouldn't be any. Each is killed through a pidfd, checked after it's
+    opened, so a process that ended and whose number was reused is never the one killed."""
+    for _ in range(20):
+        strays = processes_of(number)
+        if not strays:
+            return True
+        for pid in strays:
+            try:
+                handle = os.pidfd_open(pid)
+            except OSError:
+                continue  # gone already
+            try:
+                if runs_as(pid, number):
+                    signal.pidfd_send_signal(handle, signal.SIGKILL)
+            except OSError:
+                pass
+            finally:
+                os.close(handle)
+        time.sleep(0.05)
+    return False
+
+
+class Ids:
+    """The user and group IDs runs get: each run one of its own, never one with processes left."""
+
+    def __init__(self, first, last, avoid):
+        self.ids = [number for number in range(first, last + 1) if number not in avoid]
+        self.busy = set()
+        self.next = 0
+        self.lock = threading.Lock()
+
+    def take(self):
+        with self.lock:
+            for _ in range(len(self.ids)):
+                candidate = self.ids[self.next]
+                self.next = (self.next + 1) % len(self.ids)
+                if candidate not in self.busy and not processes_of(candidate):
+                    self.busy.add(candidate)
+                    return candidate
+        return None
+
+    def give_back(self, number):
+        with self.lock:
+            self.busy.discard(number)
+
+
+def usable(files, file_output):
+    """Whether the handed files are what a run reads and writes: a file, pipe, or socket in, and a pipe
+    or socket out (a file, for a playable copy). Never a folder or a device."""
+    kinds = [stat.S_IFMT(os.fstat(descriptor).st_mode) for descriptor in files]
+    outputs = (stat.S_IFREG,) if file_output is not None else (stat.S_IFIFO, stat.S_IFSOCK)
+    return kinds[0] in (stat.S_IFREG, stat.S_IFIFO, stat.S_IFSOCK) and kinds[1] in outputs
+
+
+def container_run(request, files, connection, ids, root):
+    """Runs the request as a throwaway user in the sandbox's own root; the client leaving stops it."""
+    try:
+        if not usable(files, request["fileOutput"]):
+            return 64
+        number = ids.take()
+        if number is None:
+            return 75
+        launch = dict(request, id=number, root=root)
+        try:
+            process = subprocess.Popen([PYTHON, "-I", HELPER, "--contain", json.dumps(launch)], stdin=files[0], stdout=files[1], stderr=subprocess.DEVNULL, close_fds=True, env={}, cwd="/")
+        except OSError:
+            ids.give_back(number)
+            return 70
+    finally:
+        for descriptor in files:
+            os.close(descriptor)
+    deadline = time.monotonic() + request["seconds"] + LAUNCH_SECONDS
+    stopped = False
+    try:
+        while process.poll() is None:
+            readable, _, _ = select.select([connection], [], [], 0.5)
+            # The client sends nothing more, so anything readable means it has gone (or broke the protocol).
+            if readable or time.monotonic() > deadline:
+                stopped = True
+                break
+    finally:
+        # This helper started the run, so its process number stays the run's until it's collected here;
+        # and with CAP_KILL, nothing the run does can keep it from being killed.
+        if process.poll() is None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=30)
+            cleared = no_strays(number)
+        except subprocess.TimeoutExpired:
+            stopped, cleared = True, False
+        if cleared:
+            ids.give_back(number)
+        else:
+            print("FilesDude's media sandbox couldn't stop the processes of user %d; that ID isn't used again" % number, file=sys.stderr)
+    if stopped:
+        return 124
+    return process.returncode if process.returncode >= 0 else 128 - process.returncode
+
+
+def capable(number):
+    """Whether this process has this capability."""
+    with open("/proc/self/status") as status:
+        for line in status:
+            if line.startswith("CapEff:"):
+                return bool(int(line.split()[1], 16) >> number & 1)
+    return False
+
+
+class CapabilityHeader(ctypes.Structure):
+    _fields_ = [("version", ctypes.c_uint32), ("pid", ctypes.c_int)]
+
+
+class CapabilityData(ctypes.Structure):
+    _fields_ = [("effective", ctypes.c_uint32), ("permitted", ctypes.c_uint32), ("inheritable", ctypes.c_uint32)]
+
+
+def keep_only(capabilities):
+    """Gives up every capability but these, and the gaining of any by running a program."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.prctl.argtypes = [ctypes.c_int] + [ctypes.c_ulong] * 4
+    mask = sum(1 << number for number in capabilities)
+    data = (CapabilityData * 2)(CapabilityData(mask, mask, 0), CapabilityData(0, 0, 0))
+    if libc.capset(ctypes.byref(CapabilityHeader(0x20080522, 0)), data) != 0:
+        raise OSError(ctypes.get_errno(), "capset")
+    for option in ((PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL), (PR_SET_NO_NEW_PRIVS, 1)):
+        if libc.prctl(*option, 0, 0, 0) != 0:
+            raise OSError(ctypes.get_errno(), "prctl")
+
+
+def mapped(map_file, first, last):
+    """Whether this user namespace map (/proc/self/uid_map) covers these IDs."""
+    with open(map_file) as entries:
+        for entry in entries:
+            inside, _, count = (int(field) for field in entry.split())
+            if inside <= first and last < inside + count:
+                return True
+    return False
+
+
+def container_ids(client_uid, client_gid):
+    """The IDs runs get (FILEDUDE_SANDBOX_IDS, FIRST-LAST), less any the container's accounts use."""
+    text = setting("FILEDUDE_SANDBOX_IDS", CONTAINER_IDS)
+    match = re.fullmatch(r"(\d{1,10})-(\d{1,10})", text)
+    first, last = (int(match.group(1)), int(match.group(2))) if match else (0, -1)
+    if not 0 < first <= last < 2 ** 32 - 2:
+        raise ValueError("FILEDUDE_SANDBOX_IDS must be a range of user and group IDs, such as " + CONTAINER_IDS)
+    if not (mapped("/proc/self/uid_map", first, last) and mapped("/proc/self/gid_map", first, last)):
+        raise ValueError("the user and group IDs %s aren't in this container's user namespace: set FILEDUDE_SANDBOX_IDS to ones that are" % text)
+    avoid = {client_uid, client_gid, 65534} | {entry.pw_uid for entry in pwd.getpwall()} | {entry.gr_gid for entry in grp.getgrall()}
+    ids = Ids(first, min(last, first + 100_000), avoid)
+    if len(ids.ids) < MAX_RUNNING:
+        raise ValueError("FILEDUDE_SANDBOX_IDS has too few IDs")
+    return ids
+
+
+def check_container(root):
+    """Raises the reason this container can't have the sandbox, if there is one."""
+    if os.geteuid() != 0:
+        raise RuntimeError("it must start as root")
+    missing = [name for name, number in (("SETUID", CAP_SETUID), ("SETGID", CAP_SETGID), ("SYS_CHROOT", CAP_SYS_CHROOT), ("KILL", CAP_KILL)) if not capable(number)]
+    if missing:
+        raise RuntimeError("the container doesn't have the %s capability: add it to cap_add (see compose.yaml)" % " and ".join(missing))
+    info = os.stat(root)
+    if info.st_uid != 0 or info.st_mode & 0o022 or not stat.S_ISDIR(info.st_mode):
+        raise RuntimeError(root + " must be a folder only root can change")
+    for program in CONTAINER_PROGRAMS.values():
+        if not os.path.isfile(os.path.join(root, program.lstrip("/"))):
+            raise RuntimeError(program + " is missing from " + root)
+    container_filter({"inspectSockets": True, "fileOutput": 1})
+
+
+def listen_on(path, group):
+    """Listens on a socket at this path that only root and this group can use, put there once ready."""
+    staging = path + ".new"
+    if os.path.lexists(staging):
+        os.unlink(staging)
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    previous = os.umask(0o177)
+    try:
+        server.bind(staging)
+    finally:
+        os.umask(previous)
+    os.chown(staging, 0, group)
+    os.chmod(staging, 0o660)
+    server.listen(64)
+    os.rename(staging, path)
+    return server
+
+
+def leave_with_parent():
+    """Ends the helper when FilesDude does: it holds the other end of standard input."""
+    try:
+        while os.read(0, 65536):
+            pass
+    except OSError:
+        pass
+    os._exit(0)
+
+
+def container_main(path, client_uid, client_gid):
+    """Takes runs from FilesDude's account (and root) on a socket at this path until FilesDude stops."""
+    root = os.path.realpath(setting("FILEDUDE_SANDBOX_ROOT", CONTAINER_ROOT))
+    try:
+        ids = container_ids(client_uid, client_gid)
+        check_container(root)
+        server = listen_on(path, client_gid)
+        keep_only((CAP_SETUID, CAP_SETGID, CAP_SYS_CHROOT, CAP_KILL))
+    except Exception as problem:  # noqa: BLE001 - whatever it is, FilesDude carries on without
+        sys.exit("The media sandbox is off: %s." % problem)
+    threading.Thread(target=leave_with_parent, daemon=True).start()
+    accept_forever(server, {0, client_uid}, lambda request, files, connection: container_run(request, files, connection, ids, root))
+
+
 def wait_for_slot(slots, connection):
     """Waits for a running slot, giving up when the client goes away or after a while."""
     deadline = time.monotonic() + SLOT_WAIT_SECONDS
@@ -244,7 +658,7 @@ def wait_for_slot(slots, connection):
     return False
 
 
-def serve(connection, allowed, slots, connections):
+def serve(connection, allowed, slots, connections, runner):
     files = []
     try:
         _, uid, _ = struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
@@ -265,7 +679,7 @@ def serve(connection, allowed, slots, connections):
             return
         try:
             handed, files = files, []
-            reply(connection, run(request, handed, connection))
+            reply(connection, runner(request, handed, connection))
         finally:
             slots.release()
     except (ValueError, ConnectionError, OSError, OverflowError, json.JSONDecodeError):
@@ -292,22 +706,7 @@ def allowed_accounts():
     return allowed
 
 
-def main():
-    if len(sys.argv) == 3 and sys.argv[1] == "--print-args":
-        print(json.dumps(unit_arguments(checked(json.loads(sys.argv[2])), "filesdude-media-example")))
-        return
-    if len(sys.argv) == 3 and sys.argv[1] == "--socket":
-        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        if os.path.exists(sys.argv[2]):
-            os.unlink(sys.argv[2])
-        server.bind(sys.argv[2])
-        os.chmod(sys.argv[2], 0o600)
-        server.listen(64)
-    elif os.environ.get("LISTEN_FDS") == "1" and os.environ.get("LISTEN_PID") == str(os.getpid()):
-        server = socket.socket(fileno=3)
-    else:
-        sys.exit("usage: sandbox-helper.py --socket PATH | --print-args REQUEST (or socket activation)")
-    allowed = allowed_accounts()
+def accept_forever(server, allowed, runner):
     slots = threading.BoundedSemaphore(MAX_RUNNING)
     connections = threading.BoundedSemaphore(MAX_CONNECTIONS)
     while True:
@@ -320,10 +719,38 @@ def main():
             connection.close()
             continue
         try:
-            threading.Thread(target=serve, args=(connection, allowed, slots, connections), daemon=True).start()
+            threading.Thread(target=serve, args=(connection, allowed, slots, connections, runner), daemon=True).start()
         except RuntimeError:
             connection.close()
             connections.release()
+
+
+def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "--print-args":
+        print(json.dumps(unit_arguments(checked(json.loads(sys.argv[2])), "filesdude-media-example")))
+        return
+    if len(sys.argv) == 3 and sys.argv[1] == "--print-container":
+        request = checked(json.loads(sys.argv[2]))
+        print(json.dumps({"program": CONTAINER_PROGRAMS[request["tool"]], "args": request["args"], "limits": container_limits(request), "denied": container_denied(request)}))
+        return
+    if len(sys.argv) == 3 and sys.argv[1] == "--contain":
+        contain(json.loads(sys.argv[2]))
+        return
+    if len(sys.argv) == 5 and sys.argv[1] == "--container":
+        container_main(sys.argv[2], int(sys.argv[3]), int(sys.argv[4]))
+        return
+    if len(sys.argv) == 3 and sys.argv[1] == "--socket":
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        if os.path.exists(sys.argv[2]):
+            os.unlink(sys.argv[2])
+        server.bind(sys.argv[2])
+        os.chmod(sys.argv[2], 0o600)
+        server.listen(64)
+    elif os.environ.get("LISTEN_FDS") == "1" and os.environ.get("LISTEN_PID") == str(os.getpid()):
+        server = socket.socket(fileno=3)
+    else:
+        sys.exit("usage: sandbox-helper.py --socket PATH | --print-args REQUEST | --container SOCKET UID GID | --print-container REQUEST (or socket activation)")
+    accept_forever(server, allowed_accounts(), run)
 
 
 if __name__ == "__main__":

@@ -31,7 +31,7 @@ FilesDude File Explorer is a secure, self-hosted web file manager for a Linux se
 - Inline previews for text, code, JSON, images, PDF, audio, and video; media uses byte-range streaming. Videos offer subtitles in the player's CC menu: subtitle files beside them (`Movie.srt`, `Movie.en.vtt`) and text subtitle tracks inside them (extracted once by ffmpeg in the media sandbox and kept). Step through a folder's files with the arrow keys, the on-screen arrows, or a swipe on touch screens; neighbouring photos load ahead. A picture's preview can play a slideshow of the folder's pictures (3 to 20 seconds each, looping, with the next one loaded ahead; P plays or pauses) and go full screen
 - Formatted previews, with **Plain text** a click away: Markdown is rendered (headings, lists and task lists, tables, code, quotes, links, and pictures), CSV and TSV become a table you can sort by any column (numbers as numbers) and filter, with the first row as headings or not (semicolon-separated CSV is recognised), and JSON becomes a tree you open level by level. A file's own HTML is never used: links open only web and mail addresses, in a new tab, and only pictures beside the file are loaded, never ones from other sites
 - Image thumbnails in grid view (JPEG, PNG, GIF, WebP, and AVIF up to 64 MB), generated on the server with EXIF rotation applied and all metadata stripped, and cached in the state directory
-- Video thumbnails in grid view (MP4, MKV, MOV, WebM, AVI, of any size) when ffmpeg is installed, taken by ffmpeg in a throwaway, locked-down systemd sandbox
+- Video thumbnails in grid view (MP4, MKV, MOV, WebM, AVI, of any size) when ffmpeg is installed (the Docker image has it), taken by ffmpeg in a throwaway, locked-down sandbox
 - Media details in Properties: an image's dimensions, format, colour, frames, and the camera and date taken from EXIF; a video's or audio file's length, resolution, frame rate, codecs, channels, bit rate, and title/artist/album tags (audio and video need ffmpeg, and are read by ffprobe in the same sandbox as video thumbnails)
 - Folder sizes in the list: switch on **Sizes** in the toolbar to fill the Size column for every folder in view and sort folders by how much they hold (remembered per browser)
 - Folder sizes in Properties: how many files and folders a folder holds, their total size, and the space they take on disk (showing what ZFS compression saves), counted when Properties opens; hard-linked files count once and links aren't followed
@@ -390,8 +390,8 @@ camera and date taken from EXIF) under **Image** in Properties, read by sharp to
 link included, so FilesDude never decodes images itself: a separate Node.js process does,
 handed the already-opened file (never its path) and returning only the thumbnail, or the
 details as a small JSON object that FilesDude checks field by field. Wherever the media
-sandbox helper is installed, that process runs in the same throwaway sandbox as ffmpeg
-(below). Node.js and FilesDude's `node_modules` are shown to it read-only, so they must be
+sandbox helper is installed (and always in the Docker image), that process runs in the same
+throwaway sandbox as ffmpeg (below). Node.js and FilesDude's `node_modules` are shown to it read-only, so they must be
 readable by other users; the installer sees to that. Without the helper, a service with
 privileges (root, or the installed account's file capabilities) shows no image thumbnails
 or details rather than decode images with those privileges. On a development machine, the
@@ -404,7 +404,8 @@ turned off.
 ## Video thumbnails
 
 When the host has ffmpeg (`/usr/bin/ffmpeg`, or set `FILEDUDE_FFMPEG_PATH`) and the
-media sandbox helper (installed with FilesDude under systemd), videos get thumbnails in grid view from a frame a few
+media sandbox helper (installed with FilesDude under systemd; the Docker image has both, and a
+sandbox of its own, described under [Install with Docker](#install-with-docker)), videos get thumbnails in grid view from a frame a few
 seconds in. ffmpeg decodes files other users control, so it never runs inside FilesDude:
 each frame comes from a throwaway systemd unit running as a temporary unprivileged user,
 with no network, sockets, or capabilities, a system-call filter, memory, task, CPU, and
@@ -686,8 +687,9 @@ Then open `http://localhost:3000` on that machine. Without a `.env`, FilesDude m
 
 `PUID` and `PGID` are the user and group FilesDude works as (`id` shows yours): it can do
 what that user can do with the files, and what it makes belongs to them. The container
-starts as root only to hand FilesDude's state volume to that user, then runs FilesDude as
-it, without any capabilities. The rest of the container is read-only.
+starts as root only to hand FilesDude's state volume to that user and to start the media
+sandbox's helper (below), then runs FilesDude as it, without any capabilities. The rest of
+the container is read-only.
 
 `setup` keeps the login in the state volume, with a session secret it makes, so the
 Compose file holds no secrets. Run it again to replace a forgotten login: that signs
@@ -718,17 +720,36 @@ settings go in `environment` in `compose.yaml`.
 
 What's different from the installer:
 
-- There's no media sandbox, which needs systemd: no video thumbnails, video and audio
-  details, copies of videos that play everywhere, or subtitles from inside videos. Image
-  thumbnails and details work, but outside any sandbox: sharp reads pictures in a separate
-  process running as `PUID`, so a picture crafted to exploit an image decoder could do
-  whatever FilesDude can. Keep that in mind if people you don't trust can upload files.
+- The media sandbox has no systemd to start its runs, so its helper (the same
+  `scripts/sandbox-helper.py`) runs them itself. The container starts it as root, which is
+  what `SETUID`, `SETGID`, `SYS_CHROOT`, and `KILL` in `cap_add` are for: it keeps only those
+  (FilesDude has none), and takes requests only from `PUID`, through a socket in a folder
+  only `PGID` can enter. Each ffmpeg, ffprobe, or picture decoder runs as a throwaway user and
+  group (one of 59000–59999 that no other run has) with no other groups and no
+  capabilities. It runs inside a root of its own: a folder in the image holding only ffmpeg,
+  Node.js, sharp, and their libraries, where nothing is writable and FilesDude's state, your
+  files, FilesDude's own code, `/tmp`, `/proc`, and `/dev` don't exist. A system-call filter
+  on top of Docker's own keeps it from making sockets (so it has no network and no way to
+  reach FilesDude), starting other processes (so the helper ends the whole run by killing it,
+  which the run can't prevent), sharing memory, or using namespaces, io_uring, or tracing.
+  Each run is limited to 512 MB of memory, 64 threads, and its time limit. Unlike under
+  systemd, there's no limit on all runs together; FilesDude only runs a few at once, but set
+  `mem_limit` on a small machine. Without user namespaces (Docker's default), those user IDs
+  are the host's too: if the host has accounts in that range, set `FILEDUDE_SANDBOX_IDS` to an
+  unused one (for example `FILEDUDE_SANDBOX_IDS: "300000-300999"`).
+- If the sandbox can't start, FilesDude's log says why, and it goes without: no video
+  thumbnails, video and audio details, copies of videos that play everywhere, or subtitles
+  from inside videos, and no image thumbnails or details either, as pictures are never
+  decoded outside the sandbox. A `compose.yaml` from before the sandbox lacks `SYS_CHROOT`
+  and `KILL`: download it again, or add those lines to `cap_add`. (`FILEDUDE_UNSANDBOXED_IMAGES=true`
+  decodes pictures without the sandbox, in a separate process running as `PUID` that a
+  crafted picture could make do whatever FilesDude can; don't, if people you don't trust
+  can upload files.)
 - There are no ZFS snapshots.
 - FilesDude can only do what `PUID` can: it can't give files to other owners. Setting `PUID`
   and `PGID` to `0` runs it as root, which can once you also add `DAC_OVERRIDE` and `FOWNER`
-  to `cap_add`, but then image thumbnails are off too (FilesDude never decodes other
-  people's pictures with privileges, outside the sandbox). Keep that to a narrowly scoped
-  folder, never `/`, reachable only over your VPN or LAN.
+  to `cap_add`. Keep that to a narrowly scoped folder, never `/`, reachable only over your
+  VPN or LAN.
 - File owners show as numbers, unless you mount the host's `/etc/passwd` and `/etc/group`
   (commented out in `compose.yaml`).
 
